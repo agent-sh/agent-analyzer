@@ -1,0 +1,15 @@
+[package]
+name = "analyzer-sync-check"
+description = "Doc-code sync analysis for agent-analyzer (Phase 4 stub)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+analyzer-core.workspace = true

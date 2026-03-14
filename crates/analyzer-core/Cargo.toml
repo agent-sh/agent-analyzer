@@ -1,0 +1,25 @@
+[package]
+name = "analyzer-core"
+description = "Shared types, git2 wrapper, file walking, and JSON output for agent-analyzer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+git2.workspace = true
+ignore.workspace = true
+regex.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

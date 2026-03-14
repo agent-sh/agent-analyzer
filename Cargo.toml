@@ -1,0 +1,71 @@
+[package]
+name = "agent-analyzer-workspace-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license.workspace = true
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/analyzer-core",
+    "crates/analyzer-git-map",
+    "crates/analyzer-repo-map",
+    "crates/analyzer-collectors",
+    "crates/analyzer-sync-check",
+    "crates/analyzer-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Avi Fenesh <avifenesh@gmail.com>"]
+repository = "https://github.com/agent-sh/agent-analyzer"
+homepage = "https://github.com/agent-sh/agent-analyzer"
+keywords = ["git", "analysis", "code-review", "repository", "ai-detection"]
+categories = ["development-tools", "command-line-utilities"]
+
+[workspace.dependencies]
+# Internal crates
+analyzer-core = { path = "crates/analyzer-core" }
+analyzer-git-map = { path = "crates/analyzer-git-map" }
+analyzer-repo-map = { path = "crates/analyzer-repo-map" }
+analyzer-collectors = { path = "crates/analyzer-collectors" }
+analyzer-sync-check = { path = "crates/analyzer-sync-check" }
+
+# Core dependencies
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+
+# Git
+git2 = "0.20"
+
+# File handling
+walkdir = "2"
+ignore = "0.4"
+glob = "0.3"
+regex = "1"
+
+# Parallelism
+rayon = "1.10"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"

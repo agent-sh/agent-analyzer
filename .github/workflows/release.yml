@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: agent-analyzer
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: agent-analyzer
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: agent-analyzer
+            cross: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: agent-analyzer
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: agent-analyzer.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+          save-if: ${{ startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
+      - name: Build release binary
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }} -p analyzer-cli
+
+      - name: Build release binary (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }} -p analyzer-cli
+
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          cd target/${{ matrix.target }}/release
+          tar czvf ../../../agent-analyzer-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          cd ../../..
+          shasum -a 256 agent-analyzer-${{ matrix.target }}.tar.gz > agent-analyzer-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath ../../../agent-analyzer-${{ matrix.target }}.zip
+          cd ../../..
+          (Get-FileHash agent-analyzer-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower() + "  agent-analyzer-${{ matrix.target }}.zip" | Out-File -Encoding ASCII agent-analyzer-${{ matrix.target }}.zip.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-analyzer-${{ matrix.target }}
+          path: |
+            agent-analyzer-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release $VERSION" > release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.notes.outputs.version }}
+          body_path: release_notes.md
+          files: artifacts/*
+          draft: false
+          prerelease: ${{ contains(github.ref, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
