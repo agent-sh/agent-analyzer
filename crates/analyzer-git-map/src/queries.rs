@@ -1188,10 +1188,10 @@ fn detect_structure(map: &RepoIntelData) -> String {
 fn detect_commands(map: &RepoIntelData) -> GettingStarted {
     let paths: Vec<&str> = map.file_activity.keys().map(|s| s.as_str()).collect();
 
-    let has_cargo = paths.iter().any(|p| *p == "Cargo.toml");
-    let has_package_json = paths.iter().any(|p| *p == "package.json");
-    let has_go_mod = paths.iter().any(|p| *p == "go.mod");
-    let has_makefile = paths.iter().any(|p| *p == "Makefile" || *p == "makefile");
+    let has_cargo = paths.contains(&"Cargo.toml");
+    let has_package_json = paths.contains(&"package.json");
+    let has_go_mod = paths.contains(&"go.mod");
+    let has_makefile = paths.contains(&"Makefile") || paths.contains(&"makefile");
 
     let (build_cmd, test_cmd) = if has_cargo {
         ("cargo build", "cargo test")
