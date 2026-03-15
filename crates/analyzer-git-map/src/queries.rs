@@ -1023,6 +1023,464 @@ pub fn recent_ai(map: &RepoIntelData, limit: usize) -> Vec<RecentAiEntry> {
     entries
 }
 
+// ─── Onboard ─────────────────────────────────────────────────────────────────
+
+/// A key area in the repository for onboarding.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyArea {
+    pub path: String,
+    pub purpose: String,
+    pub files: usize,
+    pub hotspot_score: f64,
+}
+
+/// A pain point in the repository.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PainPoint {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Getting started information for new contributors.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GettingStarted {
+    pub build_command: String,
+    pub test_command: String,
+    pub entry_points: Vec<String>,
+}
+
+/// Convention summary for onboard and can-i-help.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConventionSummary {
+    pub commit_style: String,
+    pub uses_scopes: bool,
+}
+
+/// Onboard result - human-readable summary for someone new to the repo.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardResult {
+    pub language: String,
+    pub framework: Option<String>,
+    pub structure: String,
+    pub total_files: usize,
+    pub total_symbols: usize,
+    pub bus_factor: usize,
+    pub health: String,
+    pub conventions: ConventionSummary,
+    pub key_areas: Vec<KeyArea>,
+    pub pain_points: Vec<PainPoint>,
+    pub getting_started: GettingStarted,
+}
+
+/// Detect the primary language from file extensions in file_activity.
+fn detect_language(map: &RepoIntelData) -> String {
+    let mut ext_counts: HashMap<String, usize> = HashMap::new();
+
+    for path in map.file_activity.keys() {
+        if let Some(ext) = path.rsplit('.').next() {
+            let ext = ext.to_lowercase();
+            // Skip non-language extensions
+            if matches!(
+                ext.as_str(),
+                "md" | "txt"
+                    | "json"
+                    | "yaml"
+                    | "yml"
+                    | "toml"
+                    | "lock"
+                    | "gitignore"
+                    | "csv"
+                    | "svg"
+                    | "png"
+                    | "jpg"
+                    | "ico"
+            ) {
+                continue;
+            }
+            *ext_counts.entry(ext).or_insert(0) += 1;
+        }
+    }
+
+    let top = ext_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(ext, _)| ext);
+
+    match top.as_deref() {
+        Some("rs") => "rust".to_string(),
+        Some("ts" | "tsx") => "typescript".to_string(),
+        Some("js" | "jsx" | "mjs" | "cjs") => "javascript".to_string(),
+        Some("py") => "python".to_string(),
+        Some("go") => "go".to_string(),
+        Some("java") => "java".to_string(),
+        Some("rb") => "ruby".to_string(),
+        Some("c" | "h") => "c".to_string(),
+        Some("cpp" | "cc" | "cxx" | "hpp") => "c++".to_string(),
+        Some("cs") => "c#".to_string(),
+        Some("swift") => "swift".to_string(),
+        Some("kt" | "kts") => "kotlin".to_string(),
+        Some("php") => "php".to_string(),
+        Some("sh" | "bash") => "shell".to_string(),
+        Some("css" | "scss" | "less") => "css".to_string(),
+        Some("html" | "htm") => "html".to_string(),
+        Some(other) => other.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+/// Detect the repository structure from directory layout.
+fn detect_structure(map: &RepoIntelData) -> String {
+    let paths: Vec<&str> = map.file_activity.keys().map(|s| s.as_str()).collect();
+
+    // Check for Cargo workspace (multiple crates/ subdirectories)
+    let crate_dirs: Vec<&str> = paths
+        .iter()
+        .filter(|p| p.starts_with("crates/"))
+        .filter_map(|p| {
+            p.strip_prefix("crates/")
+                .and_then(|rest| rest.split('/').next())
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    if crate_dirs.len() > 1 {
+        return format!("workspace with {} crates", crate_dirs.len());
+    }
+
+    // Check for monorepo (packages/ directory)
+    let package_dirs: Vec<&str> = paths
+        .iter()
+        .filter(|p| p.starts_with("packages/"))
+        .filter_map(|p| {
+            p.strip_prefix("packages/")
+                .and_then(|rest| rest.split('/').next())
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    if package_dirs.len() > 1 {
+        return format!("monorepo with {} packages", package_dirs.len());
+    }
+
+    // Check for src/ + lib/ split
+    let has_src = paths.iter().any(|p| p.starts_with("src/"));
+    let has_lib = paths.iter().any(|p| p.starts_with("lib/"));
+
+    if has_src && has_lib {
+        return "src + lib layout".to_string();
+    }
+    if has_src {
+        return "single package".to_string();
+    }
+    if has_lib {
+        return "library".to_string();
+    }
+
+    "flat".to_string()
+}
+
+/// Detect build and test commands from file patterns.
+fn detect_commands(map: &RepoIntelData) -> GettingStarted {
+    let paths: Vec<&str> = map.file_activity.keys().map(|s| s.as_str()).collect();
+
+    let has_cargo = paths.iter().any(|p| *p == "Cargo.toml");
+    let has_package_json = paths.iter().any(|p| *p == "package.json");
+    let has_go_mod = paths.iter().any(|p| *p == "go.mod");
+    let has_makefile = paths.iter().any(|p| *p == "Makefile" || *p == "makefile");
+
+    let (build_cmd, test_cmd) = if has_cargo {
+        ("cargo build", "cargo test")
+    } else if has_package_json {
+        ("npm install", "npm test")
+    } else if has_go_mod {
+        ("go build ./...", "go test ./...")
+    } else if has_makefile {
+        ("make", "make test")
+    } else {
+        ("see README", "see README")
+    };
+
+    // Find entry points
+    let mut entry_points = Vec::new();
+    let entry_candidates = [
+        "src/main.rs",
+        "src/lib.rs",
+        "src/index.ts",
+        "src/index.js",
+        "index.ts",
+        "index.js",
+        "main.go",
+        "cmd/main.go",
+        "app.py",
+        "main.py",
+    ];
+    for candidate in &entry_candidates {
+        if paths.iter().any(|p| *p == *candidate) {
+            entry_points.push(candidate.to_string());
+        }
+    }
+
+    // Also look for main.rs in crate subdirectories
+    for path in &paths {
+        if path.ends_with("/main.rs") && !entry_points.contains(&path.to_string()) {
+            entry_points.push(path.to_string());
+        }
+    }
+
+    if entry_points.is_empty() {
+        // Fallback: take the first source file
+        if let Some(first) = paths.iter().find(|p| {
+            p.ends_with(".rs")
+                || p.ends_with(".ts")
+                || p.ends_with(".js")
+                || p.ends_with(".py")
+                || p.ends_with(".go")
+        }) {
+            entry_points.push(first.to_string());
+        }
+    }
+
+    GettingStarted {
+        build_command: build_cmd.to_string(),
+        test_command: test_cmd.to_string(),
+        entry_points,
+    }
+}
+
+/// Infer the purpose of a directory area from its name.
+fn infer_area_purpose(area: &str) -> String {
+    let name = area.trim_end_matches('/');
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    match leaf.to_lowercase().as_str() {
+        "src" => "source code".to_string(),
+        "lib" => "library code".to_string(),
+        "test" | "tests" | "__tests__" => "test suite".to_string(),
+        "docs" | "doc" => "documentation".to_string(),
+        "bin" | "cmd" => "binary entrypoints".to_string(),
+        "config" | "cfg" => "configuration".to_string(),
+        "utils" | "util" | "helpers" | "helper" => "shared utilities".to_string(),
+        "core" => "core logic".to_string(),
+        "api" => "API layer".to_string(),
+        "cli" => "command-line interface".to_string(),
+        "web" | "ui" | "frontend" => "user interface".to_string(),
+        "server" | "backend" => "server-side logic".to_string(),
+        "models" | "types" => "data models and types".to_string(),
+        "scripts" => "build and automation scripts".to_string(),
+        ".github" => "CI/CD and GitHub configuration".to_string(),
+        _ => format!("{leaf} module"),
+    }
+}
+
+/// Human-readable summary for someone new to the repo.
+///
+/// Derives language, structure, health, conventions, key areas, pain points,
+/// and getting-started info from the cached `RepoIntelData`.
+pub fn onboard(map: &RepoIntelData) -> OnboardResult {
+    let language = detect_language(map);
+    let structure = detect_structure(map);
+    let total_files = map.file_activity.len();
+    let bf = bus_factor(map, false);
+
+    let h = health(map);
+    let health_label = if !h.active {
+        "inactive"
+    } else if bf >= 3 {
+        "healthy"
+    } else if bf >= 2 {
+        "moderate"
+    } else {
+        "at-risk"
+    };
+
+    let n = norms(map);
+    let conv = ConventionSummary {
+        commit_style: n.commits.style,
+        uses_scopes: n.commits.uses_scopes,
+    };
+
+    // Key areas from areas() - top areas by file count
+    let area_list = areas(map);
+    let key_areas: Vec<KeyArea> = area_list
+        .iter()
+        .take(10)
+        .map(|a| KeyArea {
+            path: a.area.clone(),
+            purpose: infer_area_purpose(&a.area),
+            files: a.files,
+            hotspot_score: a.hotspot_score,
+        })
+        .collect();
+
+    // Pain points: areas with both high bug rate and ownership risk
+    let pain_points: Vec<PainPoint> = area_list
+        .iter()
+        .filter(|a| {
+            let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(false);
+            let high_bug_rate = a.bug_fix_rate >= 0.3;
+            let single_owner = a.owners.len() <= 1;
+            (high_bug_rate && primary_stale) || (high_bug_rate && single_owner)
+        })
+        .map(|a| {
+            let mut reasons = Vec::new();
+            if a.bug_fix_rate >= 0.3 {
+                reasons.push("high bug-fix rate");
+            }
+            let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(false);
+            if primary_stale {
+                reasons.push("primary owner inactive");
+            }
+            if a.owners.len() <= 1 {
+                reasons.push("single owner");
+            }
+            PainPoint {
+                path: a.area.clone(),
+                reason: reasons.join(", "),
+            }
+        })
+        .collect();
+
+    let getting_started = detect_commands(map);
+
+    OnboardResult {
+        language,
+        framework: None,
+        structure,
+        total_files,
+        total_symbols: 0,
+        bus_factor: bf,
+        health: health_label.to_string(),
+        conventions: conv,
+        key_areas,
+        pain_points,
+        getting_started,
+    }
+}
+
+// ─── Can I Help ──────────────────────────────────────────────────────────────
+
+/// A good first area for new contributors.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoodFirstArea {
+    pub path: String,
+    pub reason: String,
+    pub files: usize,
+    pub hotspot_score: f64,
+}
+
+/// An area that needs help from outside contributors.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NeedsHelpArea {
+    pub path: String,
+    pub reason: String,
+    pub bug_fix_rate: f64,
+    pub owner_stale: bool,
+}
+
+/// Recent activity summary.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentActivitySummary {
+    pub active_contributors: usize,
+    pub total_commits: u64,
+    pub bus_factor: usize,
+}
+
+/// Can-I-Help result - guidance for outside contributors.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanIHelpResult {
+    pub conventions: ConventionSummary,
+    pub good_first_areas: Vec<GoodFirstArea>,
+    pub needs_help: Vec<NeedsHelpArea>,
+    pub recent_activity: RecentActivitySummary,
+}
+
+/// Guidance for outside contributors.
+///
+/// Identifies good first areas (low complexity, non-stale owners) and
+/// areas that need help (high bug rate or stale owners).
+pub fn can_i_help(map: &RepoIntelData) -> CanIHelpResult {
+    let n = norms(map);
+    let conv = ConventionSummary {
+        commit_style: n.commits.style,
+        uses_scopes: n.commits.uses_scopes,
+    };
+
+    let area_list = areas(map);
+    let repo_last = &map.git.last_commit_date;
+
+    // Good first areas: low hotspot score AND non-stale primary owner
+    let good_first_areas: Vec<GoodFirstArea> = area_list
+        .iter()
+        .filter(|a| {
+            let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(true);
+            let low_hotspot = a.hotspot_score < 1.5;
+            let low_bug_rate = a.bug_fix_rate < 0.3;
+            !primary_stale && low_hotspot && low_bug_rate
+        })
+        .map(|a| GoodFirstArea {
+            path: a.area.clone(),
+            reason: "low complexity, active maintainer".to_string(),
+            files: a.files,
+            hotspot_score: a.hotspot_score,
+        })
+        .collect();
+
+    // Needs help: high bug rate OR stale owners
+    let needs_help: Vec<NeedsHelpArea> = area_list
+        .iter()
+        .filter(|a| {
+            let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(false);
+            let high_bug_rate = a.bug_fix_rate >= 0.3;
+            primary_stale || high_bug_rate
+        })
+        .map(|a| {
+            let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(false);
+            let mut reasons = Vec::new();
+            if a.bug_fix_rate >= 0.3 {
+                reasons.push("high bug-fix rate");
+            }
+            if primary_stale {
+                reasons.push("primary owner inactive");
+            }
+            NeedsHelpArea {
+                path: a.area.clone(),
+                reason: reasons.join(", "),
+                bug_fix_rate: a.bug_fix_rate,
+                owner_stale: primary_stale,
+            }
+        })
+        .collect();
+
+    // Recent activity: count non-stale contributors
+    let active_contributors = map
+        .contributors
+        .humans
+        .values()
+        .filter(|c| !is_stale(&c.last_seen, repo_last))
+        .count();
+
+    let recent_activity = RecentActivitySummary {
+        active_contributors,
+        total_commits: map.git.total_commits_analyzed,
+        bus_factor: bus_factor(map, false),
+    };
+
+    CanIHelpResult {
+        conventions: conv,
+        good_first_areas,
+        needs_help,
+        recent_activity,
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1731,5 +2189,287 @@ mod tests {
                 cold[i].last_changed
             );
         }
+    }
+
+    #[test]
+    fn test_onboard() {
+        let map = make_test_map();
+        let result = onboard(&map);
+
+        // Language should be detected from .rs files
+        assert_eq!(result.language, "rust");
+        // Framework is always None for now
+        assert!(result.framework.is_none());
+        // Should have files
+        assert!(result.total_files > 0);
+        assert_eq!(result.total_files, map.file_activity.len());
+        // total_symbols is always 0 (Phase 2)
+        assert_eq!(result.total_symbols, 0);
+        // Bus factor should match bus_factor()
+        assert_eq!(result.bus_factor, bus_factor(&map, false));
+        // Health should be a valid label
+        assert!(
+            ["healthy", "moderate", "at-risk", "inactive"].contains(&result.health.as_str()),
+            "unexpected health: {}",
+            result.health
+        );
+        // Conventions should match norms
+        let n = norms(&map);
+        assert_eq!(result.conventions.commit_style, n.commits.style);
+        assert_eq!(result.conventions.uses_scopes, n.commits.uses_scopes);
+        // Key areas should be populated
+        assert!(!result.key_areas.is_empty());
+        // Getting started should detect cargo
+        assert!(!result.getting_started.build_command.is_empty());
+        assert!(!result.getting_started.test_command.is_empty());
+    }
+
+    #[test]
+    fn test_onboard_language_detection() {
+        // Create a map with TypeScript files
+        let mut map = create_empty_map();
+        let delta = CommitDelta {
+            head: "abc".to_string(),
+            commits: vec![CommitInfo {
+                hash: "a".to_string(),
+                author_name: "dev".to_string(),
+                author_email: "dev@test.com".to_string(),
+                date: "2026-03-10T10:00:00Z".to_string(),
+                subject: "feat: init".to_string(),
+                body: String::new(),
+                trailers: vec![],
+                files: vec![
+                    FileChange {
+                        path: "src/index.ts".to_string(),
+                        additions: 50,
+                        deletions: 0,
+                    },
+                    FileChange {
+                        path: "src/utils.ts".to_string(),
+                        additions: 30,
+                        deletions: 0,
+                    },
+                    FileChange {
+                        path: "package.json".to_string(),
+                        additions: 10,
+                        deletions: 0,
+                    },
+                    FileChange {
+                        path: "README.md".to_string(),
+                        additions: 5,
+                        deletions: 0,
+                    },
+                ],
+            }],
+            renames: vec![],
+            deletions: vec![],
+        };
+        merge_delta(&mut map, &delta);
+
+        let result = onboard(&map);
+        assert_eq!(result.language, "typescript");
+        // package.json detected -> npm commands
+        assert_eq!(result.getting_started.build_command, "npm install");
+        assert_eq!(result.getting_started.test_command, "npm test");
+        // Should find src/index.ts as entry point
+        assert!(
+            result
+                .getting_started
+                .entry_points
+                .contains(&"src/index.ts".to_string()),
+            "should find src/index.ts entry point"
+        );
+    }
+
+    #[test]
+    fn test_onboard_structure_detection() {
+        // Create a workspace-like map
+        let mut map = create_empty_map();
+        let delta = CommitDelta {
+            head: "abc".to_string(),
+            commits: vec![CommitInfo {
+                hash: "a".to_string(),
+                author_name: "dev".to_string(),
+                author_email: "dev@test.com".to_string(),
+                date: "2026-03-10T10:00:00Z".to_string(),
+                subject: "feat: workspace".to_string(),
+                body: String::new(),
+                trailers: vec![],
+                files: vec![
+                    FileChange {
+                        path: "crates/core/src/lib.rs".to_string(),
+                        additions: 50,
+                        deletions: 0,
+                    },
+                    FileChange {
+                        path: "crates/cli/src/main.rs".to_string(),
+                        additions: 30,
+                        deletions: 0,
+                    },
+                    FileChange {
+                        path: "crates/utils/src/lib.rs".to_string(),
+                        additions: 20,
+                        deletions: 0,
+                    },
+                    FileChange {
+                        path: "Cargo.toml".to_string(),
+                        additions: 10,
+                        deletions: 0,
+                    },
+                ],
+            }],
+            renames: vec![],
+            deletions: vec![],
+        };
+        merge_delta(&mut map, &delta);
+
+        let result = onboard(&map);
+        assert!(
+            result.structure.contains("workspace"),
+            "should detect workspace structure: {}",
+            result.structure
+        );
+        assert!(
+            result.structure.contains("3"),
+            "should detect 3 crates: {}",
+            result.structure
+        );
+    }
+
+    #[test]
+    fn test_can_i_help() {
+        let map = make_test_map();
+        let result = can_i_help(&map);
+
+        // Conventions should be populated
+        assert_eq!(result.conventions.commit_style, "conventional");
+        // Recent activity should reflect contributors
+        assert!(result.recent_activity.active_contributors > 0);
+        assert!(result.recent_activity.total_commits > 0);
+        assert_eq!(result.recent_activity.bus_factor, bus_factor(&map, false));
+    }
+
+    #[test]
+    fn test_can_i_help_with_staleness() {
+        let map = make_staleness_test_map();
+        let result = can_i_help(&map);
+
+        // With staleness, src/ area should appear in needs_help
+        // (alice is stale, bob is active; bug_fix_rate is 0.5 >= 0.3)
+        let src_needs_help = result.needs_help.iter().find(|a| a.path == "src/");
+        assert!(
+            src_needs_help.is_some(),
+            "src/ should need help due to high bug rate or stale owner"
+        );
+        let src = src_needs_help.unwrap();
+        assert!(src.bug_fix_rate >= 0.3);
+
+        // Active contributors should be 1 (only bob is non-stale)
+        assert_eq!(result.recent_activity.active_contributors, 1);
+    }
+
+    #[test]
+    fn test_can_i_help_good_first_areas() {
+        // Create a map with a low-activity area (multiple non-recent commits
+        // to bring down hotspot score) and a high-activity area
+        let mut map = create_empty_map();
+        let delta = CommitDelta {
+            head: "abc".to_string(),
+            commits: vec![
+                // Old commit - only adds to total, not recent
+                CommitInfo {
+                    hash: "old1".to_string(),
+                    author_name: "dev".to_string(),
+                    author_email: "dev@test.com".to_string(),
+                    date: "2025-06-01T10:00:00Z".to_string(),
+                    subject: "feat: add helpers".to_string(),
+                    body: String::new(),
+                    trailers: vec![],
+                    files: vec![
+                        FileChange {
+                            path: "utils/helpers.rs".to_string(),
+                            additions: 20,
+                            deletions: 0,
+                        },
+                        FileChange {
+                            path: "utils/format.rs".to_string(),
+                            additions: 15,
+                            deletions: 0,
+                        },
+                    ],
+                },
+                CommitInfo {
+                    hash: "old2".to_string(),
+                    author_name: "dev".to_string(),
+                    author_email: "dev@test.com".to_string(),
+                    date: "2025-07-01T10:00:00Z".to_string(),
+                    subject: "feat: more helpers".to_string(),
+                    body: String::new(),
+                    trailers: vec![],
+                    files: vec![FileChange {
+                        path: "utils/helpers.rs".to_string(),
+                        additions: 10,
+                        deletions: 0,
+                    }],
+                },
+                // Recent commit from same dev
+                CommitInfo {
+                    hash: "new1".to_string(),
+                    author_name: "dev".to_string(),
+                    author_email: "dev@test.com".to_string(),
+                    date: "2026-03-10T10:00:00Z".to_string(),
+                    subject: "feat: add core".to_string(),
+                    body: String::new(),
+                    trailers: vec![],
+                    files: vec![FileChange {
+                        path: "src/core.rs".to_string(),
+                        additions: 100,
+                        deletions: 0,
+                    }],
+                },
+            ],
+            renames: vec![],
+            deletions: vec![],
+        };
+        merge_delta(&mut map, &delta);
+
+        let result = can_i_help(&map);
+        // utils/ area has 2 total changes on helpers.rs, 0 recent, 1 on format.rs, 0 recent
+        // hotspot_score for helpers: (0*2 + 2)/(2+1) = 0.67
+        // hotspot_score for format: (0*2 + 1)/(1+1) = 0.5
+        // max = 0.67, low_hotspot (< 1.5) => true
+        // owner is dev who is non-stale => good first area
+        let utils_good = result.good_first_areas.iter().find(|a| a.path == "utils/");
+        assert!(
+            utils_good.is_some(),
+            "utils/ should be a good first area (low hotspot, active owner)"
+        );
+    }
+
+    #[test]
+    fn test_onboard_serialization() {
+        let map = make_test_map();
+        let result = onboard(&map);
+        // Ensure it serializes to valid JSON
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"language\""));
+        assert!(json.contains("\"busFactor\""));
+        assert!(json.contains("\"keyAreas\""));
+        assert!(json.contains("\"gettingStarted\""));
+        assert!(json.contains("\"painPoints\""));
+        // framework should serialize as null
+        assert!(json.contains("\"framework\":null"));
+    }
+
+    #[test]
+    fn test_can_i_help_serialization() {
+        let map = make_test_map();
+        let result = can_i_help(&map);
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"conventions\""));
+        assert!(json.contains("\"goodFirstAreas\""));
+        assert!(json.contains("\"needsHelp\""));
+        assert!(json.contains("\"recentActivity\""));
+        assert!(json.contains("\"commitStyle\""));
     }
 }
