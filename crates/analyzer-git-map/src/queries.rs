@@ -1425,11 +1425,27 @@ pub fn can_i_help(map: &RepoIntelData) -> CanIHelpResult {
             let low_bug_rate = a.bug_fix_rate < 0.3;
             !primary_stale && low_hotspot && low_bug_rate
         })
-        .map(|a| GoodFirstArea {
-            path: a.area.clone(),
-            reason: "low complexity, active maintainer".to_string(),
-            files: a.files,
-            hotspot_score: a.hotspot_score,
+        .map(|a| {
+            let mut reasons = Vec::new();
+            if a.hotspot_score < 1.0 {
+                reasons.push("low churn");
+            }
+            if a.bug_fix_rate < 0.3 {
+                reasons.push("low bug rate");
+            }
+            if a.owners.first().map(|o| !o.stale).unwrap_or(false) {
+                reasons.push("active maintainer for review");
+            }
+            GoodFirstArea {
+                path: a.area.clone(),
+                reason: if reasons.is_empty() {
+                    "stable area".to_string()
+                } else {
+                    reasons.join(", ")
+                },
+                files: a.files,
+                hotspot_score: a.hotspot_score,
+            }
         })
         .collect();
 
