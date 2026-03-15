@@ -225,6 +225,22 @@ pub enum QueryAction {
         #[arg(long)]
         map_file: PathBuf,
     },
+    /// Human-readable summary for someone new to the repo
+    Onboard {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Guidance for outside contributors
+    CanIHelp {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
 }
 
 pub fn run(action: RepoIntelAction) -> Result<()> {
@@ -427,6 +443,16 @@ fn run_query(query: QueryAction) -> Result<()> {
         QueryAction::RecentAi { map_file, top, .. } => {
             let map = load_map(&map_file)?;
             let result = queries::recent_ai(&map, top);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::Onboard { map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::onboard(&map);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::CanIHelp { map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::can_i_help(&map);
             println!("{}", output::to_json(&result));
         }
     }
