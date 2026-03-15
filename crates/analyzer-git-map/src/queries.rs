@@ -2363,6 +2363,24 @@ mod tests {
         assert!(result.recent_activity.active_contributors > 0);
         assert!(result.recent_activity.total_commits > 0);
         assert_eq!(result.recent_activity.bus_factor, bus_factor(&map, false));
+
+        // good_first_areas and needs_help should be populated (all commits recent in test map)
+        // With all-recent commits: areas have high hotspot scores, so good_first_areas may be empty
+        // needs_help should reflect areas with bug fixes
+        // At minimum, both should be valid (not panic)
+        let _gfa = &result.good_first_areas;
+        let _nh = &result.needs_help;
+        // If any area has bug_fix_rate >= 0.3, it should appear in needs_help
+        let area_list = areas(&map);
+        let buggy_areas: Vec<_> = area_list.iter().filter(|a| a.bug_fix_rate >= 0.3).collect();
+        for ba in &buggy_areas {
+            assert!(
+                result.needs_help.iter().any(|nh| nh.path == ba.area),
+                "area {} with bug_fix_rate {:.2} should appear in needs_help",
+                ba.area,
+                ba.bug_fix_rate
+            );
+        }
     }
 
     #[test]
@@ -2475,6 +2493,60 @@ mod tests {
         assert!(json.contains("\"painPoints\""));
         // framework should serialize as null
         assert!(json.contains("\"framework\":null"));
+    }
+
+    #[test]
+    fn test_onboard_pain_points() {
+        // Create a map with a single-owner area that has high bug rate
+        let mut map = create_empty_map();
+        let delta = CommitDelta {
+            head: "abc".to_string(),
+            commits: vec![
+                CommitInfo {
+                    hash: "f1".to_string(),
+                    author_name: "alice".to_string(),
+                    author_email: "alice@test.com".to_string(),
+                    date: "2026-03-10T10:00:00Z".to_string(),
+                    subject: "fix: patch bug".to_string(),
+                    body: String::new(),
+                    trailers: vec![],
+                    files: vec![FileChange {
+                        path: "src/buggy.rs".to_string(),
+                        additions: 5,
+                        deletions: 2,
+                    }],
+                },
+                CommitInfo {
+                    hash: "f2".to_string(),
+                    author_name: "alice".to_string(),
+                    author_email: "alice@test.com".to_string(),
+                    date: "2026-03-11T10:00:00Z".to_string(),
+                    subject: "fix: another bug".to_string(),
+                    body: String::new(),
+                    trailers: vec![],
+                    files: vec![FileChange {
+                        path: "src/buggy.rs".to_string(),
+                        additions: 3,
+                        deletions: 1,
+                    }],
+                },
+            ],
+            renames: vec![],
+            deletions: vec![],
+        };
+        merge_delta(&mut map, &delta);
+
+        let result = onboard(&map);
+        // src/ has: bug_fix_rate=1.0, single owner (alice) => pain point
+        assert!(
+            !result.pain_points.is_empty(),
+            "single-owner area with 100% bug-fix rate should be a pain point"
+        );
+        let src_pain = result.pain_points.iter().find(|p| p.path == "src/");
+        assert!(src_pain.is_some(), "src/ should be a pain point");
+        let sp = src_pain.unwrap();
+        assert!(sp.reason.contains("high bug-fix rate"));
+        assert!(sp.reason.contains("single owner"));
     }
 
     #[test]
