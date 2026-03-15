@@ -1220,7 +1220,7 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
         "main.py",
     ];
     for candidate in &entry_candidates {
-        if paths.iter().any(|p| *p == *candidate) {
+        if paths.contains(candidate) {
             entry_points.push(candidate.to_string());
         }
     }
@@ -1323,7 +1323,7 @@ pub fn onboard(map: &RepoIntelData) -> OnboardResult {
             let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(false);
             let high_bug_rate = a.bug_fix_rate >= 0.3;
             let single_owner = a.owners.len() <= 1;
-            (high_bug_rate && primary_stale) || (high_bug_rate && single_owner)
+            high_bug_rate && (primary_stale || single_owner)
         })
         .map(|a| {
             let mut reasons = Vec::new();
