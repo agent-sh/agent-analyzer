@@ -1,0 +1,440 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use clap::Subcommand;
+
+use analyzer_core::git;
+use analyzer_core::output;
+use analyzer_git_map::{aggregator, extractor, incremental, queries};
+
+#[derive(Subcommand)]
+pub enum RepoIntelAction {
+    /// Full history scan - creates a new repo-intel map
+    Init {
+        /// Repository path to analyze
+        path: PathBuf,
+        /// Maximum number of commits to process
+        #[arg(long)]
+        max_commits: Option<usize>,
+    },
+    /// Incremental update - process new commits since last scan
+    Update {
+        /// Repository path to analyze
+        path: PathBuf,
+        /// Path to existing repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Check repo-intel map validity against the repository
+    Status {
+        /// Repository path
+        path: PathBuf,
+        /// Path to existing repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Run queries against a cached repo-intel map
+    Query {
+        #[command(subcommand)]
+        query: QueryAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum QueryAction {
+    /// Show most-changed files
+    Hotspots {
+        /// Repository path (or path to repo-intel JSON)
+        path: PathBuf,
+        /// Number of results to show
+        #[arg(long, default_value = "10")]
+        top: usize,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show files coupled with a given file
+    Coupling {
+        /// File to find coupling for
+        file: String,
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show ownership for a file or directory
+    Ownership {
+        /// File or directory path
+        file: String,
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Calculate bus factor
+    BusFactor {
+        /// Repository path
+        path: PathBuf,
+        /// Adjust for AI-assisted commits
+        #[arg(long)]
+        adjust_for_ai: bool,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show files with highest bug-fix density
+    Bugspots {
+        /// Repository path
+        path: PathBuf,
+        /// Number of results to show
+        #[arg(long, default_value = "10")]
+        top: usize,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show project norms detected from git history
+    Norms {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show area-level health overview
+    Areas {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show least-changed files (no recent activity)
+    Coldspots {
+        /// Repository path
+        path: PathBuf,
+        /// Number of results to show
+        #[arg(long, default_value = "10")]
+        top: usize,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show contributors sorted by commit count
+    Contributors {
+        /// Repository path
+        path: PathBuf,
+        /// Number of results to show
+        #[arg(long, default_value = "20")]
+        top: usize,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show AI vs human contribution ratio
+    AiRatio {
+        /// Repository path
+        path: PathBuf,
+        /// Filter to a specific path
+        #[arg(long)]
+        path_filter: Option<String>,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show release cadence and tag information
+    ReleaseInfo {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show repository health summary
+    Health {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show history for a specific file
+    FileHistory {
+        /// File path to look up
+        file: String,
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show commit message conventions
+    Conventions {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show hot source files with no co-changing test file
+    TestGaps {
+        /// Repository path
+        path: PathBuf,
+        /// Number of results to show
+        #[arg(long, default_value = "10")]
+        top: usize,
+        /// Minimum changes to consider a file
+        #[arg(long, default_value = "2")]
+        min_changes: u64,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Score changed files by risk (takes comma-separated file list)
+    DiffRisk {
+        /// Repository path
+        path: PathBuf,
+        /// Comma-separated list of changed files
+        #[arg(long)]
+        files: String,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show doc files with low code coupling (likely stale)
+    DocDrift {
+        /// Repository path
+        path: PathBuf,
+        /// Number of results to show
+        #[arg(long, default_value = "10")]
+        top: usize,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show files with recent AI-authored changes
+    RecentAi {
+        /// Repository path
+        path: PathBuf,
+        /// Number of results to show
+        #[arg(long, default_value = "20")]
+        top: usize,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+}
+
+pub fn run(action: RepoIntelAction) -> Result<()> {
+    match action {
+        RepoIntelAction::Init { path, max_commits } => run_init(&path, max_commits),
+        RepoIntelAction::Update { path, map_file } => run_update(&path, &map_file),
+        RepoIntelAction::Status { path, map_file } => run_status(&path, &map_file),
+        RepoIntelAction::Query { query } => run_query(query),
+    }
+}
+
+fn run_init(path: &Path, _max_commits: Option<usize>) -> Result<()> {
+    eprintln!("[INFO] Scanning full history at {}", path.display());
+
+    let delta = extractor::extract_full(path).context("failed to extract git history")?;
+
+    eprintln!("[INFO] Processed {} commits", delta.commits.len());
+
+    let mut map = aggregator::create_empty_map();
+
+    let repo = git::open_repo(path)?;
+    map.git.shallow = git::is_shallow(&repo);
+
+    aggregator::merge_delta(&mut map, &delta);
+
+    println!("{}", output::to_json(&map));
+    eprintln!("[OK] Repo intel map created successfully");
+    Ok(())
+}
+
+fn run_update(path: &Path, map_file: &Path) -> Result<()> {
+    let map_json = std::fs::read_to_string(map_file)
+        .with_context(|| format!("failed to read map file: {}", map_file.display()))?;
+    let mut map: analyzer_core::types::RepoIntelData =
+        serde_json::from_str(&map_json).context("failed to parse map JSON")?;
+
+    let repo = git::open_repo(path)?;
+
+    // Check if we need a full rebuild
+    if incremental::needs_rebuild(&map, &repo) {
+        eprintln!("[WARN] Force push detected, performing full rebuild");
+        return run_init(path, None);
+    }
+
+    let since_sha =
+        incremental::get_since_sha(&map).context("map has no analyzedUpTo - use init instead")?;
+
+    eprintln!("[INFO] Updating from {} at {}", since_sha, path.display());
+
+    let delta = extractor::extract_delta(path, &since_sha)?;
+
+    eprintln!("[INFO] Processed {} new commits", delta.commits.len());
+
+    aggregator::merge_delta(&mut map, &delta);
+
+    println!("{}", output::to_json(&map));
+    eprintln!("[OK] Repo intel map updated successfully");
+    Ok(())
+}
+
+fn run_status(path: &Path, map_file: &Path) -> Result<()> {
+    let map_json = std::fs::read_to_string(map_file)
+        .with_context(|| format!("failed to read map file: {}", map_file.display()))?;
+    let map: analyzer_core::types::RepoIntelData =
+        serde_json::from_str(&map_json).context("failed to parse map JSON")?;
+
+    let repo = git::open_repo(path)?;
+    let status = incremental::check_status(&map, &repo);
+
+    #[derive(serde::Serialize)]
+    struct StatusOutput {
+        status: String,
+        analyzed_up_to: String,
+        total_commits: u64,
+    }
+
+    let output = StatusOutput {
+        status: serde_json::to_value(&status)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "unknown".to_string()),
+        analyzed_up_to: map.git.analyzed_up_to,
+        total_commits: map.git.total_commits_analyzed,
+    };
+
+    println!("{}", analyzer_core::output::to_json(&output));
+    Ok(())
+}
+
+fn run_query(query: QueryAction) -> Result<()> {
+    match query {
+        QueryAction::Hotspots { map_file, top, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::hotspots(&map, None, top);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::Coupling { file, map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::coupling(&map, &file, false);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::Ownership { file, map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::ownership(&map, &file);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::BusFactor {
+            map_file,
+            adjust_for_ai,
+            ..
+        } => {
+            let map = load_map(&map_file)?;
+            let result = queries::bus_factor_detailed(&map, adjust_for_ai);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::Bugspots { map_file, top, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::bugspots(&map, top);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::Norms { map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::norms(&map);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::Areas { map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::areas(&map);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::Coldspots { map_file, top, .. } => {
+            let map = load_map(&map_file)?;
+            let mut result = queries::coldspots(&map, None);
+            result.truncate(top);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::Contributors { map_file, top, .. } => {
+            let map = load_map(&map_file)?;
+            let mut result = queries::contributors(&map, None);
+            result.truncate(top);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::AiRatio {
+            map_file,
+            path_filter,
+            ..
+        } => {
+            let map = load_map(&map_file)?;
+            let result = queries::ai_ratio(&map, path_filter.as_deref());
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::ReleaseInfo { map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::release_info(&map);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::Health { map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::health(&map);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::FileHistory { file, map_file, .. } => {
+            let map = load_map(&map_file)?;
+            match queries::file_history(&map, &file) {
+                Some(activity) => println!("{}", output::to_json(activity)),
+                None => {
+                    eprintln!("[WARN] No history found for {}", file);
+                    println!("null");
+                }
+            }
+        }
+        QueryAction::Conventions { map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::conventions(&map);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::TestGaps {
+            map_file,
+            top,
+            min_changes,
+            ..
+        } => {
+            let map = load_map(&map_file)?;
+            let result = queries::test_gaps(&map, min_changes, top);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::DiffRisk {
+            map_file, files, ..
+        } => {
+            let map = load_map(&map_file)?;
+            let file_list: Vec<String> = files.split(',').map(|s| s.trim().to_string()).collect();
+            let result = queries::diff_risk(&map, &file_list);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::DocDrift { map_file, top, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::doc_drift(&map, top);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::RecentAi { map_file, top, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::recent_ai(&map, top);
+            println!("{}", output::to_json(&result));
+        }
+    }
+    Ok(())
+}
+
+fn load_map(path: &Path) -> Result<analyzer_core::types::RepoIntelData> {
+    let json = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read map file: {}", path.display()))?;
+    serde_json::from_str(&json).context("failed to parse map JSON")
+}

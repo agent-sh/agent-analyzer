@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Full git-map JSON schema - the primary output artifact.
+/// Full repo-intel JSON schema - the primary output artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GitMapData {
+pub struct RepoIntelData {
     pub version: String,
     pub generated: DateTime<Utc>,
     pub updated: DateTime<Utc>,
@@ -14,9 +14,7 @@ pub struct GitMapData {
     pub git: GitInfo,
     pub contributors: Contributors,
     pub file_activity: HashMap<String, FileActivity>,
-    pub dir_activity: HashMap<String, DirActivity>,
     pub coupling: HashMap<String, HashMap<String, CouplingEntry>>,
-    pub commit_shape: CommitShape,
     pub conventions: ConventionInfo,
     pub ai_attribution: AiAttribution,
     pub releases: Releases,
@@ -48,6 +46,7 @@ pub struct Contributors {
 #[serde(rename_all = "camelCase")]
 pub struct HumanContributor {
     pub commits: u64,
+    pub recent_commits: u64,
     pub first_seen: String,
     pub last_seen: String,
     pub ai_assisted_commits: u64,
@@ -58,6 +57,7 @@ pub struct HumanContributor {
 #[serde(rename_all = "camelCase")]
 pub struct BotContributor {
     pub commits: u64,
+    pub recent_commits: u64,
     pub first_seen: String,
     pub last_seen: String,
 }
@@ -67,6 +67,7 @@ pub struct BotContributor {
 #[serde(rename_all = "camelCase")]
 pub struct FileActivity {
     pub changes: u64,
+    pub recent_changes: u64,
     pub authors: Vec<String>,
     pub created: String,
     pub last_changed: String,
@@ -76,15 +77,8 @@ pub struct FileActivity {
     pub ai_additions: u64,
     pub ai_deletions: u64,
     pub bug_fix_changes: u64,
-}
-
-/// Per-directory activity metrics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DirActivity {
-    pub changes: u64,
-    pub authors: Vec<String>,
-    pub ai_changes: u64,
+    pub refactor_changes: u64,
+    pub last_bug_fix: String,
 }
 
 /// Coupling entry for co-change tracking between files.
@@ -96,32 +90,6 @@ pub struct CouplingEntry {
     pub ai_cochanges: u64,
 }
 
-/// Commit size distribution and shape metrics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommitShape {
-    pub size_distribution: SizeDistribution,
-    pub files_per_commit: FilesPerCommit,
-    pub merge_commits: u64,
-}
-
-/// Commit size buckets.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SizeDistribution {
-    pub tiny: u64,
-    pub small: u64,
-    pub medium: u64,
-    pub large: u64,
-    pub huge: u64,
-}
-
-/// Files-per-commit statistics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FilesPerCommit {
-    pub median: u64,
-    pub p90: u64,
-}
-
 /// Commit message convention tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,7 +97,6 @@ pub struct ConventionInfo {
     pub prefixes: HashMap<String, u64>,
     pub style: String,
     pub uses_scopes: bool,
-    pub samples: Vec<String>,
 }
 
 /// AI attribution statistics.
@@ -139,6 +106,7 @@ pub struct AiAttribution {
     pub heuristic: u64,
     pub none: u64,
     pub tools: HashMap<String, u64>,
+    pub confidence: String,
 }
 
 /// Release tag tracking.
@@ -344,8 +312,8 @@ mod tests {
     }
 
     #[test]
-    fn test_git_map_data_serialization() {
-        let data = GitMapData {
+    fn test_repo_intel_data_serialization() {
+        let data = RepoIntelData {
             version: "1.0".to_string(),
             generated: Utc::now(),
             updated: Utc::now(),
@@ -363,30 +331,18 @@ mod tests {
                 bots: HashMap::new(),
             },
             file_activity: HashMap::new(),
-            dir_activity: HashMap::new(),
             coupling: HashMap::new(),
-            commit_shape: CommitShape {
-                size_distribution: SizeDistribution {
-                    tiny: 0,
-                    small: 0,
-                    medium: 0,
-                    large: 0,
-                    huge: 0,
-                },
-                files_per_commit: FilesPerCommit { median: 0, p90: 0 },
-                merge_commits: 0,
-            },
             conventions: ConventionInfo {
                 prefixes: HashMap::new(),
                 style: "unknown".to_string(),
                 uses_scopes: false,
-                samples: vec![],
             },
             ai_attribution: AiAttribution {
                 attributed: 0,
                 heuristic: 0,
                 none: 0,
                 tools: HashMap::new(),
+                confidence: "low".to_string(),
             },
             releases: Releases {
                 tags: vec![],
@@ -397,9 +353,10 @@ mod tests {
         };
 
         let json = serde_json::to_string(&data).unwrap();
-        let roundtrip: GitMapData = serde_json::from_str(&json).unwrap();
+        let roundtrip: RepoIntelData = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip.version, "1.0");
         assert_eq!(roundtrip.git.analyzed_up_to, "abc123");
+        assert_eq!(roundtrip.ai_attribution.confidence, "low");
     }
 
     #[test]

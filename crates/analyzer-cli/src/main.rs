@@ -15,10 +15,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Git history analysis - extraction, aggregation, and queries
-    GitMap {
+    /// Repository intelligence - extraction, aggregation, and queries
+    RepoIntel {
         #[command(subcommand)]
-        action: commands::git_map::GitMapAction,
+        action: commands::repo_intel::RepoIntelAction,
     },
     /// AST-based repository symbol mapping (not yet implemented)
     RepoMap {
@@ -41,7 +41,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::GitMap { action } => commands::git_map::run(action),
+        Commands::RepoIntel { action } => commands::repo_intel::run(action),
         Commands::RepoMap { action } => commands::repo_map::run(action),
         Commands::Collect { action } => commands::collect::run(action),
         Commands::SyncCheck { action } => commands::sync_check::run(action),

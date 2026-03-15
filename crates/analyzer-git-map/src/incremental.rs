@@ -1,9 +1,9 @@
 use serde::Serialize;
 
 use analyzer_core::git;
-use analyzer_core::types::GitMapData;
+use analyzer_core::types::RepoIntelData;
 
-/// Status of the cached git-map relative to the repository.
+/// Status of the cached repo-intel map relative to the repository.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MapStatus {
@@ -16,7 +16,7 @@ pub enum MapStatus {
 }
 
 /// Check the status of a cached map against the repository.
-pub fn check_status(map: &GitMapData, repo: &git2::Repository) -> MapStatus {
+pub fn check_status(map: &RepoIntelData, repo: &git2::Repository) -> MapStatus {
     if map.git.analyzed_up_to.is_empty() {
         return MapStatus::Invalid;
     }
@@ -36,7 +36,7 @@ pub fn check_status(map: &GitMapData, repo: &git2::Repository) -> MapStatus {
 }
 
 /// Check if the map needs a full rebuild (force push detected).
-pub fn needs_rebuild(map: &GitMapData, repo: &git2::Repository) -> bool {
+pub fn needs_rebuild(map: &RepoIntelData, repo: &git2::Repository) -> bool {
     if map.git.analyzed_up_to.is_empty() {
         return true;
     }
@@ -47,7 +47,7 @@ pub fn needs_rebuild(map: &GitMapData, repo: &git2::Repository) -> bool {
 ///
 /// Returns empty string for full scan (new map), or the SHA to start from
 /// for incremental update.
-pub fn get_since_sha(map: &GitMapData) -> Option<String> {
+pub fn get_since_sha(map: &RepoIntelData) -> Option<String> {
     if map.git.analyzed_up_to.is_empty() {
         None
     } else {

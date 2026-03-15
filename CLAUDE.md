@@ -47,7 +47,7 @@ analyzer-cli (unified binary, clap dispatch, depends on all above)
 crates/
   analyzer-core/        # Shared library
     src/
-      types.rs          # GitMapData, Contributors, FileActivity, CouplingEntry, AiSignal, CommitDelta, etc.
+      types.rs          # RepoIntelData, Contributors, FileActivity, CouplingEntry, AiSignal, CommitDelta
       git.rs            # git2 wrapper: open_repo, walk_commits, get_commit_diff_stats, renames, deletions
       ai_detect.rs      # AI commit detection using embedded signature registry
       ai_signatures.json # Updateable AI tool signatures (trailers, emails, patterns, bots)
@@ -57,7 +57,7 @@ crates/
     src/
       extractor.rs      # extract_full(), extract_delta() using git2
       aggregator.rs     # create_empty_map(), merge_delta() - full spec implementation
-      queries.rs        # hotspots, coldspots, coupling, ownership, bus_factor, ai_ratio, etc.
+      queries.rs        # hotspots, bugspots, ownership, bus_factor, areas, norms, coupling, etc.
       incremental.rs    # check_status(), needs_rebuild(), get_since_sha()
   analyzer-repo-map/    # Stub (Phase 2)
   analyzer-collectors/  # Stub (Phase 3)
@@ -66,7 +66,7 @@ crates/
     src/
       main.rs           # clap dispatch
       commands/
-        git_map.rs      # init, update, status, query subcommands
+        repo_intel.rs   # init, update, status, query subcommands
         repo_map.rs     # stub
         collect.rs      # stub
         sync_check.rs   # stub
@@ -78,19 +78,24 @@ crates/
 ### Key Types (analyzer-core::types)
 
 ```rust
-GitMapData              // Full JSON output artifact
+RepoIntelData           // Full JSON output artifact (repo-intel.json)
   git: GitInfo          // analyzedUpTo, totalCommitsAnalyzed, dates, scope, shallow
   contributors: Contributors  // humans (HashMap<String, HumanContributor>), bots
-  file_activity: HashMap<String, FileActivity>  // per-file: changes, authors, ai metrics
-  dir_activity: HashMap<String, DirActivity>    // per-directory aggregates
+  file_activity: HashMap<String, FileActivity>  // per-file: changes, recent_changes, authors, ai metrics
   coupling: HashMap<String, HashMap<String, CouplingEntry>>  // co-change pairs
-  commit_shape: CommitShape   // size distribution, files per commit, merge count
-  conventions: ConventionInfo // conventional commit prefixes, style, samples
-  ai_attribution: AiAttribution // attributed/heuristic/none counts, per-tool breakdown
+  conventions: ConventionInfo // conventional commit prefixes, style, usesScopes
+  ai_attribution: AiAttribution // attributed/heuristic/none counts, per-tool breakdown, confidence
   releases: Releases          // tags, cadence
   renames: Vec<RenameEntry>   // file rename tracking
   deletions: Vec<DeletionEntry> // file deletion tracking
 
+FileActivity            // Per-file metrics
+  changes, recent_changes, authors, created, last_changed
+  additions, deletions, ai_changes, ai_additions, ai_deletions
+  bug_fix_changes, refactor_changes, last_bug_fix
+
+HumanContributor        // commits, recent_commits, first_seen, last_seen, ai_assisted_commits
+BotContributor          // commits, recent_commits, first_seen, last_seen
 CommitDelta             // Raw extraction output (commits, renames, deletions)
 CommitInfo              // Parsed commit (hash, author, date, subject, body, trailers, files)
 AiSignal                // Detection result (detected, tool, method)
@@ -109,24 +114,40 @@ Check order (highest confidence first):
 
 Signatures loaded from embedded `ai_signatures.json` - update that file to add new tools.
 
+Note: AI detection confidence is "low" - metadata-based detection catches <15% of AI commits. Phase 5 will add code stylometry for higher accuracy.
+
 ### Query API (analyzer-git-map::queries)
 
-All queries operate on the cached `GitMapData` - no git commands needed.
+All queries operate on the cached `RepoIntelData` - no git commands needed.
 
 | Function | Returns | Notes |
 |----------|---------|-------|
-| `hotspots(map, months, limit)` | `Vec<HotspotEntry>` | Sorted by change count |
-| `coldspots(map, months)` | `Vec<ColdspotEntry>` | Sorted by last_changed ascending |
+| `hotspots(map, _months, limit)` | `Vec<HotspotEntry>` | Recency-weighted score, sorted by score. `months` reserved (90-day window is snapshot-relative) |
+| `coldspots(map, _months)` | `Vec<ColdspotEntry>` | Sorted by last_changed ascending. `months` reserved |
+| `bugspots(map, limit)` | `Vec<BugspotEntry>` | Bug-fix density (fixes/changes ratio) |
 | `coupling(map, file, human_only)` | `Vec<CouplingResult>` | Bidirectional lookup |
-| `ownership(map, path)` | `OwnershipResult` | Primary owner + contributors |
+| `ownership(map, path)` | `OwnershipResult` | With staleness, bus_factor_risk |
 | `bus_factor(map, adjust_for_ai)` | `usize` | People covering 80% of commits |
+| `bus_factor_detailed(map, adjust_for_ai)` | `BusFactorResult` | With critical_owners, at_risk_areas |
+| `norms(map)` | `NormsResult` | Commit conventions (Phase 2 adds code norms) |
+| `areas(map)` | `Vec<AreaEntry>` | Directory-level health (healthy/needs-attention/at-risk) |
 | `contributors(map, months)` | `Vec<ContributorEntry>` | Sorted by commit count |
 | `ai_ratio(map, path_filter)` | `AiRatioResult` | Repo-wide or per-path |
 | `release_info(map)` | `ReleaseInfo` | Cadence, last release, unreleased |
 | `health(map)` | `HealthResult` | Active, bus_factor, frequency, ai_ratio |
 | `file_history(map, path)` | `Option<&FileActivity>` | Single file lookup |
-| `commit_shape(map)` | `CommitShapeResult` | Typical size, files per commit |
 | `conventions(map)` | `ConventionResult` | Style, prefixes, scopes |
+| `test_gaps(map, min_changes, limit)` | `Vec<TestGapEntry>` | Hot files with no co-changing test file |
+| `diff_risk(map, files)` | `Vec<DiffRiskEntry>` | Score file list by composite risk |
+| `doc_drift(map, limit)` | `Vec<DocDriftEntry>` | Doc files with low code coupling |
+| `recent_ai(map, limit)` | `Vec<RecentAiEntry>` | Files with recent AI changes |
+
+### Recency and Staleness
+
+- **Recency window**: 90 days relative to repo's `last_commit_date` (snapshot-relative, not wall clock)
+- **recent_changes/recent_commits**: Counted within the 90-day window
+- **Stale**: A contributor is stale if their `last_seen` is >90 days before `last_commit_date`
+- **Hotspot score**: `(recent_changes * 2 + total_changes) / (total_changes + 1)`
 
 ### Noise Filtering (analyzer-core::walk)
 
@@ -139,13 +160,27 @@ Excluded from coupling and hotspot analysis:
 
 ```
 agent-analyzer --version
-agent-analyzer git-map init [--since=<date>] [--max-commits=N] <path>
-agent-analyzer git-map update <path>
-agent-analyzer git-map status <path>
-agent-analyzer git-map query hotspots [--top=N] <path>
-agent-analyzer git-map query coupling <file> <path>
-agent-analyzer git-map query ownership <file> <path>
-agent-analyzer git-map query bus-factor [--adjust-for-ai] <path>
+agent-analyzer repo-intel init [--max-commits=N] <path>
+agent-analyzer repo-intel update --map-file=<file> <path>
+agent-analyzer repo-intel status --map-file=<file> <path>
+agent-analyzer repo-intel query hotspots [--top=N] --map-file=<file> <path>
+agent-analyzer repo-intel query coldspots [--top=N] --map-file=<file> <path>
+agent-analyzer repo-intel query bugspots [--top=N] --map-file=<file> <path>
+agent-analyzer repo-intel query coupling <file> --map-file=<file> <path>
+agent-analyzer repo-intel query ownership <file> --map-file=<file> <path>
+agent-analyzer repo-intel query bus-factor [--adjust-for-ai] --map-file=<file> <path>
+agent-analyzer repo-intel query norms --map-file=<file> <path>
+agent-analyzer repo-intel query areas --map-file=<file> <path>
+agent-analyzer repo-intel query contributors [--top=N] --map-file=<file> <path>
+agent-analyzer repo-intel query ai-ratio [--path-filter=<path>] --map-file=<file> <path>
+agent-analyzer repo-intel query release-info --map-file=<file> <path>
+agent-analyzer repo-intel query health --map-file=<file> <path>
+agent-analyzer repo-intel query file-history <file> --map-file=<file> <path>
+agent-analyzer repo-intel query conventions --map-file=<file> <path>
+agent-analyzer repo-intel query test-gaps [--top=N] [--min-changes=N] --map-file=<file> <path>
+agent-analyzer repo-intel query diff-risk --files=<a,b,c> --map-file=<file> <path>
+agent-analyzer repo-intel query doc-drift [--top=N] --map-file=<file> <path>
+agent-analyzer repo-intel query recent-ai [--top=N] --map-file=<file> <path>
 agent-analyzer repo-map ...    # "not yet implemented"
 agent-analyzer collect ...     # "not yet implemented"
 agent-analyzer sync-check ...  # "not yet implemented"
@@ -164,17 +199,17 @@ agent-analyzer sync-check ...  # "not yet implemented"
 
 ```bash
 cargo check                           # Compile check
-cargo test                            # Run all tests (43 tests)
+cargo test                            # Run all tests (68 tests)
 cargo build --release                 # Build release binary
 cargo clippy -- -D warnings           # Lint (treat warnings as errors)
 cargo fmt --check                     # Format check
-cargo run --bin agent-analyzer -- --version  # Run CLI
+cargo run -p analyzer-cli -- --version  # Run CLI
 ```
 
 ## Current State
 
-- v0.1.0 - Phase 1 complete (core + git-map + CLI)
-- 43 passing tests (24 analyzer-core, 19 analyzer-git-map)
+- Phase 1 git intelligence upgrade in progress
+- 68 passing tests (24 analyzer-core, 44 analyzer-git-map)
 - Stub crates: analyzer-repo-map, analyzer-collectors, analyzer-sync-check
 - CI: cargo test + clippy + fmt on push/PR
 - Release: 5-target cross-platform builds on tag push
@@ -183,10 +218,11 @@ cargo run --bin agent-analyzer -- --version  # Run CLI
 
 | Phase | Crate | Status | Description |
 |-------|-------|--------|-------------|
-| 1 | analyzer-core, analyzer-git-map, analyzer-cli | Done | Git history analysis |
+| 1 | analyzer-core, analyzer-git-map, analyzer-cli | In Progress | Git intelligence (recency, staleness, bugspots, norms, areas) |
 | 2 | analyzer-repo-map | Stub | AST-based symbol mapping (embed ast-grep) |
 | 3 | analyzer-collectors | Stub | Project data gathering (docs, codebase, github) |
 | 4 | analyzer-sync-check | Stub | Doc-code sync analysis |
+| 5 | analyzer-core | Planned | AI code stylometry (replace metadata-based detection) |
 
 ## Integration
 
@@ -196,7 +232,7 @@ This binary is consumed by JS plugins via the binary resolver in `agent-core/lib
 - Distribution: lazy download on first use, no manual install
 
 Consumers:
-- `git-map` plugin (JS wrapper for `/git-map` command)
+- `git-map` plugin (JS wrapper using `repo-intel` CLI namespace)
 - `repo-map` plugin (Phase 2 - will replace `ast-grep` subprocess)
 - `agent-core/lib/collectors/` (Phase 3 - will replace JS implementations)
 - `sync-docs` plugin (Phase 4 - will replace JS analysis)
@@ -204,7 +240,7 @@ Consumers:
 ## References
 
 - Part of the [agent-sh](https://github.com/agent-sh) ecosystem
-- Spec: `agent-knowledge/git-map-spec.md`
+- Spec: `agent-analyzer/SPEC.md`
 - AI detection: `agent-knowledge/ai-commit-detection-forensics.md`
 - Git analysis research: `agent-knowledge/git-history-analysis-developer-tools.md`
 - https://agentskills.io
