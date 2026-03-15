@@ -43,10 +43,10 @@ If you use the [git-map](https://github.com/agent-sh/git-map) plugin, the binary
 
 ```bash
 # Scan a repository's full git history
-agent-analyzer git-map init ./my-repo > git-map.json
+agent-analyzer repo-intel init ./my-repo > repo-intel.json
 
 # Query the cached result - no git access needed
-agent-analyzer git-map query hotspots ./my-repo --map-file git-map.json --top 5
+agent-analyzer repo-intel query hotspots ./my-repo --map-file repo-intel.json --top 5
 ```
 
 Output (JSON to stdout):
@@ -62,7 +62,7 @@ Progress and errors go to stderr, so piping and redirection work as expected.
 
 ## Core concepts
 
-**Two-phase architecture**: First, `init` or `update` walks git history and produces a `GitMapData` JSON artifact. Then, `query` subcommands operate entirely on that cached artifact - no repository access required.
+**Two-phase architecture**: First, `init` or `update` walks git history and produces a `RepoIntelData` JSON artifact. Then, `query` subcommands operate entirely on that cached artifact - no repository access required.
 
 **Incremental by default**: After the initial scan, `update` only processes commits after `analyzedUpTo`. If a force-push is detected (the recorded SHA is no longer in history), it falls back to a full rebuild automatically.
 
@@ -86,19 +86,19 @@ Progress and errors go to stderr, so piping and redirection work as expected.
 ### Full scan
 
 ```bash
-agent-analyzer git-map init /path/to/repo > git-map.json
+agent-analyzer repo-intel init /path/to/repo > repo-intel.json
 ```
 
 ### Incremental update
 
 ```bash
-agent-analyzer git-map update /path/to/repo --map-file git-map.json > git-map-updated.json
+agent-analyzer repo-intel update /path/to/repo --map-file repo-intel.json > git-map-updated.json
 ```
 
 ### Check status
 
 ```bash
-agent-analyzer git-map status /path/to/repo --map-file git-map.json
+agent-analyzer repo-intel status /path/to/repo --map-file repo-intel.json
 ```
 
 Returns `current`, `stale`, or `rebuild_needed`.
@@ -109,16 +109,16 @@ All queries read from the cached JSON - no git access.
 
 ```bash
 # Most-changed files
-agent-analyzer git-map query hotspots . --map-file git-map.json --top 10
+agent-analyzer repo-intel query hotspots . --map-file repo-intel.json --top 10
 
 # Files that change together with a given file
-agent-analyzer git-map query coupling src/engine.rs . --map-file git-map.json
+agent-analyzer repo-intel query coupling src/engine.rs . --map-file repo-intel.json
 
 # Who owns a file or directory
-agent-analyzer git-map query ownership src/core/ . --map-file git-map.json
+agent-analyzer repo-intel query ownership src/core/ . --map-file repo-intel.json
 
 # Bus factor (people covering 80% of commits)
-agent-analyzer git-map query bus-factor . --map-file git-map.json --adjust-for-ai
+agent-analyzer repo-intel query bus-factor . --map-file repo-intel.json --adjust-for-ai
 ```
 
 ## Architecture
@@ -159,7 +159,7 @@ Signatures are loaded from an embedded JSON registry (`ai_signatures.json`). To 
 ## Development
 
 ```bash
-cargo test                            # 43 tests across all crates
+cargo test                            # 68 tests across all crates
 cargo clippy -- -D warnings           # lint
 cargo fmt --check                     # format check
 cargo build --release                 # optimized binary (LTO + stripped)
