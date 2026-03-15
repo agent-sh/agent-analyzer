@@ -37,6 +37,9 @@
     "dependabot[bot]": "dependabot",
     "renovate[bot]": "renovate",
     "github-actions[bot]": "github-actions",
-    "devin-ai-integration[bot]": "devin"
+    "devin-ai-integration[bot]": "devin",
+    "copilot-swe-agent[bot]": "copilot",
+    "Copilot": "copilot",
+    "agent-core-bot": "agent-core"
   }
 }

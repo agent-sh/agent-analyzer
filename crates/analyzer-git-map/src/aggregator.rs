@@ -1,19 +1,18 @@
 use std::collections::HashMap;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use analyzer_core::ai_detect::{detect_ai, is_bot};
 use analyzer_core::types::{
-    AiAttribution, CommitDelta, CommitShape, CommitSize, Contributors, ConventionInfo, DirActivity,
-    FileActivity, FilesPerCommit, GitInfo, GitMapData, Releases, SizeDistribution,
-    extract_conventional_prefix,
+    AiAttribution, CommitDelta, Contributors, ConventionInfo, FileActivity, GitInfo, Releases,
+    RepoIntelData, extract_conventional_prefix,
 };
 use analyzer_core::walk::is_noise;
 
-/// Create an empty git-map data structure.
-pub fn create_empty_map() -> GitMapData {
+/// Create an empty repo-intel data structure.
+pub fn create_empty_map() -> RepoIntelData {
     let now = Utc::now();
-    GitMapData {
+    RepoIntelData {
         version: "1.0".to_string(),
         generated: now,
         updated: now,
@@ -31,30 +30,18 @@ pub fn create_empty_map() -> GitMapData {
             bots: HashMap::new(),
         },
         file_activity: HashMap::new(),
-        dir_activity: HashMap::new(),
         coupling: HashMap::new(),
-        commit_shape: CommitShape {
-            size_distribution: SizeDistribution {
-                tiny: 0,
-                small: 0,
-                medium: 0,
-                large: 0,
-                huge: 0,
-            },
-            files_per_commit: FilesPerCommit { median: 0, p90: 0 },
-            merge_commits: 0,
-        },
         conventions: ConventionInfo {
             prefixes: HashMap::new(),
             style: "unknown".to_string(),
             uses_scopes: false,
-            samples: vec![],
         },
         ai_attribution: AiAttribution {
             attributed: 0,
             heuristic: 0,
             none: 0,
             tools: HashMap::new(),
+            confidence: "low".to_string(),
         },
         releases: Releases {
             tags: vec![],
@@ -65,12 +52,10 @@ pub fn create_empty_map() -> GitMapData {
     }
 }
 
-/// Merge a commit delta into an existing git-map.
+/// Merge a commit delta into an existing repo-intel map.
 ///
-/// Implements the merge algorithm from the git-map spec section 5.
-pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
-    let mut files_per_commit_values: Vec<u64> = Vec::new();
-
+/// Implements the merge algorithm from the repo-intel spec section 5.
+pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
     for commit in &delta.commits {
         // Determine if author is a bot
         let is_bot_author = is_bot(&commit.author_name);
@@ -84,11 +69,17 @@ pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
                 .entry(commit.author_name.clone())
                 .or_insert_with(|| analyzer_core::types::BotContributor {
                     commits: 0,
+                    recent_commits: 0,
                     first_seen: commit.date.clone(),
                     last_seen: commit.date.clone(),
                 });
             entry.commits += 1;
-            entry.last_seen.clone_from(&commit.date);
+            if commit.date < entry.first_seen {
+                entry.first_seen.clone_from(&commit.date);
+            }
+            if commit.date > entry.last_seen {
+                entry.last_seen.clone_from(&commit.date);
+            }
         } else {
             let entry = map
                 .contributors
@@ -96,12 +87,18 @@ pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
                 .entry(commit.author_name.clone())
                 .or_insert_with(|| analyzer_core::types::HumanContributor {
                     commits: 0,
+                    recent_commits: 0,
                     first_seen: commit.date.clone(),
                     last_seen: commit.date.clone(),
                     ai_assisted_commits: 0,
                 });
             entry.commits += 1;
-            entry.last_seen.clone_from(&commit.date);
+            if commit.date < entry.first_seen {
+                entry.first_seen.clone_from(&commit.date);
+            }
+            if commit.date > entry.last_seen {
+                entry.last_seen.clone_from(&commit.date);
+            }
 
             if ai_signal.detected {
                 entry.ai_assisted_commits += 1;
@@ -117,20 +114,6 @@ pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
             map.ai_attribution.none += 1;
         }
 
-        // Update commit shape - size distribution
-        let total_lines: u64 = commit.files.iter().map(|f| f.additions + f.deletions).sum();
-        let size = CommitSize::classify(total_lines);
-        match size {
-            CommitSize::Tiny => map.commit_shape.size_distribution.tiny += 1,
-            CommitSize::Small => map.commit_shape.size_distribution.small += 1,
-            CommitSize::Medium => map.commit_shape.size_distribution.medium += 1,
-            CommitSize::Large => map.commit_shape.size_distribution.large += 1,
-            CommitSize::Huge => map.commit_shape.size_distribution.huge += 1,
-        }
-
-        // Track files per commit for median/p90 calculation
-        files_per_commit_values.push(commit.files.len() as u64);
-
         // Update conventions
         let prefix = extract_conventional_prefix(&commit.subject);
         if let Some(ref p) = prefix {
@@ -140,11 +123,6 @@ pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
         // Check for scope usage
         if commit.subject.contains('(') && commit.subject.contains(')') {
             map.conventions.uses_scopes = true;
-        }
-
-        // Collect sample commit messages (keep up to 5)
-        if map.conventions.samples.len() < 5 {
-            map.conventions.samples.push(commit.subject.clone());
         }
 
         // Update per-file activity
@@ -161,6 +139,7 @@ pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
                 .entry(file.path.clone())
                 .or_insert_with(|| FileActivity {
                     changes: 0,
+                    recent_changes: 0,
                     authors: vec![],
                     created: commit.date.clone(),
                     last_changed: commit.date.clone(),
@@ -170,10 +149,17 @@ pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
                     ai_additions: 0,
                     ai_deletions: 0,
                     bug_fix_changes: 0,
+                    refactor_changes: 0,
+                    last_bug_fix: String::new(),
                 });
 
             entry.changes += 1;
-            entry.last_changed.clone_from(&commit.date);
+            if commit.date < entry.created {
+                entry.created.clone_from(&commit.date);
+            }
+            if commit.date > entry.last_changed {
+                entry.last_changed.clone_from(&commit.date);
+            }
             entry.additions += file.additions;
             entry.deletions += file.deletions;
 
@@ -189,6 +175,12 @@ pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
 
             if prefix.as_deref() == Some("fix") {
                 entry.bug_fix_changes += 1;
+                if commit.date > entry.last_bug_fix {
+                    entry.last_bug_fix.clone_from(&commit.date);
+                }
+            }
+            if prefix.as_deref() == Some("refactor") {
+                entry.refactor_changes += 1;
             }
         }
 
@@ -219,29 +211,50 @@ pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
             }
         }
 
-        // Update directory activity
-        for file in &commit.files {
-            let dir = file_dir(&file.path);
-            let entry = map.dir_activity.entry(dir).or_insert_with(|| DirActivity {
-                changes: 0,
-                authors: vec![],
-                ai_changes: 0,
-            });
-            entry.changes += 1;
-            if !entry.authors.contains(&commit.author_name) {
-                entry.authors.push(commit.author_name.clone());
-            }
-            if ai_signal.detected {
-                entry.ai_changes += 1;
-            }
-        }
-
         // Update first/last commit dates
         if map.git.first_commit_date.is_empty() || commit.date < map.git.first_commit_date {
             map.git.first_commit_date.clone_from(&commit.date);
         }
         if map.git.last_commit_date.is_empty() || commit.date > map.git.last_commit_date {
             map.git.last_commit_date.clone_from(&commit.date);
+        }
+    }
+
+    // Compute recency: count commits/changes within 90 days of last_commit_date
+    if let Ok(last_date) = DateTime::parse_from_rfc3339(&map.git.last_commit_date) {
+        let cutoff = last_date - chrono::Duration::days(90);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        // Reset recent counts (needed for incremental updates that shift the window)
+        for contributor in map.contributors.humans.values_mut() {
+            contributor.recent_commits = 0;
+        }
+        for contributor in map.contributors.bots.values_mut() {
+            contributor.recent_commits = 0;
+        }
+        for activity in map.file_activity.values_mut() {
+            activity.recent_changes = 0;
+        }
+
+        // Re-count from delta commits
+        for commit in &delta.commits {
+            if commit.date >= cutoff_str {
+                if is_bot(&commit.author_name) {
+                    if let Some(c) = map.contributors.bots.get_mut(&commit.author_name) {
+                        c.recent_commits += 1;
+                    }
+                } else if let Some(c) = map.contributors.humans.get_mut(&commit.author_name) {
+                    c.recent_commits += 1;
+                }
+
+                for file in &commit.files {
+                    if !is_noise(&file.path) {
+                        if let Some(a) = map.file_activity.get_mut(&file.path) {
+                            a.recent_changes += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -263,16 +276,6 @@ pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
     map.git.analyzed_up_to.clone_from(&delta.head);
     map.git.total_commits_analyzed += delta.commits.len() as u64;
 
-    // Update files per commit stats
-    if !files_per_commit_values.is_empty() {
-        files_per_commit_values.sort();
-        let len = files_per_commit_values.len();
-        map.commit_shape.files_per_commit.median = files_per_commit_values[len / 2];
-        let p90_idx = (len as f64 * 0.9) as usize;
-        map.commit_shape.files_per_commit.p90 =
-            files_per_commit_values[p90_idx.min(len.saturating_sub(1))];
-    }
-
     // Detect convention style
     let total_prefixed: u64 = map.conventions.prefixes.values().sum();
     let total_commits = map.git.total_commits_analyzed;
@@ -289,7 +292,7 @@ pub fn merge_delta(map: &mut GitMapData, delta: &CommitDelta) {
 }
 
 /// Extract the directory from a file path (with trailing slash).
-fn file_dir(path: &str) -> String {
+pub fn file_dir(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     if let Some(pos) = normalized.rfind('/') {
         format!("{}/", &normalized[..pos])
@@ -418,6 +421,64 @@ mod tests {
         // Noise files should not appear in file_activity
         assert!(!map.file_activity.contains_key("package-lock.json"));
         assert!(map.file_activity.contains_key("src/app.js"));
+    }
+
+    #[test]
+    fn test_date_ordering_newest_first() {
+        // Simulate revwalk order: newest commit first (TOPOLOGICAL|TIME)
+        let mut map = create_empty_map();
+        let newest = CommitInfo {
+            hash: "new".to_string(),
+            author_name: "alice".to_string(),
+            author_email: "alice@example.com".to_string(),
+            date: "2026-03-14T10:00:00Z".to_string(),
+            subject: "feat: latest".to_string(),
+            body: String::new(),
+            trailers: vec![],
+            files: vec![FileChange {
+                path: "src/main.rs".to_string(),
+                additions: 5,
+                deletions: 0,
+            }],
+        };
+        let oldest = CommitInfo {
+            hash: "old".to_string(),
+            author_name: "alice".to_string(),
+            author_email: "alice@example.com".to_string(),
+            date: "2025-01-01T10:00:00Z".to_string(),
+            subject: "feat: initial".to_string(),
+            body: String::new(),
+            trailers: vec![],
+            files: vec![FileChange {
+                path: "src/main.rs".to_string(),
+                additions: 10,
+                deletions: 0,
+            }],
+        };
+
+        // Newest first, like real revwalk
+        let delta = make_delta(vec![newest, oldest]);
+        merge_delta(&mut map, &delta);
+
+        let activity = &map.file_activity["src/main.rs"];
+        assert!(
+            activity.created <= activity.last_changed,
+            "created ({}) must be <= last_changed ({})",
+            activity.created,
+            activity.last_changed
+        );
+        assert_eq!(activity.created, "2025-01-01T10:00:00Z");
+        assert_eq!(activity.last_changed, "2026-03-14T10:00:00Z");
+
+        let contributor = &map.contributors.humans["alice"];
+        assert!(
+            contributor.first_seen <= contributor.last_seen,
+            "first_seen ({}) must be <= last_seen ({})",
+            contributor.first_seen,
+            contributor.last_seen
+        );
+        assert_eq!(contributor.first_seen, "2025-01-01T10:00:00Z");
+        assert_eq!(contributor.last_seen, "2026-03-14T10:00:00Z");
     }
 
     #[test]
