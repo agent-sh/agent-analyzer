@@ -1152,6 +1152,21 @@ fn detect_structure(map: &RepoIntelData) -> String {
         return format!("workspace with {} crates", crate_dirs.len());
     }
 
+    // Check for plugin framework (plugins/ directory)
+    let plugin_dirs: Vec<&str> = paths
+        .iter()
+        .filter(|p| p.starts_with("plugins/"))
+        .filter_map(|p| {
+            p.strip_prefix("plugins/")
+                .and_then(|rest| rest.split('/').next())
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    if plugin_dirs.len() > 1 {
+        return format!("plugin framework with {} plugins", plugin_dirs.len());
+    }
+
     // Check for monorepo (packages/ directory)
     let package_dirs: Vec<&str> = paths
         .iter()
@@ -1212,12 +1227,17 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
         "src/lib.rs",
         "src/index.ts",
         "src/index.js",
+        "src/app.ts",
         "index.ts",
         "index.js",
+        "bin/cli.js",
+        "bin/index.js",
+        "cli.js",
         "main.go",
         "cmd/main.go",
         "app.py",
         "main.py",
+        "manage.py",
     ];
     for candidate in &entry_candidates {
         if paths.contains(candidate) {
@@ -1286,9 +1306,17 @@ pub fn onboard(map: &RepoIntelData) -> OnboardResult {
     let total_files = map.file_activity.len();
     let bf = bus_factor(map, false);
 
+    let total_contributors = map.contributors.humans.len();
     let h = health(map);
     let health_label = if !h.active {
         "inactive"
+    } else if total_contributors <= 1 {
+        // Single-developer repo: bus factor is always 1, judge by activity instead
+        if h.commit_frequency > 100.0 {
+            "active"
+        } else {
+            "early-stage"
+        }
     } else if bf >= 3 {
         "healthy"
     } else if bf >= 2 {
@@ -1303,9 +1331,21 @@ pub fn onboard(map: &RepoIntelData) -> OnboardResult {
         uses_scopes: n.commits.uses_scopes,
     };
 
-    // Key areas from areas() - top areas by file count
+    // Key areas from areas() - filter noise, sort by file count
     let area_list = areas(map);
-    let key_areas: Vec<KeyArea> = area_list
+    let mut meaningful_areas: Vec<&AreaEntry> = area_list
+        .iter()
+        .filter(|a| {
+            let path = &a.area;
+            // Skip dotfile directories, adapters (platform copies), and tiny areas
+            !path.starts_with('.')
+                && !path.contains("/.")
+                && !path.starts_with("adapters/")
+                && a.files >= 2
+        })
+        .collect();
+    meaningful_areas.sort_by(|a, b| b.files.cmp(&a.files));
+    let key_areas: Vec<KeyArea> = meaningful_areas
         .iter()
         .take(10)
         .map(|a| KeyArea {
@@ -1316,25 +1356,32 @@ pub fn onboard(map: &RepoIntelData) -> OnboardResult {
         })
         .collect();
 
-    // Pain points: areas with both high bug rate and ownership risk
-    let pain_points: Vec<PainPoint> = area_list
+    // Pain points: areas with high bug rate + ownership risk
+    // In single-developer repos, skip the "single owner" signal (it's every area)
+    let is_solo_project = total_contributors <= 1;
+    let mut pain_points: Vec<PainPoint> = area_list
         .iter()
         .filter(|a| {
+            if a.files < 2 {
+                return false;
+            }
             let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(false);
             let high_bug_rate = a.bug_fix_rate >= 0.3;
-            let single_owner = a.owners.len() <= 1;
-            high_bug_rate && (primary_stale || single_owner)
+            let single_owner = !is_solo_project && a.owners.len() <= 1;
+            high_bug_rate && (primary_stale || single_owner || a.bug_fix_rate >= 0.5)
         })
         .map(|a| {
             let mut reasons = Vec::new();
-            if a.bug_fix_rate >= 0.3 {
+            if a.bug_fix_rate >= 0.5 {
+                reasons.push("very high bug-fix rate");
+            } else {
                 reasons.push("high bug-fix rate");
             }
             let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(false);
             if primary_stale {
                 reasons.push("primary owner inactive");
             }
-            if a.owners.len() <= 1 {
+            if !is_solo_project && a.owners.len() <= 1 {
                 reasons.push("single owner");
             }
             PainPoint {
@@ -1343,6 +1390,12 @@ pub fn onboard(map: &RepoIntelData) -> OnboardResult {
             }
         })
         .collect();
+    pain_points.sort_by(|a, b| {
+        b.reason
+            .contains("very high")
+            .cmp(&a.reason.contains("very high"))
+    });
+    pain_points.truncate(10);
 
     let getting_started = detect_commands(map);
 
@@ -2510,11 +2563,18 @@ mod tests {
                     subject: "fix: patch bug".to_string(),
                     body: String::new(),
                     trailers: vec![],
-                    files: vec![FileChange {
-                        path: "src/buggy.rs".to_string(),
-                        additions: 5,
-                        deletions: 2,
-                    }],
+                    files: vec![
+                        FileChange {
+                            path: "src/buggy.rs".to_string(),
+                            additions: 5,
+                            deletions: 2,
+                        },
+                        FileChange {
+                            path: "src/also_buggy.rs".to_string(),
+                            additions: 3,
+                            deletions: 0,
+                        },
+                    ],
                 },
                 CommitInfo {
                     hash: "f2".to_string(),
@@ -2524,11 +2584,18 @@ mod tests {
                     subject: "fix: another bug".to_string(),
                     body: String::new(),
                     trailers: vec![],
-                    files: vec![FileChange {
-                        path: "src/buggy.rs".to_string(),
-                        additions: 3,
-                        deletions: 1,
-                    }],
+                    files: vec![
+                        FileChange {
+                            path: "src/buggy.rs".to_string(),
+                            additions: 3,
+                            deletions: 1,
+                        },
+                        FileChange {
+                            path: "src/also_buggy.rs".to_string(),
+                            additions: 2,
+                            deletions: 1,
+                        },
+                    ],
                 },
             ],
             renames: vec![],
@@ -2545,8 +2612,7 @@ mod tests {
         let src_pain = result.pain_points.iter().find(|p| p.path == "src/");
         assert!(src_pain.is_some(), "src/ should be a pain point");
         let sp = src_pain.unwrap();
-        assert!(sp.reason.contains("high bug-fix rate"));
-        assert!(sp.reason.contains("single owner"));
+        assert!(sp.reason.contains("bug-fix rate"));
     }
 
     #[test]
