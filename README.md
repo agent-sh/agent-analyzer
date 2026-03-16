@@ -119,6 +119,12 @@ agent-analyzer repo-intel query ownership src/core/ . --map-file repo-intel.json
 
 # Bus factor (people covering 80% of commits)
 agent-analyzer repo-intel query bus-factor . --map-file repo-intel.json --adjust-for-ai
+
+# Newcomer orientation summary
+agent-analyzer repo-intel query onboard . --map-file repo-intel.json
+
+# Outside contributor guidance
+agent-analyzer repo-intel query can-i-help . --map-file repo-intel.json
 ```
 
 ## Architecture
@@ -159,7 +165,7 @@ Signatures are loaded from an embedded JSON registry (`ai_signatures.json`). To 
 ## Development
 
 ```bash
-cargo test                            # 68 tests across all crates
+cargo test                            # 77 tests across all crates
 cargo clippy -- -D warnings           # lint
 cargo fmt --check                     # format check
 cargo build --release                 # optimized binary (LTO + stripped)

@@ -141,6 +141,8 @@ All queries operate on the cached `RepoIntelData` - no git commands needed.
 | `diff_risk(map, files)` | `Vec<DiffRiskEntry>` | Score file list by composite risk |
 | `doc_drift(map, limit)` | `Vec<DocDriftEntry>` | Doc files with low code coupling |
 | `recent_ai(map, limit)` | `Vec<RecentAiEntry>` | Files with recent AI changes |
+| `onboard(map)` | `OnboardResult` | Newcomer-oriented repo summary (structure, key areas, pain points) |
+| `can_i_help(map)` | `CanIHelpResult` | Contributor guidance (good-first areas, needs-help areas) |
 
 ### Recency and Staleness
 
@@ -181,6 +183,8 @@ agent-analyzer repo-intel query test-gaps [--top=N] [--min-changes=N] --map-file
 agent-analyzer repo-intel query diff-risk --files=<a,b,c> --map-file=<file> <path>
 agent-analyzer repo-intel query doc-drift [--top=N] --map-file=<file> <path>
 agent-analyzer repo-intel query recent-ai [--top=N] --map-file=<file> <path>
+agent-analyzer repo-intel query onboard --map-file=<file> <path>
+agent-analyzer repo-intel query can-i-help --map-file=<file> <path>
 agent-analyzer repo-map ...    # "not yet implemented"
 agent-analyzer collect ...     # "not yet implemented"
 agent-analyzer sync-check ...  # "not yet implemented"
@@ -199,7 +203,7 @@ agent-analyzer sync-check ...  # "not yet implemented"
 
 ```bash
 cargo check                           # Compile check
-cargo test                            # Run all tests (68 tests)
+cargo test                            # Run all tests (77 tests)
 cargo build --release                 # Build release binary
 cargo clippy -- -D warnings           # Lint (treat warnings as errors)
 cargo fmt --check                     # Format check
@@ -208,8 +212,8 @@ cargo run -p analyzer-cli -- --version  # Run CLI
 
 ## Current State
 
-- Phase 1 git intelligence upgrade in progress
-- 68 passing tests (24 analyzer-core, 44 analyzer-git-map)
+- Phase 1 git intelligence complete
+- 77 passing tests (24 analyzer-core, 53 analyzer-git-map)
 - Stub crates: analyzer-repo-map, analyzer-collectors, analyzer-sync-check
 - CI: cargo test + clippy + fmt on push/PR
 - Release: 5-target cross-platform builds on tag push
@@ -218,7 +222,7 @@ cargo run -p analyzer-cli -- --version  # Run CLI
 
 | Phase | Crate | Status | Description |
 |-------|-------|--------|-------------|
-| 1 | analyzer-core, analyzer-git-map, analyzer-cli | In Progress | Git intelligence (recency, staleness, bugspots, norms, areas) |
+| 1 | analyzer-core, analyzer-git-map, analyzer-cli | Complete | Git intelligence (recency, staleness, bugspots, norms, areas, onboard, can-i-help) |
 | 2 | analyzer-repo-map | Stub | AST-based symbol mapping (embed ast-grep) |
 | 3 | analyzer-collectors | Stub | Project data gathering (docs, codebase, github) |
 | 4 | analyzer-sync-check | Stub | Doc-code sync analysis |
