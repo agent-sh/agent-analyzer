@@ -445,14 +445,14 @@ fn run_query(query: QueryAction) -> Result<()> {
             let result = queries::recent_ai(&map, top);
             println!("{}", output::to_json(&result));
         }
-        QueryAction::Onboard { map_file, .. } => {
+        QueryAction::Onboard { path, map_file } => {
             let map = load_map(&map_file)?;
-            let result = queries::onboard(&map);
+            let result = queries::onboard(&map, Some(&path));
             println!("{}", output::to_json(&result));
         }
-        QueryAction::CanIHelp { map_file, .. } => {
+        QueryAction::CanIHelp { path, map_file } => {
             let map = load_map(&map_file)?;
-            let result = queries::can_i_help(&map);
+            let result = queries::can_i_help(&map, Some(&path));
             println!("{}", output::to_json(&result));
         }
     }
