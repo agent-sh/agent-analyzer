@@ -1167,6 +1167,14 @@ fn detect_structure(map: &RepoIntelData) -> String {
         return format!("plugin framework with {} plugins", plugin_dirs.len());
     }
 
+    // Check for Go module layout (cmd/ + pkg/ or internal/)
+    let has_cmd = paths.iter().any(|p| p.starts_with("cmd/"));
+    let has_pkg = paths.iter().any(|p| p.starts_with("pkg/"));
+    let has_internal = paths.iter().any(|p| p.starts_with("internal/"));
+    if has_cmd && (has_pkg || has_internal) {
+        return "Go module layout".to_string();
+    }
+
     // Check for monorepo (packages/ directory)
     let package_dirs: Vec<&str> = paths
         .iter()
@@ -1180,6 +1188,11 @@ fn detect_structure(map: &RepoIntelData) -> String {
         .collect();
     if package_dirs.len() > 1 {
         return format!("monorepo with {} packages", package_dirs.len());
+    }
+
+    // Check for Java/Maven layout (src/main/java/)
+    if paths.iter().any(|p| p.starts_with("src/main/java/")) {
+        return "Maven project layout".to_string();
     }
 
     // Check for src/ + lib/ split
@@ -1206,6 +1219,10 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
     let has_cargo = paths.contains(&"Cargo.toml");
     let has_package_json = paths.contains(&"package.json");
     let has_go_mod = paths.contains(&"go.mod");
+    let has_pyproject = paths.contains(&"pyproject.toml");
+    let has_setup_py = paths.contains(&"setup.py");
+    let has_pom = paths.contains(&"pom.xml");
+    let has_gradle = paths.contains(&"build.gradle") || paths.contains(&"build.gradle.kts");
     let has_makefile = paths.contains(&"Makefile") || paths.contains(&"makefile");
 
     let (build_cmd, test_cmd) = if has_cargo {
@@ -1214,6 +1231,14 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
         ("npm install", "npm test")
     } else if has_go_mod {
         ("go build ./...", "go test ./...")
+    } else if has_pyproject {
+        ("pip install -e .", "pytest")
+    } else if has_setup_py {
+        ("pip install -e .", "pytest")
+    } else if has_pom {
+        ("mvn compile", "mvn test")
+    } else if has_gradle {
+        ("./gradlew build", "./gradlew test")
     } else if has_makefile {
         ("make", "make test")
     } else {
@@ -1223,21 +1248,30 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
     // Find entry points
     let mut entry_points = Vec::new();
     let entry_candidates = [
+        // Rust
         "src/main.rs",
         "src/lib.rs",
+        // JS/TS
         "src/index.ts",
         "src/index.js",
         "src/app.ts",
+        "src/app.js",
         "index.ts",
         "index.js",
         "bin/cli.js",
         "bin/index.js",
         "cli.js",
+        // Go
         "main.go",
         "cmd/main.go",
+        // Python
         "app.py",
         "main.py",
         "manage.py",
+        "__main__.py",
+        "src/__main__.py",
+        // Java
+        "src/main/java/App.java",
     ];
     for candidate in &entry_candidates {
         if paths.contains(candidate) {
@@ -1245,9 +1279,11 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
         }
     }
 
-    // Also look for main.rs in crate subdirectories
+    // Also look for main.rs in crate subdirs and main.go in cmd/ subdirs
     for path in &paths {
-        if path.ends_with("/main.rs") && !entry_points.contains(&path.to_string()) {
+        if (path.ends_with("/main.rs") || path.ends_with("/main.go"))
+            && !entry_points.contains(&path.to_string())
+        {
             entry_points.push(path.to_string());
         }
     }
@@ -1273,25 +1309,90 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
 }
 
 /// Infer the purpose of a directory area from its name.
+/// Handles conventions across JS/TS, Rust, Go, Python, Java ecosystems.
 fn infer_area_purpose(area: &str) -> String {
     let name = area.trim_end_matches('/');
     let leaf = name.rsplit('/').next().unwrap_or(name);
     match leaf.to_lowercase().as_str() {
+        // Source code
         "src" => "source code".to_string(),
         "lib" => "library code".to_string(),
-        "test" | "tests" | "__tests__" => "test suite".to_string(),
-        "docs" | "doc" => "documentation".to_string(),
+        "pkg" => "public packages".to_string(),
+        "internal" => "internal packages (not exported)".to_string(),
+        "crates" => "workspace crates".to_string(),
+
+        // Tests
+        "test" | "tests" | "__tests__" | "spec" | "specs" => "test suite".to_string(),
+        "fixtures" | "testdata" | "test-data" => "test fixtures".to_string(),
+        "e2e" | "integration" => "integration tests".to_string(),
+        "fuzzer" | "fuzz" => "fuzz testing".to_string(),
+
+        // Entrypoints and CLI
         "bin" | "cmd" => "binary entrypoints".to_string(),
-        "config" | "cfg" => "configuration".to_string(),
-        "utils" | "util" | "helpers" | "helper" => "shared utilities".to_string(),
-        "core" => "core logic".to_string(),
-        "api" => "API layer".to_string(),
         "cli" => "command-line interface".to_string(),
-        "web" | "ui" | "frontend" => "user interface".to_string(),
-        "server" | "backend" => "server-side logic".to_string(),
-        "models" | "types" => "data models and types".to_string(),
+
+        // Config and build
+        "config" | "cfg" | "conf" => "configuration".to_string(),
         "scripts" => "build and automation scripts".to_string(),
+        "build" | "dist" | "out" | "target" => "build output".to_string(),
+
+        // Architecture layers
+        "core" => "core logic".to_string(),
+        "api" | "routes" | "handlers" | "controllers" | "endpoints" => "API layer".to_string(),
+        "web" | "ui" | "frontend" | "app" | "pages" | "views" => "user interface".to_string(),
+        "server" | "backend" => "server-side logic".to_string(),
+        "models" | "types" | "schemas" | "entities" => "data models and types".to_string(),
+        "utils" | "util" | "helpers" | "helper" | "common" | "shared" => {
+            "shared utilities".to_string()
+        }
+        "services" | "domain" => "business logic".to_string(),
+        "middleware" => "middleware layer".to_string(),
+        "db" | "database" | "migrations" | "prisma" => "database layer".to_string(),
+        "auth" | "iam" => "authentication and authorization".to_string(),
+
+        // Plugin/extension systems
+        "plugins" | "extensions" | "addons" | "modules" => "plugin system".to_string(),
+        "agents" => "AI agent definitions".to_string(),
+        "skills" => "skill definitions".to_string(),
+        "commands" => "command definitions".to_string(),
+        "hooks" => "lifecycle hooks".to_string(),
+
+        // Documentation and knowledge
+        "docs" | "doc" | "documentation" => "documentation".to_string(),
+        "examples" | "example" | "demo" | "demos" => "usage examples".to_string(),
+        "benchmarks" | "benches" | "bench" | "perf" => "performance benchmarks".to_string(),
+        "agent-knowledge" => "AI research guides".to_string(),
+        "checklists" => "process checklists".to_string(),
+
+        // Infrastructure
         ".github" => "CI/CD and GitHub configuration".to_string(),
+        ".kiro" | ".cursor" | ".vscode" => "editor configuration".to_string(),
+        "deploy" | "infra" | "terraform" | "k8s" => "deployment infrastructure".to_string(),
+        "docker" => "container configuration".to_string(),
+
+        // Assets
+        "assets" | "static" | "public" => "static assets".to_string(),
+        "components" => "UI components".to_string(),
+        "styles" | "css" => "stylesheets".to_string(),
+
+        // State and data
+        "state" => "state management".to_string(),
+        "store" | "stores" => "data stores".to_string(),
+        "cache" => "caching layer".to_string(),
+        "collectors" => "data collectors".to_string(),
+        "patterns" => "detection patterns".to_string(),
+        "platform" => "platform abstraction".to_string(),
+        "cross-platform" => "cross-platform compatibility".to_string(),
+        "sources" => "data sources".to_string(),
+        "discovery" => "auto-discovery logic".to_string(),
+        "enhance" => "enhancement analyzers".to_string(),
+        "serializers" => "data serialization".to_string(),
+
+        // Workspace/monorepo
+        "packages" => "monorepo packages".to_string(),
+        "workspaces" => "workspace packages".to_string(),
+        "vendor" | "third-party" => "vendored dependencies".to_string(),
+
         _ => format!("{leaf} module"),
     }
 }
