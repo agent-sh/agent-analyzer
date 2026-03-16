@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use std::path::Path;
 
 use chrono::DateTime;
 use serde::Serialize;
@@ -487,9 +489,18 @@ pub struct AreaEntry {
 pub fn areas(map: &RepoIntelData) -> Vec<AreaEntry> {
     let repo_last = &map.git.last_commit_date;
 
-    // Group files by directory
+    // Build set of deleted file paths for filtering
+    let deleted_paths: HashSet<&str> = map.deletions.iter().map(|d| d.path.as_str()).collect();
+
+    // Also collect old paths from renames
+    let renamed_from: HashSet<&str> = map.renames.iter().map(|r| r.from.as_str()).collect();
+
+    // Group files by directory, excluding deleted and renamed-from files
     let mut dir_files: HashMap<String, Vec<(&String, &FileActivity)>> = HashMap::new();
     for (path, activity) in &map.file_activity {
+        if deleted_paths.contains(path.as_str()) || renamed_from.contains(path.as_str()) {
+            continue;
+        }
         let dir = file_dir(path);
         dir_files.entry(dir).or_default().push((path, activity));
     }
@@ -1310,10 +1321,48 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
 
 /// Infer the purpose of a directory area from its name.
 /// Handles conventions across JS/TS, Rust, Go, Python, Java ecosystems.
+/// Check if a directory path looks like generated/archival data.
+fn is_generated_dir(area: &str) -> bool {
+    let lower = area.to_lowercase();
+    // Direct leaf matches
+    let leaf = lower.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    matches!(
+        leaf,
+        "results" | "coverage" | "reports" | "snapshots" | "__snapshots__"
+    ) || lower.contains("benchmark") && lower.contains("results")
+}
+
+/// Priority tier for key areas sorting. Lower = higher priority.
+/// Source code dirs rank above test/doc/benchmark dirs.
+fn area_tier(area: &str) -> u8 {
+    let leaf = area.trim_end_matches('/').rsplit('/').next().unwrap_or(area);
+    let lower = leaf.to_lowercase();
+    match lower.as_str() {
+        // Tier 0: root files
+        "./" | "." => 0,
+        // Tier 1: source code directories
+        "src" | "lib" | "pkg" | "internal" | "core" | "crates" | "packages" | "modules"
+        | "app" | "apps" | "server" | "api" | "routes" | "handlers" | "controllers"
+        | "services" | "models" | "views" | "components" | "middleware" | "plugins"
+        | "commands" | "cmd" | "bin" => 1,
+        // Tier 3: test/doc/benchmark/example (lower priority)
+        "test" | "tests" | "__tests__" | "spec" | "specs" | "e2e" | "integration"
+        | "docs" | "doc" | "documentation" | "benchmarks" | "benchmark" | "examples"
+        | "example" | "fixtures" | "testdata" | "fuzz" | "fuzzer" => 3,
+        // Tier 4: generated/archival data
+        "results" | "coverage" | "reports" | "assets" | "imgs" | "images" | "static"
+        | "public" | "dist" | "build" => 4,
+        // Tier 2: everything else
+        _ => 2,
+    }
+}
+
 fn infer_area_purpose(area: &str) -> String {
     let name = area.trim_end_matches('/');
     let leaf = name.rsplit('/').next().unwrap_or(name);
     match leaf.to_lowercase().as_str() {
+        // Root directory
+        "." => "project root".to_string(),
         // Source code
         "src" => "source code".to_string(),
         "lib" => "library code".to_string(),
@@ -1401,7 +1450,7 @@ fn infer_area_purpose(area: &str) -> String {
 ///
 /// Derives language, structure, health, conventions, key areas, pain points,
 /// and getting-started info from the cached `RepoIntelData`.
-pub fn onboard(map: &RepoIntelData) -> OnboardResult {
+pub fn onboard(map: &RepoIntelData, repo_path: Option<&Path>) -> OnboardResult {
     let language = detect_language(map);
     let structure = detect_structure(map);
     let total_files = map.file_activity.len();
@@ -1432,20 +1481,42 @@ pub fn onboard(map: &RepoIntelData) -> OnboardResult {
         uses_scopes: n.commits.uses_scopes,
     };
 
-    // Key areas from areas() - filter noise, sort by file count
+    // Key areas from areas() - prioritize source code over tests/docs/benchmarks
     let area_list = areas(map);
     let mut meaningful_areas: Vec<&AreaEntry> = area_list
         .iter()
         .filter(|a| {
             let path = &a.area;
-            // Skip dotfile directories, adapters (platform copies), and tiny areas
-            !path.starts_with('.')
-                && !path.contains("/.")
-                && !path.starts_with("adapters/")
-                && a.files >= 2
+            // Skip dotfile directories (but NOT "./"), adapters, tiny areas, generated data
+            if (path.starts_with('.') && path != "./")
+                || path.contains("/.")
+                || path.starts_with("adapters/")
+                || a.files < 2
+            {
+                return false;
+            }
+            // Filter generated/archival data directories
+            if is_generated_dir(path) {
+                return false;
+            }
+            // Filesystem validation: skip dirs that don't exist on disk (phantom dirs)
+            if let Some(rp) = repo_path {
+                let dir_path = rp.join(path.trim_end_matches('/'));
+                if !dir_path.exists() {
+                    return false;
+                }
+            }
+            true
         })
         .collect();
-    meaningful_areas.sort_by(|a, b| b.files.cmp(&a.files));
+    // Sort by: source dirs first (tier weight), then by hotspot score within tier
+    meaningful_areas.sort_by(|a, b| {
+        let tier_a = area_tier(&a.area);
+        let tier_b = area_tier(&b.area);
+        tier_a
+            .cmp(&tier_b)
+            .then(b.hotspot_score.partial_cmp(&a.hotspot_score).unwrap_or(std::cmp::Ordering::Equal))
+    });
     let key_areas: Vec<KeyArea> = meaningful_areas
         .iter()
         .take(10)
@@ -1560,7 +1631,7 @@ pub struct CanIHelpResult {
 ///
 /// Identifies good first areas (low complexity, non-stale owners) and
 /// areas that need help (high bug rate or stale owners).
-pub fn can_i_help(map: &RepoIntelData) -> CanIHelpResult {
+pub fn can_i_help(map: &RepoIntelData, repo_path: Option<&Path>) -> CanIHelpResult {
     let n = norms(map);
     let conv = ConventionSummary {
         commit_style: n.commits.style,
@@ -1571,13 +1642,25 @@ pub fn can_i_help(map: &RepoIntelData) -> CanIHelpResult {
     let repo_last = &map.git.last_commit_date;
 
     // Good first areas: low hotspot score AND non-stale primary owner
-    let good_first_areas: Vec<GoodFirstArea> = area_list
+    let mut good_first_areas: Vec<GoodFirstArea> = area_list
         .iter()
         .filter(|a| {
             let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(true);
             let low_hotspot = a.hotspot_score < 1.5;
             let low_bug_rate = a.bug_fix_rate < 0.3;
-            !primary_stale && low_hotspot && low_bug_rate
+            if !(!primary_stale && low_hotspot && low_bug_rate && a.files >= 1) {
+                return false;
+            }
+            // Skip generated data and phantom dirs
+            if is_generated_dir(&a.area) {
+                return false;
+            }
+            if let Some(rp) = repo_path {
+                if !rp.join(a.area.trim_end_matches('/')).exists() {
+                    return false;
+                }
+            }
+            true
         })
         .map(|a| {
             let mut reasons = Vec::new();
@@ -1603,13 +1686,47 @@ pub fn can_i_help(map: &RepoIntelData) -> CanIHelpResult {
         })
         .collect();
 
-    // Needs help: high bug rate OR stale owners
+    // Fallback: if no good-first areas found, look for docs/examples/small self-contained dirs
+    if good_first_areas.is_empty() {
+        let fallback_patterns = ["docs", "doc", "examples", "example", "contrib", "site"];
+        for a in &area_list {
+            let leaf = a.area.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            let exists = repo_path
+                .map(|rp| rp.join(a.area.trim_end_matches('/')).exists())
+                .unwrap_or(true);
+            if fallback_patterns.contains(&leaf.to_lowercase().as_str())
+                && a.files >= 1
+                && exists
+                && !is_generated_dir(&a.area)
+            {
+                good_first_areas.push(GoodFirstArea {
+                    path: a.area.clone(),
+                    reason: "documentation or examples - approachable for newcomers".to_string(),
+                    files: a.files,
+                    hotspot_score: a.hotspot_score,
+                });
+            }
+        }
+    }
+
+    // Needs help: high bug rate OR stale owners (skip phantom/generated dirs)
     let needs_help: Vec<NeedsHelpArea> = area_list
         .iter()
         .filter(|a| {
             let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(false);
             let high_bug_rate = a.bug_fix_rate >= 0.3;
-            primary_stale || high_bug_rate
+            if !(primary_stale || high_bug_rate) {
+                return false;
+            }
+            if is_generated_dir(&a.area) {
+                return false;
+            }
+            if let Some(rp) = repo_path {
+                if !rp.join(a.area.trim_end_matches('/')).exists() {
+                    return false;
+                }
+            }
+            true
         })
         .map(|a| {
             let primary_stale = a.owners.first().map(|o| o.stale).unwrap_or(false);
@@ -2364,7 +2481,7 @@ mod tests {
     #[test]
     fn test_onboard() {
         let map = make_test_map();
-        let result = onboard(&map);
+        let result = onboard(&map, None);
 
         // Language should be detected from .rs files
         assert_eq!(result.language, "rust");
@@ -2436,7 +2553,7 @@ mod tests {
         };
         merge_delta(&mut map, &delta);
 
-        let result = onboard(&map);
+        let result = onboard(&map, None);
         assert_eq!(result.language, "typescript");
         // package.json detected -> npm commands
         assert_eq!(result.getting_started.build_command, "npm install");
@@ -2493,7 +2610,7 @@ mod tests {
         };
         merge_delta(&mut map, &delta);
 
-        let result = onboard(&map);
+        let result = onboard(&map, None);
         assert!(
             result.structure.contains("workspace"),
             "should detect workspace structure: {}",
@@ -2509,7 +2626,7 @@ mod tests {
     #[test]
     fn test_can_i_help() {
         let map = make_test_map();
-        let result = can_i_help(&map);
+        let result = can_i_help(&map, None);
 
         // Conventions should be populated
         assert_eq!(result.conventions.commit_style, "conventional");
@@ -2540,7 +2657,7 @@ mod tests {
     #[test]
     fn test_can_i_help_with_staleness() {
         let map = make_staleness_test_map();
-        let result = can_i_help(&map);
+        let result = can_i_help(&map, None);
 
         // With staleness, src/ area should appear in needs_help
         // (alice is stale, bob is active; bug_fix_rate is 0.5 >= 0.3)
@@ -2621,7 +2738,7 @@ mod tests {
         };
         merge_delta(&mut map, &delta);
 
-        let result = can_i_help(&map);
+        let result = can_i_help(&map, None);
         // utils/ area has 2 total changes on helpers.rs, 0 recent, 1 on format.rs, 0 recent
         // hotspot_score for helpers: (0*2 + 2)/(2+1) = 0.67
         // hotspot_score for format: (0*2 + 1)/(1+1) = 0.5
@@ -2637,7 +2754,7 @@ mod tests {
     #[test]
     fn test_onboard_serialization() {
         let map = make_test_map();
-        let result = onboard(&map);
+        let result = onboard(&map, None);
         // Ensure it serializes to valid JSON
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"language\""));
@@ -2704,7 +2821,7 @@ mod tests {
         };
         merge_delta(&mut map, &delta);
 
-        let result = onboard(&map);
+        let result = onboard(&map, None);
         // src/ has: bug_fix_rate=1.0, single owner (alice) => pain point
         assert!(
             !result.pain_points.is_empty(),
@@ -2719,7 +2836,7 @@ mod tests {
     #[test]
     fn test_can_i_help_serialization() {
         let map = make_test_map();
-        let result = can_i_help(&map);
+        let result = can_i_help(&map, None);
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"conventions\""));
         assert!(json.contains("\"goodFirstAreas\""));
