@@ -10,7 +10,7 @@ use analyzer_core::types::{DefinitionEntry, FileSymbols, ImportEntry, SymbolEntr
 use analyzer_core::walk;
 
 use crate::complexity::cyclomatic_complexity;
-use crate::parser::{detect_language, parse_source, Language};
+use crate::parser::{Language, detect_language, parse_source};
 
 /// Maximum file size to parse (500KB). Larger files are likely generated.
 const MAX_FILE_SIZE: u64 = 500_000;
@@ -1397,14 +1397,16 @@ mod tests {
         assert_eq!(syms.definitions[1].kind, SymbolKind::Field);
         assert_eq!(syms.definitions[1].name, "name");
         assert_eq!(syms.definitions[2].kind, SymbolKind::Enum);
-        assert!(syms
-            .definitions
-            .iter()
-            .any(|d| d.name == "Active" && d.kind == SymbolKind::EnumVariant));
-        assert!(syms
-            .definitions
-            .iter()
-            .any(|d| d.name == "Inactive" && d.kind == SymbolKind::EnumVariant));
+        assert!(
+            syms.definitions
+                .iter()
+                .any(|d| d.name == "Active" && d.kind == SymbolKind::EnumVariant)
+        );
+        assert!(
+            syms.definitions
+                .iter()
+                .any(|d| d.name == "Inactive" && d.kind == SymbolKind::EnumVariant)
+        );
     }
 
     #[test]
