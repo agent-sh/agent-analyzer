@@ -241,6 +241,48 @@ pub enum QueryAction {
         #[arg(long)]
         map_file: PathBuf,
     },
+    /// Show AST symbols for a specific file
+    Symbols {
+        /// File to query symbols for
+        file: String,
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Find all files that depend on a symbol
+    Dependents {
+        /// Symbol name to search for
+        symbol: String,
+        /// Repository path
+        path: PathBuf,
+        /// Restrict to definitions in this file
+        #[arg(long)]
+        file: Option<String>,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show stale documentation references (symbol-level)
+    StaleDocs {
+        /// Repository path
+        path: PathBuf,
+        /// Maximum number of results
+        #[arg(long, default_value = "20")]
+        top: usize,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show project metadata (languages, CI, license, README)
+    ProjectInfo {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
 }
 
 pub fn run(action: RepoIntelAction) -> Result<()> {
@@ -524,6 +566,74 @@ fn run_query(query: QueryAction) -> Result<()> {
             let map = load_map(&map_file)?;
             let result = queries::can_i_help(&map, Some(&path));
             println!("{}", output::to_json(&result));
+        }
+        QueryAction::Symbols { file, map_file, .. } => {
+            let map = load_map(&map_file)?;
+            match (map.symbols.as_ref(), map.import_graph.as_ref()) {
+                (Some(syms), Some(graph)) => {
+                    match analyzer_repo_map::queries::symbols(syms, graph, &file) {
+                        Some(result) => println!("{}", output::to_json(&result)),
+                        None => {
+                            eprintln!("[WARN] No symbols found for {}", file);
+                            println!("null");
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("[WARN] No symbol data in map. Run repo-intel init to generate.");
+                    println!("null");
+                }
+            }
+        }
+        QueryAction::Dependents {
+            symbol,
+            file,
+            map_file,
+            ..
+        } => {
+            let map = load_map(&map_file)?;
+            match map.symbols.as_ref() {
+                Some(syms) => {
+                    let result = analyzer_repo_map::queries::dependents(
+                        syms,
+                        &symbol,
+                        file.as_deref(),
+                    );
+                    println!("{}", output::to_json(&result));
+                }
+                None => {
+                    eprintln!("[WARN] No symbol data in map. Run repo-intel init to generate.");
+                    println!("null");
+                }
+            }
+        }
+        QueryAction::StaleDocs {
+            path,
+            top,
+            map_file,
+        } => {
+            let map = load_map(&map_file)?;
+            match map.symbols.as_ref() {
+                Some(syms) => {
+                    let result =
+                        analyzer_sync_check::queries::stale_docs(&path, &map, syms, top)?;
+                    println!("{}", output::to_json(&result));
+                }
+                None => {
+                    eprintln!("[WARN] No symbol data in map. Run repo-intel init to generate.");
+                    println!("[]");
+                }
+            }
+        }
+        QueryAction::ProjectInfo { map_file, .. } => {
+            let map = load_map(&map_file)?;
+            match map.project {
+                Some(project) => println!("{}", output::to_json(&project)),
+                None => {
+                    eprintln!("[WARN] No project metadata in map. Run repo-intel init to generate.");
+                    println!("null");
+                }
+            }
         }
     }
     Ok(())
