@@ -121,7 +121,7 @@ pub fn bugspots(map: &RepoIntelData, limit: usize) -> Vec<BugspotEntry> {
     let mut entries: Vec<BugspotEntry> = map
         .file_activity
         .iter()
-        .filter(|(_, activity)| activity.bug_fix_changes > 0)
+        .filter(|(_, activity)| activity.bug_fix_changes > 0 && activity.changes > 0)
         .map(|(path, activity)| {
             let rate = activity.bug_fix_changes as f64 / activity.changes as f64;
             BugspotEntry {
