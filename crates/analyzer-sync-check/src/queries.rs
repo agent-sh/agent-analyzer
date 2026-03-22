@@ -59,12 +59,7 @@ pub fn stale_docs(
         // Extract and match references
         if let Ok(raw_refs) = parser::extract_code_refs(path) {
             let mut matched = matcher::match_refs(&raw_refs, symbols);
-            checker::check_staleness(
-                &mut matched,
-                &map.renames,
-                &map.deletions,
-                &hotspot_files,
-            );
+            checker::check_staleness(&mut matched, &map.renames, &map.deletions, &hotspot_files);
 
             // Collect entries with issues
             for code_ref in &matched {
@@ -120,18 +115,11 @@ pub fn build_doc_refs(
             }
 
             let mut matched = matcher::match_refs(&raw_refs, symbols);
-            checker::check_staleness(
-                &mut matched,
-                &map.renames,
-                &map.deletions,
-                &hotspot_files,
-            );
+            checker::check_staleness(&mut matched, &map.renames, &map.deletions, &hotspot_files);
 
-            let references_hot = matched.iter().any(|r| {
-                r.file
-                    .as_ref()
-                    .is_some_and(|f| hotspot_files.contains(f))
-            });
+            let references_hot = matched
+                .iter()
+                .any(|r| r.file.as_ref().is_some_and(|f| hotspot_files.contains(f)));
 
             // Get doc file last modified date
             let last_updated = std::fs::metadata(path)
@@ -185,21 +173,28 @@ fn severity(issue: &str) -> u8 {
 fn make_suggestion(issue: &str, code_ref: &CodeRef, map: &RepoIntelData) -> String {
     match issue {
         "symbol-not-found" => {
-            format!("Symbol `{}` not found in codebase - may have been removed", code_ref.symbol)
+            format!(
+                "Symbol `{}` not found in codebase - may have been removed",
+                code_ref.symbol
+            )
         }
         "symbol-deleted" => {
-            if let Some(del) = map.deletions.iter().find(|d| {
-                code_ref.file.as_ref().is_some_and(|f| f == &d.path)
-            }) {
+            if let Some(del) = map
+                .deletions
+                .iter()
+                .find(|d| code_ref.file.as_ref().is_some_and(|f| f == &d.path))
+            {
                 format!("File `{}` was deleted in commit {}", del.path, del.commit)
             } else {
                 "Referenced file was deleted".to_string()
             }
         }
         "symbol-renamed" => {
-            if let Some(rename) = map.renames.iter().find(|r| {
-                code_ref.file.as_ref().is_some_and(|f| f == &r.from)
-            }) {
+            if let Some(rename) = map
+                .renames
+                .iter()
+                .find(|r| code_ref.file.as_ref().is_some_and(|f| f == &r.from))
+            {
                 format!("Renamed from `{}` to `{}`", rename.from, rename.to)
             } else {
                 "Referenced symbol was renamed".to_string()
