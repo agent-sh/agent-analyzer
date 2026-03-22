@@ -20,17 +20,17 @@ enum Commands {
         #[command(subcommand)]
         action: commands::repo_intel::RepoIntelAction,
     },
-    /// AST-based repository symbol mapping (not yet implemented)
+    /// AST-based repository symbol mapping
     RepoMap {
         #[command(subcommand)]
         action: commands::repo_map::RepoMapAction,
     },
-    /// Project data gathering (not yet implemented)
+    /// Project data gathering
     Collect {
         #[command(subcommand)]
         action: commands::collect::CollectAction,
     },
-    /// Doc-code sync analysis (not yet implemented)
+    /// Doc-code sync analysis
     SyncCheck {
         #[command(subcommand)]
         action: commands::sync_check::SyncCheckAction,

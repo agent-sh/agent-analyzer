@@ -1,6 +1,9 @@
-//! Phase 4 stub - doc-code sync analysis. Not yet implemented.
+//! Phase 4 - Doc-code cross-reference and sync checking.
+//!
+//! Parses markdown files for code references, matches them against
+//! a symbol table, and detects stale references.
 
-/// Placeholder for the sync-check crate.
-pub fn placeholder() {
-    unimplemented!("This crate will be implemented in a future phase");
-}
+mod checker;
+mod matcher;
+mod parser;
+pub mod queries;

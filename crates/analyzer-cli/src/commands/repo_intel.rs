@@ -241,6 +241,48 @@ pub enum QueryAction {
         #[arg(long)]
         map_file: PathBuf,
     },
+    /// Show AST symbols for a specific file
+    Symbols {
+        /// File to query symbols for
+        file: String,
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Find all files that depend on a symbol
+    Dependents {
+        /// Symbol name to search for
+        symbol: String,
+        /// Repository path
+        path: PathBuf,
+        /// Restrict to definitions in this file
+        #[arg(long)]
+        file: Option<String>,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show stale documentation references (symbol-level)
+    StaleDocs {
+        /// Repository path
+        path: PathBuf,
+        /// Maximum number of results
+        #[arg(long, default_value = "20")]
+        top: usize,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show project metadata (languages, CI, license, README)
+    ProjectInfo {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
 }
 
 pub fn run(action: RepoIntelAction) -> Result<()> {
@@ -265,6 +307,46 @@ fn run_init(path: &Path, _max_commits: Option<usize>) -> Result<()> {
     map.git.shallow = git::is_shallow(&repo);
 
     aggregator::merge_delta(&mut map, &delta);
+
+    // Phase 2: AST symbol extraction
+    eprintln!("[INFO] Extracting AST symbols...");
+    match analyzer_repo_map::extractor::extract_symbols(path) {
+        Ok((symbols, import_graph)) => {
+            eprintln!("[INFO] Extracted symbols from {} files", symbols.len());
+
+            // Detect naming conventions and test patterns
+            let naming = analyzer_repo_map::conventions::detect_naming(&symbols);
+            let test_patterns =
+                analyzer_repo_map::conventions::detect_test_patterns(path, &symbols);
+            map.conventions.naming_patterns = Some(naming);
+            map.conventions.test_patterns = Some(test_patterns);
+
+            map.symbols = Some(symbols);
+            map.import_graph = Some(import_graph);
+        }
+        Err(e) => eprintln!("[WARN] AST extraction failed: {e}"),
+    }
+
+    // Phase 3: Project metadata
+    eprintln!("[INFO] Collecting project metadata...");
+    match analyzer_collectors::collect_metadata(path) {
+        Ok(metadata) => {
+            map.project = Some(metadata);
+        }
+        Err(e) => eprintln!("[WARN] Metadata collection failed: {e}"),
+    }
+
+    // Phase 4: Doc-code cross-references (requires Phase 2 symbols)
+    if let Some(ref symbols) = map.symbols {
+        eprintln!("[INFO] Checking doc-code references...");
+        match analyzer_sync_check::queries::build_doc_refs(path, &map, symbols) {
+            Ok(doc_refs) => {
+                eprintln!("[INFO] Checked {} doc files", doc_refs.len());
+                map.doc_refs = Some(doc_refs);
+            }
+            Err(e) => eprintln!("[WARN] Doc-code sync check failed: {e}"),
+        }
+    }
 
     println!("{}", output::to_json(&map));
     eprintln!("[OK] Repo intel map created successfully");
@@ -295,6 +377,36 @@ fn run_update(path: &Path, map_file: &Path) -> Result<()> {
     eprintln!("[INFO] Processed {} new commits", delta.commits.len());
 
     aggregator::merge_delta(&mut map, &delta);
+
+    // Re-run AST extraction on update (re-parses changed files only would be ideal,
+    // but for now we do a full rescan since it's fast enough)
+    eprintln!("[INFO] Refreshing AST symbols...");
+    match analyzer_repo_map::extractor::extract_symbols(path) {
+        Ok((symbols, import_graph)) => {
+            let naming = analyzer_repo_map::conventions::detect_naming(&symbols);
+            let test_patterns =
+                analyzer_repo_map::conventions::detect_test_patterns(path, &symbols);
+            map.conventions.naming_patterns = Some(naming);
+            map.conventions.test_patterns = Some(test_patterns);
+            map.symbols = Some(symbols);
+            map.import_graph = Some(import_graph);
+        }
+        Err(e) => eprintln!("[WARN] AST extraction failed: {e}"),
+    }
+
+    // Refresh project metadata
+    match analyzer_collectors::collect_metadata(path) {
+        Ok(metadata) => map.project = Some(metadata),
+        Err(e) => eprintln!("[WARN] Metadata collection failed: {e}"),
+    }
+
+    // Refresh doc-code references
+    if let Some(ref symbols) = map.symbols {
+        match analyzer_sync_check::queries::build_doc_refs(path, &map, symbols) {
+            Ok(doc_refs) => map.doc_refs = Some(doc_refs),
+            Err(e) => eprintln!("[WARN] Doc-code sync check failed: {e}"),
+        }
+    }
 
     println!("{}", output::to_json(&map));
     eprintln!("[OK] Repo intel map updated successfully");
@@ -454,6 +566,72 @@ fn run_query(query: QueryAction) -> Result<()> {
             let map = load_map(&map_file)?;
             let result = queries::can_i_help(&map, Some(&path));
             println!("{}", output::to_json(&result));
+        }
+        QueryAction::Symbols { file, map_file, .. } => {
+            let map = load_map(&map_file)?;
+            match (map.symbols.as_ref(), map.import_graph.as_ref()) {
+                (Some(syms), Some(graph)) => {
+                    match analyzer_repo_map::queries::symbols(syms, graph, &file) {
+                        Some(result) => println!("{}", output::to_json(&result)),
+                        None => {
+                            eprintln!("[WARN] No symbols found for {}", file);
+                            println!("null");
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("[WARN] No symbol data in map. Run repo-intel init to generate.");
+                    println!("null");
+                }
+            }
+        }
+        QueryAction::Dependents {
+            symbol,
+            file,
+            map_file,
+            ..
+        } => {
+            let map = load_map(&map_file)?;
+            match map.symbols.as_ref() {
+                Some(syms) => {
+                    let result =
+                        analyzer_repo_map::queries::dependents(syms, &symbol, file.as_deref());
+                    println!("{}", output::to_json(&result));
+                }
+                None => {
+                    eprintln!("[WARN] No symbol data in map. Run repo-intel init to generate.");
+                    println!("null");
+                }
+            }
+        }
+        QueryAction::StaleDocs {
+            path,
+            top,
+            map_file,
+        } => {
+            let map = load_map(&map_file)?;
+            match map.symbols.as_ref() {
+                Some(syms) => {
+                    let result = analyzer_sync_check::queries::stale_docs(&path, &map, syms, top)?;
+                    println!("{}", output::to_json(&result));
+                }
+                None => {
+                    eprintln!("[WARN] No symbol data in map. Run repo-intel init to generate.");
+                    println!("[]");
+                }
+            }
+        }
+        QueryAction::ProjectInfo { map_file, .. } => {
+            let map = load_map(&map_file)?;
+            match map.project {
+                Some(project) => println!("{}", output::to_json(&project)),
+                None => {
+                    eprintln!(
+                        "[WARN] No project metadata in map. Run repo-intel init to generate."
+                    );
+                    println!("null");
+                }
+            }
         }
     }
     Ok(())

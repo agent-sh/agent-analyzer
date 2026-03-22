@@ -59,9 +59,25 @@ crates/
       aggregator.rs     # create_empty_map(), merge_delta() - full spec implementation
       queries.rs        # hotspots, bugspots, ownership, bus_factor, areas, norms, coupling, etc.
       incremental.rs    # check_status(), needs_rebuild(), get_since_sha()
-  analyzer-repo-map/    # Stub (Phase 2)
-  analyzer-collectors/  # Stub (Phase 3)
-  analyzer-sync-check/  # Stub (Phase 4)
+  analyzer-repo-map/    # AST symbol extraction (Phase 2)
+    src/
+      parser.rs         # Language detection, tree-sitter grammar init (6 languages)
+      extractor.rs      # Walk files, parse, extract symbols (exports, imports, definitions, fields)
+      complexity.rs     # Cyclomatic complexity via AST branch-point counting
+      conventions.rs    # Naming pattern detection (snake_case, PascalCase), test framework detection
+      queries.rs        # symbols(), dependents() queries
+  analyzer-collectors/  # Project metadata (Phase 3)
+    src/
+      readme.rs         # README detection and heading extraction
+      ci.rs             # CI provider detection (GitHub Actions, GitLab CI, etc.)
+      license.rs        # License detection (SPDX from manifests + file pattern matching)
+      languages.rs      # Language distribution by file extension
+  analyzer-sync-check/  # Doc-code cross-reference (Phase 4)
+    src/
+      parser.rs         # Markdown parsing with pulldown-cmark, code ref extraction
+      matcher.rs        # Symbol matching against AST symbol table, camelCase-to-snake_case
+      checker.rs        # Staleness detection (deleted, renamed, hotspot references)
+      queries.rs        # stale_docs(), build_doc_refs()
   analyzer-cli/         # Unified CLI binary
     src/
       main.rs           # clap dispatch
@@ -185,9 +201,12 @@ agent-analyzer repo-intel query doc-drift [--top=N] --map-file=<file> <path>
 agent-analyzer repo-intel query recent-ai [--top=N] --map-file=<file> <path>
 agent-analyzer repo-intel query onboard --map-file=<file> <path>
 agent-analyzer repo-intel query can-i-help --map-file=<file> <path>
-agent-analyzer repo-map ...    # "not yet implemented"
-agent-analyzer collect ...     # "not yet implemented"
-agent-analyzer sync-check ...  # "not yet implemented"
+agent-analyzer repo-map generate <path>
+agent-analyzer repo-map symbols <file> --map-file=<file>
+agent-analyzer repo-map dependents <symbol> [--file=<file>] --map-file=<file>
+agent-analyzer collect run <path>
+agent-analyzer sync-check check <path> --map-file=<file>
+agent-analyzer sync-check stale-docs <path> [--top=N] --map-file=<file>
 ```
 
 ### Build Targets
@@ -203,7 +222,7 @@ agent-analyzer sync-check ...  # "not yet implemented"
 
 ```bash
 cargo check                           # Compile check
-cargo test                            # Run all tests (77 tests)
+cargo test                            # Run all tests (142 tests)
 cargo build --release                 # Build release binary
 cargo clippy -- -D warnings           # Lint (treat warnings as errors)
 cargo fmt --check                     # Format check
@@ -212,9 +231,8 @@ cargo run -p analyzer-cli -- --version  # Run CLI
 
 ## Current State
 
-- Phase 1 git intelligence complete
-- 77 passing tests (24 analyzer-core, 53 analyzer-git-map)
-- Stub crates: analyzer-repo-map, analyzer-collectors, analyzer-sync-check
+- Phase 1-4 complete
+- 142 passing tests (24 analyzer-core, 53 analyzer-git-map, 30 analyzer-repo-map, 16 analyzer-collectors, 19 analyzer-sync-check)
 - CI: cargo test + clippy + fmt on push/PR
 - Release: 5-target cross-platform builds on tag push
 
@@ -223,9 +241,9 @@ cargo run -p analyzer-cli -- --version  # Run CLI
 | Phase | Crate | Status | Description |
 |-------|-------|--------|-------------|
 | 1 | analyzer-core, analyzer-git-map, analyzer-cli | Complete | Git intelligence (recency, staleness, bugspots, norms, areas, onboard, can-i-help) |
-| 2 | analyzer-repo-map | Stub | AST-based symbol mapping (embed ast-grep) |
-| 3 | analyzer-collectors | Stub | Project data gathering (docs, codebase, github) |
-| 4 | analyzer-sync-check | Stub | Doc-code sync analysis |
+| 2 | analyzer-repo-map | Complete | AST symbol extraction (tree-sitter, 6 languages: Rust, TS, JS, Python, Go, Java) |
+| 3 | analyzer-collectors | Complete | Project metadata (README, CI, license, languages, package manager) |
+| 4 | analyzer-sync-check | Complete | Doc-code cross-reference (inline code matching, hotspot detection, staleness) |
 | 5 | analyzer-core | Planned | AI code stylometry (replace metadata-based detection) |
 
 ## Integration
@@ -237,9 +255,9 @@ This binary is consumed by JS plugins via the binary resolver in `agent-core/lib
 
 Consumers:
 - `git-map` plugin (JS wrapper using `repo-intel` CLI namespace)
-- `repo-map` plugin (Phase 2 - will replace `ast-grep` subprocess)
-- `agent-core/lib/collectors/` (Phase 3 - will replace JS implementations)
-- `sync-docs` plugin (Phase 4 - will replace JS analysis)
+- `repo-map` plugin (uses `repo-map` CLI for AST symbol extraction)
+- `agent-core/lib/collectors/` (uses `collect` CLI for project metadata)
+- `sync-docs` plugin (uses `sync-check` CLI for doc-code cross-references)
 
 ## References
 

@@ -1242,9 +1242,7 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
         ("npm install", "npm test")
     } else if has_go_mod {
         ("go build ./...", "go test ./...")
-    } else if has_pyproject {
-        ("pip install -e .", "pytest")
-    } else if has_setup_py {
+    } else if has_pyproject || has_setup_py {
         ("pip install -e .", "pytest")
     } else if has_pom {
         ("mvn compile", "mvn test")
@@ -1335,23 +1333,27 @@ fn is_generated_dir(area: &str) -> bool {
 /// Priority tier for key areas sorting. Lower = higher priority.
 /// Source code dirs rank above test/doc/benchmark dirs.
 fn area_tier(area: &str) -> u8 {
-    let leaf = area.trim_end_matches('/').rsplit('/').next().unwrap_or(area);
+    let leaf = area
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(area);
     let lower = leaf.to_lowercase();
     match lower.as_str() {
         // Tier 0: root files
         "./" | "." => 0,
         // Tier 1: source code directories
-        "src" | "lib" | "pkg" | "internal" | "core" | "crates" | "packages" | "modules"
-        | "app" | "apps" | "server" | "api" | "routes" | "handlers" | "controllers"
-        | "services" | "models" | "views" | "components" | "middleware" | "plugins"
-        | "commands" | "cmd" | "bin" => 1,
+        "src" | "lib" | "pkg" | "internal" | "core" | "crates" | "packages" | "modules" | "app"
+        | "apps" | "server" | "api" | "routes" | "handlers" | "controllers" | "services"
+        | "models" | "views" | "components" | "middleware" | "plugins" | "commands" | "cmd"
+        | "bin" => 1,
         // Tier 3: test/doc/benchmark/example (lower priority)
-        "test" | "tests" | "__tests__" | "spec" | "specs" | "e2e" | "integration"
-        | "docs" | "doc" | "documentation" | "benchmarks" | "benchmark" | "examples"
-        | "example" | "fixtures" | "testdata" | "fuzz" | "fuzzer" => 3,
+        "test" | "tests" | "__tests__" | "spec" | "specs" | "e2e" | "integration" | "docs"
+        | "doc" | "documentation" | "benchmarks" | "benchmark" | "examples" | "example"
+        | "fixtures" | "testdata" | "fuzz" | "fuzzer" => 3,
         // Tier 4: generated/archival data
-        "results" | "coverage" | "reports" | "assets" | "imgs" | "images" | "static"
-        | "public" | "dist" | "build" => 4,
+        "results" | "coverage" | "reports" | "assets" | "imgs" | "images" | "static" | "public"
+        | "dist" | "build" => 4,
         // Tier 2: everything else
         _ => 2,
     }
@@ -1513,9 +1515,11 @@ pub fn onboard(map: &RepoIntelData, repo_path: Option<&Path>) -> OnboardResult {
     meaningful_areas.sort_by(|a, b| {
         let tier_a = area_tier(&a.area);
         let tier_b = area_tier(&b.area);
-        tier_a
-            .cmp(&tier_b)
-            .then(b.hotspot_score.partial_cmp(&a.hotspot_score).unwrap_or(std::cmp::Ordering::Equal))
+        tier_a.cmp(&tier_b).then(
+            b.hotspot_score
+                .partial_cmp(&a.hotspot_score)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
     let key_areas: Vec<KeyArea> = meaningful_areas
         .iter()
@@ -1690,7 +1694,12 @@ pub fn can_i_help(map: &RepoIntelData, repo_path: Option<&Path>) -> CanIHelpResu
     if good_first_areas.is_empty() {
         let fallback_patterns = ["docs", "doc", "examples", "example", "contrib", "site"];
         for a in &area_list {
-            let leaf = a.area.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            let leaf = a
+                .area
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("");
             let exists = repo_path
                 .map(|rp| rp.join(a.area.trim_end_matches('/')).exists())
                 .unwrap_or(true);
