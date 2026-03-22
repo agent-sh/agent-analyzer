@@ -594,11 +594,8 @@ fn run_query(query: QueryAction) -> Result<()> {
             let map = load_map(&map_file)?;
             match map.symbols.as_ref() {
                 Some(syms) => {
-                    let result = analyzer_repo_map::queries::dependents(
-                        syms,
-                        &symbol,
-                        file.as_deref(),
-                    );
+                    let result =
+                        analyzer_repo_map::queries::dependents(syms, &symbol, file.as_deref());
                     println!("{}", output::to_json(&result));
                 }
                 None => {
@@ -615,8 +612,7 @@ fn run_query(query: QueryAction) -> Result<()> {
             let map = load_map(&map_file)?;
             match map.symbols.as_ref() {
                 Some(syms) => {
-                    let result =
-                        analyzer_sync_check::queries::stale_docs(&path, &map, syms, top)?;
+                    let result = analyzer_sync_check::queries::stale_docs(&path, &map, syms, top)?;
                     println!("{}", output::to_json(&result));
                 }
                 None => {
@@ -630,7 +626,9 @@ fn run_query(query: QueryAction) -> Result<()> {
             match map.project {
                 Some(project) => println!("{}", output::to_json(&project)),
                 None => {
-                    eprintln!("[WARN] No project metadata in map. Run repo-intel init to generate.");
+                    eprintln!(
+                        "[WARN] No project metadata in map. Run repo-intel init to generate."
+                    );
                     println!("null");
                 }
             }
