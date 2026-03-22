@@ -38,8 +38,7 @@ pub fn run(action: RepoMapAction) -> Result<()> {
     match action {
         RepoMapAction::Generate { path } => {
             eprintln!("[INFO] Extracting symbols from {}", path.display());
-            let (symbols, import_graph) =
-                analyzer_repo_map::extractor::extract_symbols(&path)?;
+            let (symbols, import_graph) = analyzer_repo_map::extractor::extract_symbols(&path)?;
             eprintln!("[OK] Extracted symbols from {} files", symbols.len());
 
             #[derive(serde::Serialize)]
@@ -82,9 +81,7 @@ pub fn run(action: RepoMapAction) -> Result<()> {
                     }
                 }
                 _ => {
-                    eprintln!(
-                        "[ERROR] No symbol data in map file. Run `repo-intel init` first."
-                    );
+                    eprintln!("[ERROR] No symbol data in map file. Run `repo-intel init` first.");
                     std::process::exit(1);
                 }
             }
@@ -98,17 +95,12 @@ pub fn run(action: RepoMapAction) -> Result<()> {
             let map = load_map(&map_file)?;
             match map.symbols.as_ref() {
                 Some(syms) => {
-                    let result = analyzer_repo_map::queries::dependents(
-                        syms,
-                        &symbol,
-                        file.as_deref(),
-                    );
+                    let result =
+                        analyzer_repo_map::queries::dependents(syms, &symbol, file.as_deref());
                     println!("{}", output::to_json(&result));
                 }
                 None => {
-                    eprintln!(
-                        "[ERROR] No symbol data in map file. Run `repo-intel init` first."
-                    );
+                    eprintln!("[ERROR] No symbol data in map file. Run `repo-intel init` first.");
                     std::process::exit(1);
                 }
             }

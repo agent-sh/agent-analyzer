@@ -48,8 +48,7 @@ fn detect_package_manager(repo_path: &Path) -> Option<String> {
         Some("pip".to_string())
     } else if repo_path.join("pom.xml").exists() {
         Some("maven".to_string())
-    } else if repo_path.join("build.gradle").exists()
-        || repo_path.join("build.gradle.kts").exists()
+    } else if repo_path.join("build.gradle").exists() || repo_path.join("build.gradle.kts").exists()
     {
         Some("gradle".to_string())
     } else if repo_path.join("package.json").exists() {
@@ -67,7 +66,10 @@ mod tests {
     fn test_detect_package_manager_cargo() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
-        assert_eq!(detect_package_manager(dir.path()), Some("cargo".to_string()));
+        assert_eq!(
+            detect_package_manager(dir.path()),
+            Some("cargo".to_string())
+        );
     }
 
     #[test]

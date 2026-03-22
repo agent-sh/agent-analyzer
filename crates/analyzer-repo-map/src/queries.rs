@@ -173,14 +173,8 @@ mod tests {
         );
 
         let mut graph = HashMap::new();
-        graph.insert(
-            "src/core.rs".to_string(),
-            vec!["src/types".to_string()],
-        );
-        graph.insert(
-            "src/main.rs".to_string(),
-            vec!["src/core".to_string()],
-        );
+        graph.insert("src/core.rs".to_string(), vec!["src/types".to_string()]);
+        graph.insert("src/main.rs".to_string(), vec!["src/core".to_string()]);
 
         (map, graph)
     }

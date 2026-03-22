@@ -12,48 +12,162 @@ struct LangExt {
 }
 
 static LANGUAGE_EXTENSIONS: &[LangExt] = &[
-    LangExt { ext: "rs", lang: "Rust" },
-    LangExt { ext: "ts", lang: "TypeScript" },
-    LangExt { ext: "tsx", lang: "TypeScript" },
-    LangExt { ext: "js", lang: "JavaScript" },
-    LangExt { ext: "jsx", lang: "JavaScript" },
-    LangExt { ext: "mjs", lang: "JavaScript" },
-    LangExt { ext: "cjs", lang: "JavaScript" },
-    LangExt { ext: "py", lang: "Python" },
-    LangExt { ext: "go", lang: "Go" },
-    LangExt { ext: "java", lang: "Java" },
-    LangExt { ext: "rb", lang: "Ruby" },
-    LangExt { ext: "php", lang: "PHP" },
-    LangExt { ext: "cs", lang: "C#" },
-    LangExt { ext: "cpp", lang: "C++" },
-    LangExt { ext: "cc", lang: "C++" },
-    LangExt { ext: "c", lang: "C" },
-    LangExt { ext: "h", lang: "C" },
-    LangExt { ext: "swift", lang: "Swift" },
-    LangExt { ext: "kt", lang: "Kotlin" },
-    LangExt { ext: "scala", lang: "Scala" },
-    LangExt { ext: "sh", lang: "Shell" },
-    LangExt { ext: "bash", lang: "Shell" },
-    LangExt { ext: "zsh", lang: "Shell" },
-    LangExt { ext: "css", lang: "CSS" },
-    LangExt { ext: "scss", lang: "SCSS" },
-    LangExt { ext: "html", lang: "HTML" },
-    LangExt { ext: "vue", lang: "Vue" },
-    LangExt { ext: "svelte", lang: "Svelte" },
-    LangExt { ext: "sql", lang: "SQL" },
-    LangExt { ext: "lua", lang: "Lua" },
-    LangExt { ext: "zig", lang: "Zig" },
-    LangExt { ext: "ex", lang: "Elixir" },
-    LangExt { ext: "exs", lang: "Elixir" },
-    LangExt { ext: "erl", lang: "Erlang" },
-    LangExt { ext: "hs", lang: "Haskell" },
-    LangExt { ext: "clj", lang: "Clojure" },
-    LangExt { ext: "dart", lang: "Dart" },
+    LangExt {
+        ext: "rs",
+        lang: "Rust",
+    },
+    LangExt {
+        ext: "ts",
+        lang: "TypeScript",
+    },
+    LangExt {
+        ext: "tsx",
+        lang: "TypeScript",
+    },
+    LangExt {
+        ext: "js",
+        lang: "JavaScript",
+    },
+    LangExt {
+        ext: "jsx",
+        lang: "JavaScript",
+    },
+    LangExt {
+        ext: "mjs",
+        lang: "JavaScript",
+    },
+    LangExt {
+        ext: "cjs",
+        lang: "JavaScript",
+    },
+    LangExt {
+        ext: "py",
+        lang: "Python",
+    },
+    LangExt {
+        ext: "go",
+        lang: "Go",
+    },
+    LangExt {
+        ext: "java",
+        lang: "Java",
+    },
+    LangExt {
+        ext: "rb",
+        lang: "Ruby",
+    },
+    LangExt {
+        ext: "php",
+        lang: "PHP",
+    },
+    LangExt {
+        ext: "cs",
+        lang: "C#",
+    },
+    LangExt {
+        ext: "cpp",
+        lang: "C++",
+    },
+    LangExt {
+        ext: "cc",
+        lang: "C++",
+    },
+    LangExt {
+        ext: "c",
+        lang: "C",
+    },
+    LangExt {
+        ext: "h",
+        lang: "C",
+    },
+    LangExt {
+        ext: "swift",
+        lang: "Swift",
+    },
+    LangExt {
+        ext: "kt",
+        lang: "Kotlin",
+    },
+    LangExt {
+        ext: "scala",
+        lang: "Scala",
+    },
+    LangExt {
+        ext: "sh",
+        lang: "Shell",
+    },
+    LangExt {
+        ext: "bash",
+        lang: "Shell",
+    },
+    LangExt {
+        ext: "zsh",
+        lang: "Shell",
+    },
+    LangExt {
+        ext: "css",
+        lang: "CSS",
+    },
+    LangExt {
+        ext: "scss",
+        lang: "SCSS",
+    },
+    LangExt {
+        ext: "html",
+        lang: "HTML",
+    },
+    LangExt {
+        ext: "vue",
+        lang: "Vue",
+    },
+    LangExt {
+        ext: "svelte",
+        lang: "Svelte",
+    },
+    LangExt {
+        ext: "sql",
+        lang: "SQL",
+    },
+    LangExt {
+        ext: "lua",
+        lang: "Lua",
+    },
+    LangExt {
+        ext: "zig",
+        lang: "Zig",
+    },
+    LangExt {
+        ext: "ex",
+        lang: "Elixir",
+    },
+    LangExt {
+        ext: "exs",
+        lang: "Elixir",
+    },
+    LangExt {
+        ext: "erl",
+        lang: "Erlang",
+    },
+    LangExt {
+        ext: "hs",
+        lang: "Haskell",
+    },
+    LangExt {
+        ext: "clj",
+        lang: "Clojure",
+    },
+    LangExt {
+        ext: "dart",
+        lang: "Dart",
+    },
 ];
 
 /// Build a lookup map from extension to language name.
 fn ext_to_lang() -> HashMap<&'static str, &'static str> {
-    LANGUAGE_EXTENSIONS.iter().map(|e| (e.ext, e.lang)).collect()
+    LANGUAGE_EXTENSIONS
+        .iter()
+        .map(|e| (e.ext, e.lang))
+        .collect()
 }
 
 /// Detect language distribution by counting source files.

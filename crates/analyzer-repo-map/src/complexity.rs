@@ -4,11 +4,7 @@ use crate::parser::Language;
 
 /// Count decision points within a tree-sitter node subtree.
 /// Base complexity is 1, plus 1 for each branch/decision point.
-pub fn cyclomatic_complexity(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    lang: Language,
-) -> u32 {
+pub fn cyclomatic_complexity(node: &tree_sitter::Node, source: &[u8], lang: Language) -> u32 {
     let branch_kinds = branch_node_kinds(lang);
     let operator_patterns = branch_operator_patterns(lang);
 
@@ -24,9 +20,7 @@ pub fn cyclomatic_complexity(
         // Check for logical operators (&& and ||) in binary expressions
         if is_binary_expression(kind, lang) {
             if let Some(op_node) = n.child_by_field_name("operator") {
-                let op_text = op_node
-                    .utf8_text(source)
-                    .unwrap_or("");
+                let op_text = op_node.utf8_text(source).unwrap_or("");
                 if operator_patterns.contains(&op_text) {
                     complexity += 1;
                 }
@@ -97,10 +91,9 @@ fn branch_operator_patterns(_lang: Language) -> &'static [&'static str] {
 fn is_binary_expression(kind: &str, lang: Language) -> bool {
     match lang {
         Language::Rust => kind == "binary_expression",
-        Language::TypeScript
-        | Language::Tsx
-        | Language::JavaScript
-        | Language::Jsx => kind == "binary_expression",
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => {
+            kind == "binary_expression"
+        }
         Language::Python => kind == "boolean_operator",
         Language::Go => kind == "binary_expression",
         Language::Java => kind == "binary_expression",
@@ -127,8 +120,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_source;
     use crate::extractor::extract_file_symbols;
+    use crate::parser::parse_source;
 
     /// Get complexity of the first function in source via the extractor.
     fn complexity_of(source: &str, lang: Language) -> u32 {
@@ -147,19 +140,13 @@ mod tests {
 
     #[test]
     fn test_rust_if() {
-        let c = complexity_of(
-            "fn foo(x: bool) { if x { return; } }",
-            Language::Rust,
-        );
+        let c = complexity_of("fn foo(x: bool) { if x { return; } }", Language::Rust);
         assert_eq!(c, 2); // base + if
     }
 
     #[test]
     fn test_rust_if_else() {
-        let c = complexity_of(
-            "fn foo(x: bool) { if x { 1 } else { 2 } }",
-            Language::Rust,
-        );
+        let c = complexity_of("fn foo(x: bool) { if x { 1 } else { 2 } }", Language::Rust);
         assert_eq!(c, 3); // base + if + else
     }
 

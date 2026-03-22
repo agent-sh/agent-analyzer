@@ -37,15 +37,10 @@ pub fn run(action: SyncCheckAction) -> Result<()> {
 
             match symbols {
                 Some(syms) => {
-                    eprintln!(
-                        "[INFO] Checking doc-code sync at {}",
-                        path.display()
-                    );
-                    let doc_refs =
-                        analyzer_sync_check::queries::build_doc_refs(&path, &map, syms)?;
+                    eprintln!("[INFO] Checking doc-code sync at {}", path.display());
+                    let doc_refs = analyzer_sync_check::queries::build_doc_refs(&path, &map, syms)?;
 
-                    let total_refs: usize =
-                        doc_refs.values().map(|d| d.code_refs.len()).sum();
+                    let total_refs: usize = doc_refs.values().map(|d| d.code_refs.len()).sum();
                     let issues: usize = doc_refs
                         .values()
                         .flat_map(|d| &d.code_refs)
@@ -67,14 +62,16 @@ pub fn run(action: SyncCheckAction) -> Result<()> {
                             issues_found: issues,
                         })
                     );
-                    eprintln!("[OK] Found {} issues in {} refs across {} docs",
-                        issues, total_refs, doc_refs.len());
+                    eprintln!(
+                        "[OK] Found {} issues in {} refs across {} docs",
+                        issues,
+                        total_refs,
+                        doc_refs.len()
+                    );
                     Ok(())
                 }
                 None => {
-                    eprintln!(
-                        "[ERROR] No symbol data in map file. Run `repo-intel init` first."
-                    );
+                    eprintln!("[ERROR] No symbol data in map file. Run `repo-intel init` first.");
                     std::process::exit(1);
                 }
             }
@@ -87,15 +84,12 @@ pub fn run(action: SyncCheckAction) -> Result<()> {
             let map = load_map(&map_file)?;
             match map.symbols.as_ref() {
                 Some(syms) => {
-                    let results =
-                        analyzer_sync_check::queries::stale_docs(&path, &map, syms, top)?;
+                    let results = analyzer_sync_check::queries::stale_docs(&path, &map, syms, top)?;
                     println!("{}", output::to_json(&results));
                     Ok(())
                 }
                 None => {
-                    eprintln!(
-                        "[ERROR] No symbol data in map file. Run `repo-intel init` first."
-                    );
+                    eprintln!("[ERROR] No symbol data in map file. Run `repo-intel init` first.");
                     std::process::exit(1);
                 }
             }

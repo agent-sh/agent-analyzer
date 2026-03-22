@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 
 use analyzer_core::ai_detect::{detect_ai, is_bot};
 use analyzer_core::types::{
-    AiAttribution, CommitDelta, Contributors, ConventionInfo, FileActivity, GitInfo, Releases,
-    RepoIntelData, extract_conventional_prefix,
+    extract_conventional_prefix, AiAttribution, CommitDelta, Contributors, ConventionInfo,
+    FileActivity, GitInfo, Releases, RepoIntelData,
 };
 use analyzer_core::walk::is_noise;
 

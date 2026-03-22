@@ -6,13 +6,11 @@ use std::path::Path;
 use anyhow::Result;
 use rayon::prelude::*;
 
-use analyzer_core::types::{
-    DefinitionEntry, FileSymbols, ImportEntry, SymbolEntry, SymbolKind,
-};
+use analyzer_core::types::{DefinitionEntry, FileSymbols, ImportEntry, SymbolEntry, SymbolKind};
 use analyzer_core::walk;
 
 use crate::complexity::cyclomatic_complexity;
-use crate::parser::{Language, detect_language, parse_source};
+use crate::parser::{detect_language, parse_source, Language};
 
 /// Maximum file size to parse (500KB). Larger files are likely generated.
 const MAX_FILE_SIZE: u64 = 500_000;
@@ -62,11 +60,7 @@ pub fn extract_symbols(repo_path: &Path) -> Result<SymbolData> {
 
     for (path, syms) in results {
         // Build import graph from import entries
-        let imports: Vec<String> = syms
-            .imports
-            .iter()
-            .map(|i| i.from.clone())
-            .collect();
+        let imports: Vec<String> = syms.imports.iter().map(|i| i.from.clone()).collect();
         if !imports.is_empty() {
             import_graph.insert(path.clone(), imports);
         }
@@ -85,7 +79,14 @@ pub fn extract_file_symbols(source: &[u8], lang: Language) -> Result<FileSymbols
     let mut imports = Vec::new();
     let mut definitions = Vec::new();
 
-    extract_from_node(&root, source, lang, &mut exports, &mut imports, &mut definitions)?;
+    extract_from_node(
+        &root,
+        source,
+        lang,
+        &mut exports,
+        &mut imports,
+        &mut definitions,
+    )?;
 
     Ok(FileSymbols {
         exports,
@@ -493,7 +494,10 @@ fn extract_js_var_decl(
                 if let Some(value) = child.child_by_field_name("value") {
                     let kind_str = value.kind();
                     // Arrow function or function expression
-                    if kind_str == "arrow_function" || kind_str == "function" || kind_str == "function_expression" {
+                    if kind_str == "arrow_function"
+                        || kind_str == "function"
+                        || kind_str == "function_expression"
+                    {
                         let name_str = node_text(&name, source);
                         let line = child.start_position().row + 1;
                         let cc = cyclomatic_complexity(&value, source, lang);
@@ -684,11 +688,13 @@ fn extract_ts_export(
                             let name_str = node_text(&name, source);
                             let line = decl.start_position().row + 1;
                             // Check if value is a function/arrow function
-                            let (kind, cc) = if let Some(value) = decl.child_by_field_name("value") {
+                            let (kind, cc) = if let Some(value) = decl.child_by_field_name("value")
+                            {
                                 match value.kind() {
-                                    "arrow_function" | "function" | "function_expression" => {
-                                        (SymbolKind::Function, cyclomatic_complexity(&value, source, lang))
-                                    }
+                                    "arrow_function" | "function" | "function_expression" => (
+                                        SymbolKind::Function,
+                                        cyclomatic_complexity(&value, source, lang),
+                                    ),
                                     _ => (SymbolKind::Constant, 1),
                                 }
                             } else {
@@ -941,7 +947,8 @@ fn extract_python(
                             if let Some(name) = member.child_by_field_name("name") {
                                 let name_str = node_text(&name, source);
                                 if name_str != "__init__" && !name_str.starts_with('_') {
-                                    let cc = cyclomatic_complexity(&member, source, Language::Python);
+                                    let cc =
+                                        cyclomatic_complexity(&member, source, Language::Python);
                                     definitions.push(DefinitionEntry {
                                         name: name_str,
                                         kind: SymbolKind::Function,
@@ -972,10 +979,7 @@ fn extract_python(
     }
 }
 
-fn parse_python_import_from(
-    node: &tree_sitter::Node,
-    source: &[u8],
-) -> Option<ImportEntry> {
+fn parse_python_import_from(node: &tree_sitter::Node, source: &[u8]) -> Option<ImportEntry> {
     let mut module = String::new();
     let mut names = Vec::new();
 
@@ -1003,7 +1007,10 @@ fn parse_python_import_from(
         return None;
     }
 
-    Some(ImportEntry { from: module, names })
+    Some(ImportEntry {
+        from: module,
+        names,
+    })
 }
 
 // ─── Go ─────────────────────────────────────────────────────────
@@ -1022,10 +1029,7 @@ fn extract_go(
                 if let Some(name) = child.child_by_field_name("name") {
                     let name_str = node_text(&name, source);
                     let line = child.start_position().row + 1;
-                    let is_exported = name_str
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_uppercase());
+                    let is_exported = name_str.chars().next().is_some_and(|c| c.is_uppercase());
                     let cc = cyclomatic_complexity(&child, source, Language::Go);
                     definitions.push(DefinitionEntry {
                         name: name_str.clone(),
@@ -1069,10 +1073,8 @@ fn extract_go(
                         if let Some(name) = spec.child_by_field_name("name") {
                             let name_str = node_text(&name, source);
                             let line = spec.start_position().row + 1;
-                            let is_exported = name_str
-                                .chars()
-                                .next()
-                                .is_some_and(|c| c.is_uppercase());
+                            let is_exported =
+                                name_str.chars().next().is_some_and(|c| c.is_uppercase());
 
                             // Determine kind from the type body
                             let type_node = spec.child_by_field_name("type");
@@ -1116,11 +1118,7 @@ fn extract_go(
     }
 }
 
-fn parse_go_imports(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    imports: &mut Vec<ImportEntry>,
-) {
+fn parse_go_imports(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportEntry>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "import_spec" || child.kind() == "import_spec_list" {
@@ -1128,18 +1126,14 @@ fn parse_go_imports(
             for spec in child.children(&mut inner) {
                 if spec.kind() == "import_spec" {
                     if let Some(path_node) = spec.child_by_field_name("path") {
-                        let path = node_text(&path_node, source)
-                            .trim_matches('"')
-                            .to_string();
+                        let path = node_text(&path_node, source).trim_matches('"').to_string();
                         imports.push(ImportEntry {
                             from: path,
                             names: vec![],
                         });
                     }
                 } else if spec.kind() == "interpreted_string_literal" {
-                    let path = node_text(&spec, source)
-                        .trim_matches('"')
-                        .to_string();
+                    let path = node_text(&spec, source).trim_matches('"').to_string();
                     imports.push(ImportEntry {
                         from: path,
                         names: vec![],
@@ -1150,9 +1144,7 @@ fn parse_go_imports(
         // Single import without parens
         if child.kind() == "import_spec" {
             if let Some(path_node) = child.child_by_field_name("path") {
-                let path = node_text(&path_node, source)
-                    .trim_matches('"')
-                    .to_string();
+                let path = node_text(&path_node, source).trim_matches('"').to_string();
                 imports.push(ImportEntry {
                     from: path,
                     names: vec![],
@@ -1395,7 +1387,8 @@ mod tests {
 
     #[test]
     fn test_rust_struct_and_enum() {
-        let source = b"pub struct Config { pub name: String }\npub enum Status { Active, Inactive }";
+        let source =
+            b"pub struct Config { pub name: String }\npub enum Status { Active, Inactive }";
         let syms = extract_file_symbols(source, Language::Rust).unwrap();
         // Config (struct) + name (field) + Status (enum) + Active + Inactive (variants)
         assert_eq!(syms.definitions.len(), 5);
@@ -1404,8 +1397,14 @@ mod tests {
         assert_eq!(syms.definitions[1].kind, SymbolKind::Field);
         assert_eq!(syms.definitions[1].name, "name");
         assert_eq!(syms.definitions[2].kind, SymbolKind::Enum);
-        assert!(syms.definitions.iter().any(|d| d.name == "Active" && d.kind == SymbolKind::EnumVariant));
-        assert!(syms.definitions.iter().any(|d| d.name == "Inactive" && d.kind == SymbolKind::EnumVariant));
+        assert!(syms
+            .definitions
+            .iter()
+            .any(|d| d.name == "Active" && d.kind == SymbolKind::EnumVariant));
+        assert!(syms
+            .definitions
+            .iter()
+            .any(|d| d.name == "Inactive" && d.kind == SymbolKind::EnumVariant));
     }
 
     #[test]
@@ -1432,12 +1431,30 @@ mod tests {
 
         let syms = extract_file_symbols(source, Language::TypeScript).unwrap();
         // Should find: Queue (class) + add, close, count (methods) + delay, attempts (interface props) + JobOptions
-        assert!(syms.definitions.iter().any(|d| d.name == "Queue"), "missing Queue");
-        assert!(syms.definitions.iter().any(|d| d.name == "add"), "missing add method");
-        assert!(syms.definitions.iter().any(|d| d.name == "close"), "missing close method");
-        assert!(syms.definitions.iter().any(|d| d.name == "JobOptions"), "missing JobOptions");
-        assert!(syms.definitions.iter().any(|d| d.name == "delay"), "missing delay prop");
-        assert!(syms.definitions.iter().any(|d| d.name == "attempts"), "missing attempts prop");
+        assert!(
+            syms.definitions.iter().any(|d| d.name == "Queue"),
+            "missing Queue"
+        );
+        assert!(
+            syms.definitions.iter().any(|d| d.name == "add"),
+            "missing add method"
+        );
+        assert!(
+            syms.definitions.iter().any(|d| d.name == "close"),
+            "missing close method"
+        );
+        assert!(
+            syms.definitions.iter().any(|d| d.name == "JobOptions"),
+            "missing JobOptions"
+        );
+        assert!(
+            syms.definitions.iter().any(|d| d.name == "delay"),
+            "missing delay prop"
+        );
+        assert!(
+            syms.definitions.iter().any(|d| d.name == "attempts"),
+            "missing attempts prop"
+        );
     }
 
     #[test]

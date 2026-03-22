@@ -21,7 +21,10 @@ struct LicensePattern {
 static LICENSE_PATTERNS: &[LicensePattern] = &[
     LicensePattern {
         name: "MIT",
-        markers: &["MIT License", "Permission is hereby granted, free of charge"],
+        markers: &[
+            "MIT License",
+            "Permission is hereby granted, free of charge",
+        ],
     },
     LicensePattern {
         name: "Apache-2.0",
@@ -37,7 +40,10 @@ static LICENSE_PATTERNS: &[LicensePattern] = &[
     },
     LicensePattern {
         name: "BSD-3-Clause",
-        markers: &["BSD 3-Clause", "Redistribution and use in source and binary forms"],
+        markers: &[
+            "BSD 3-Clause",
+            "Redistribution and use in source and binary forms",
+        ],
     },
     LicensePattern {
         name: "BSD-2-Clause",
@@ -70,7 +76,11 @@ pub fn detect_license(repo_path: &Path) -> Option<String> {
         if let Ok(content) = std::fs::read_to_string(&path) {
             let upper = content.to_uppercase();
             for pattern in LICENSE_PATTERNS {
-                if pattern.markers.iter().all(|m| upper.contains(&m.to_uppercase())) {
+                if pattern
+                    .markers
+                    .iter()
+                    .all(|m| upper.contains(&m.to_uppercase()))
+                {
                     return Some(pattern.name.to_string());
                 }
             }
@@ -106,7 +116,8 @@ fn detect_from_manifest(repo_path: &Path) -> Option<String> {
                     .trim()
                     .trim_matches('"')
                     .trim_matches('\'');
-                if !value.is_empty() && !value.contains('{') && value != "true" && value != "false" {
+                if !value.is_empty() && !value.contains('{') && value != "true" && value != "false"
+                {
                     return Some(value.to_string());
                 }
             }

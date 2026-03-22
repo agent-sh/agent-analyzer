@@ -3,9 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use analyzer_core::types::{
-    FileSymbols, NamingPatterns, SymbolKind, TestPatterns,
-};
+use analyzer_core::types::{FileSymbols, NamingPatterns, SymbolKind, TestPatterns};
 
 /// Detect naming conventions from symbol definitions.
 pub fn detect_naming(symbols: &HashMap<String, FileSymbols>) -> NamingPatterns {
@@ -53,7 +51,9 @@ fn classify_case(name: &str) -> &'static str {
     }
     // SCREAMING_SNAKE: all uppercase with underscores
     if name.len() > 1
-        && name.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
     {
         return "SCREAMING_SNAKE";
     }
@@ -65,7 +65,10 @@ fn classify_case(name: &str) -> &'static str {
         return "PascalCase";
     }
     // snake_case: all lowercase with underscores
-    if name.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()) {
+    if name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+    {
         return "snake_case";
     }
     // camelCase: starts with lowercase, has uppercase
@@ -150,10 +153,7 @@ fn detect_framework(symbols: &HashMap<String, FileSymbols>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn detect_test_location(
-    _repo_path: &Path,
-    symbols: &HashMap<String, FileSymbols>,
-) -> String {
+fn detect_test_location(_repo_path: &Path, symbols: &HashMap<String, FileSymbols>) -> String {
     let mut locations: HashMap<&str, usize> = HashMap::new();
 
     for path in symbols.keys() {

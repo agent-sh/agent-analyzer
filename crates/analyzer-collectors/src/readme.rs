@@ -68,7 +68,10 @@ mod tests {
     fn test_extract_markdown_headings() {
         let content = "# Title\n\nSome text\n\n## Section 1\n\n### Subsection\n\n## Section 2\n";
         let headings = extract_headings(content, "README.md");
-        assert_eq!(headings, vec!["Title", "Section 1", "Subsection", "Section 2"]);
+        assert_eq!(
+            headings,
+            vec!["Title", "Section 1", "Subsection", "Section 2"]
+        );
     }
 
     #[test]

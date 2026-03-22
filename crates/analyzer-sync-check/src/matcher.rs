@@ -7,10 +7,7 @@ use analyzer_core::types::{CodeRef, FileSymbols};
 use crate::parser::RawCodeRef;
 
 /// Match raw code references against symbols to produce CodeRef entries.
-pub fn match_refs(
-    refs: &[RawCodeRef],
-    symbols: &HashMap<String, FileSymbols>,
-) -> Vec<CodeRef> {
+pub fn match_refs(refs: &[RawCodeRef], symbols: &HashMap<String, FileSymbols>) -> Vec<CodeRef> {
     refs.iter()
         .map(|raw| {
             let candidates = extract_candidates(&raw.text);
@@ -73,7 +70,10 @@ fn clean_symbol(text: &str) -> String {
         }
     }
     // Strip leading & or *
-    s = s.trim_start_matches('&').trim_start_matches('*').to_string();
+    s = s
+        .trim_start_matches('&')
+        .trim_start_matches('*')
+        .to_string();
     s
 }
 
@@ -110,10 +110,7 @@ fn camel_to_snake(s: &str) -> String {
 
 /// Search the symbol table for a matching symbol.
 /// Returns (exists, defining_file).
-fn find_symbol(
-    symbol: &str,
-    symbols: &HashMap<String, FileSymbols>,
-) -> (bool, Option<String>) {
+fn find_symbol(symbol: &str, symbols: &HashMap<String, FileSymbols>) -> (bool, Option<String>) {
     // Try exact name match across all files
     let last_segment = symbol.rsplit("::").next().unwrap_or(symbol);
     let last_segment = last_segment.rsplit('.').next().unwrap_or(last_segment);
@@ -135,8 +132,8 @@ fn find_symbol(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use analyzer_core::types::{DefinitionEntry, SymbolEntry, SymbolKind};
     use crate::parser::RefContext;
+    use analyzer_core::types::{DefinitionEntry, SymbolEntry, SymbolKind};
 
     fn sample_symbols() -> HashMap<String, FileSymbols> {
         let mut map = HashMap::new();
