@@ -266,6 +266,46 @@ fn run_init(path: &Path, _max_commits: Option<usize>) -> Result<()> {
 
     aggregator::merge_delta(&mut map, &delta);
 
+    // Phase 2: AST symbol extraction
+    eprintln!("[INFO] Extracting AST symbols...");
+    match analyzer_repo_map::extractor::extract_symbols(path) {
+        Ok((symbols, import_graph)) => {
+            eprintln!("[INFO] Extracted symbols from {} files", symbols.len());
+
+            // Detect naming conventions and test patterns
+            let naming = analyzer_repo_map::conventions::detect_naming(&symbols);
+            let test_patterns =
+                analyzer_repo_map::conventions::detect_test_patterns(path, &symbols);
+            map.conventions.naming_patterns = Some(naming);
+            map.conventions.test_patterns = Some(test_patterns);
+
+            map.symbols = Some(symbols);
+            map.import_graph = Some(import_graph);
+        }
+        Err(e) => eprintln!("[WARN] AST extraction failed: {e}"),
+    }
+
+    // Phase 3: Project metadata
+    eprintln!("[INFO] Collecting project metadata...");
+    match analyzer_collectors::collect_metadata(path) {
+        Ok(metadata) => {
+            map.project = Some(metadata);
+        }
+        Err(e) => eprintln!("[WARN] Metadata collection failed: {e}"),
+    }
+
+    // Phase 4: Doc-code cross-references (requires Phase 2 symbols)
+    if let Some(ref symbols) = map.symbols {
+        eprintln!("[INFO] Checking doc-code references...");
+        match analyzer_sync_check::queries::build_doc_refs(path, &map, symbols) {
+            Ok(doc_refs) => {
+                eprintln!("[INFO] Checked {} doc files", doc_refs.len());
+                map.doc_refs = Some(doc_refs);
+            }
+            Err(e) => eprintln!("[WARN] Doc-code sync check failed: {e}"),
+        }
+    }
+
     println!("{}", output::to_json(&map));
     eprintln!("[OK] Repo intel map created successfully");
     Ok(())
@@ -295,6 +335,36 @@ fn run_update(path: &Path, map_file: &Path) -> Result<()> {
     eprintln!("[INFO] Processed {} new commits", delta.commits.len());
 
     aggregator::merge_delta(&mut map, &delta);
+
+    // Re-run AST extraction on update (re-parses changed files only would be ideal,
+    // but for now we do a full rescan since it's fast enough)
+    eprintln!("[INFO] Refreshing AST symbols...");
+    match analyzer_repo_map::extractor::extract_symbols(path) {
+        Ok((symbols, import_graph)) => {
+            let naming = analyzer_repo_map::conventions::detect_naming(&symbols);
+            let test_patterns =
+                analyzer_repo_map::conventions::detect_test_patterns(path, &symbols);
+            map.conventions.naming_patterns = Some(naming);
+            map.conventions.test_patterns = Some(test_patterns);
+            map.symbols = Some(symbols);
+            map.import_graph = Some(import_graph);
+        }
+        Err(e) => eprintln!("[WARN] AST extraction failed: {e}"),
+    }
+
+    // Refresh project metadata
+    match analyzer_collectors::collect_metadata(path) {
+        Ok(metadata) => map.project = Some(metadata),
+        Err(e) => eprintln!("[WARN] Metadata collection failed: {e}"),
+    }
+
+    // Refresh doc-code references
+    if let Some(ref symbols) = map.symbols {
+        match analyzer_sync_check::queries::build_doc_refs(path, &map, symbols) {
+            Ok(doc_refs) => map.doc_refs = Some(doc_refs),
+            Err(e) => eprintln!("[WARN] Doc-code sync check failed: {e}"),
+        }
+    }
 
     println!("{}", output::to_json(&map));
     eprintln!("[OK] Repo intel map updated successfully");

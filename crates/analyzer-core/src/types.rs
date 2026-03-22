@@ -20,6 +20,20 @@ pub struct RepoIntelData {
     pub releases: Releases,
     pub renames: Vec<RenameEntry>,
     pub deletions: Vec<DeletionEntry>,
+
+    // Phase 2: AST symbol data (optional - populated when AST analysis runs)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub symbols: Option<HashMap<String, FileSymbols>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub import_graph: Option<HashMap<String, Vec<String>>>,
+
+    // Phase 3: Project metadata (optional - populated when collectors run)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<ProjectMetadata>,
+
+    // Phase 4: Doc-code cross-references (optional - populated when sync-check runs)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub doc_refs: Option<HashMap<String, DocRefEntry>>,
 }
 
 /// Git repository metadata.
@@ -97,6 +111,10 @@ pub struct ConventionInfo {
     pub prefixes: HashMap<String, u64>,
     pub style: String,
     pub uses_scopes: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub naming_patterns: Option<NamingPatterns>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub test_patterns: Option<TestPatterns>,
 }
 
 /// AI attribution statistics.
@@ -142,6 +160,138 @@ pub struct DeletionEntry {
     pub commit: String,
     pub date: String,
 }
+
+// ─── Phase 2: AST Symbol Types ──────────────────────────────────
+
+/// Symbols extracted from a single file via AST parsing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSymbols {
+    pub exports: Vec<SymbolEntry>,
+    pub imports: Vec<ImportEntry>,
+    pub definitions: Vec<DefinitionEntry>,
+}
+
+/// An exported symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolEntry {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub line: usize,
+}
+
+/// Kind of symbol extracted from AST.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SymbolKind {
+    Function,
+    Class,
+    Struct,
+    Trait,
+    Interface,
+    Enum,
+    Constant,
+    TypeAlias,
+    Module,
+    Field,
+    EnumVariant,
+    Property,
+}
+
+/// An import reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportEntry {
+    pub from: String,
+    pub names: Vec<String>,
+}
+
+/// A definition with complexity info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefinitionEntry {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub line: usize,
+    pub complexity: u32,
+}
+
+/// Naming convention patterns detected from code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamingPatterns {
+    pub functions: String,
+    pub types: String,
+    pub constants: String,
+}
+
+/// Test framework and patterns detected from code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestPatterns {
+    pub framework: String,
+    pub location: String,
+    pub naming: String,
+}
+
+// ─── Phase 3: Project Metadata Types ────────────────────────────
+
+/// Project metadata gathered by collectors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectMetadata {
+    pub readme: Option<ReadmeInfo>,
+    pub license: Option<String>,
+    pub ci: Option<CiInfo>,
+    pub package_manager: Option<String>,
+    pub languages: Vec<LanguageInfo>,
+}
+
+/// README file information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadmeInfo {
+    pub exists: bool,
+    pub path: String,
+    pub sections: Vec<String>,
+}
+
+/// CI provider detection result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CiInfo {
+    pub provider: String,
+    pub config_files: Vec<String>,
+}
+
+/// Language distribution entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageInfo {
+    pub language: String,
+    pub file_count: usize,
+    pub percentage: f64,
+}
+
+// ─── Phase 4: Doc-Code Cross-Reference Types ────────────────────
+
+/// A documentation file's cross-references to code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocRefEntry {
+    pub code_refs: Vec<CodeRef>,
+    pub last_updated: String,
+    pub references_hot_files: bool,
+}
+
+/// A single code reference found in a doc file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeRef {
+    pub text: String,
+    pub symbol: String,
+    pub file: Option<String>,
+    pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub issue: Option<String>,
+}
+
+// ─── AI Detection Types ─────────────────────────────────────────
 
 /// AI detection signal for a single commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,6 +486,8 @@ mod tests {
                 prefixes: HashMap::new(),
                 style: "unknown".to_string(),
                 uses_scopes: false,
+                naming_patterns: None,
+                test_patterns: None,
             },
             ai_attribution: AiAttribution {
                 attributed: 0,
@@ -350,6 +502,10 @@ mod tests {
             },
             renames: vec![],
             deletions: vec![],
+            symbols: None,
+            import_graph: None,
+            project: None,
+            doc_refs: None,
         };
 
         let json = serde_json::to_string(&data).unwrap();

@@ -13,3 +13,13 @@ categories.workspace = true
 
 [dependencies]
 analyzer-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+walkdir.workspace = true
+regex.workspace = true
+pulldown-cmark.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1242,9 +1242,7 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
         ("npm install", "npm test")
     } else if has_go_mod {
         ("go build ./...", "go test ./...")
-    } else if has_pyproject {
-        ("pip install -e .", "pytest")
-    } else if has_setup_py {
+    } else if has_pyproject || has_setup_py {
         ("pip install -e .", "pytest")
     } else if has_pom {
         ("mvn compile", "mvn test")

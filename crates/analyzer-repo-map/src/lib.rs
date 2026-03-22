@@ -1,6 +1,10 @@
-//! Phase 2 stub - AST-based symbol mapping. Not yet implemented.
+//! Phase 2 - AST-based symbol mapping using tree-sitter.
+//!
+//! Extracts exports, imports, definitions, and complexity from source files
+//! for Rust, TypeScript, JavaScript, Python, Go, and Java.
 
-/// Placeholder for the repo-map crate.
-pub fn placeholder() {
-    unimplemented!("This crate will be implemented in a future phase");
-}
+pub mod complexity;
+pub mod conventions;
+pub mod extractor;
+pub mod parser;
+pub mod queries;

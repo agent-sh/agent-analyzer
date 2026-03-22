@@ -35,6 +35,8 @@ pub fn create_empty_map() -> RepoIntelData {
             prefixes: HashMap::new(),
             style: "unknown".to_string(),
             uses_scopes: false,
+            naming_patterns: None,
+            test_patterns: None,
         },
         ai_attribution: AiAttribution {
             attributed: 0,
@@ -49,6 +51,10 @@ pub fn create_empty_map() -> RepoIntelData {
         },
         renames: vec![],
         deletions: vec![],
+        symbols: None,
+        import_graph: None,
+        project: None,
+        doc_refs: None,
     }
 }
 
