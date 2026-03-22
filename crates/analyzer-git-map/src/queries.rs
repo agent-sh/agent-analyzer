@@ -474,9 +474,12 @@ pub fn norms(map: &RepoIntelData) -> NormsResult {
 pub struct AreaEntry {
     pub area: String,
     pub files: usize,
+    pub total_symbols: usize,
     pub owners: Vec<OwnerEntry>,
     pub hotspot_score: f64,
     pub bug_fix_rate: f64,
+    pub complexity_median: f64,
+    pub complexity_max: u32,
     pub health: String,
 }
 
@@ -579,12 +582,43 @@ pub fn areas(map: &RepoIntelData) -> Vec<AreaEntry> {
                 "healthy"
             };
 
+            // Gather complexity and symbol counts from Phase 2 data (if available)
+            let mut complexities: Vec<u32> = Vec::new();
+            let mut sym_count: usize = 0;
+            if let Some(ref symbols) = map.symbols {
+                for (file_path, file_syms) in symbols {
+                    if file_dir(file_path) == area {
+                        sym_count += file_syms.definitions.len();
+                        for def in &file_syms.definitions {
+                            if def.complexity > 0 {
+                                complexities.push(def.complexity);
+                            }
+                        }
+                    }
+                }
+            }
+            complexities.sort_unstable();
+            let complexity_max = complexities.last().copied().unwrap_or(0);
+            let complexity_median = if complexities.is_empty() {
+                0.0
+            } else {
+                let mid = complexities.len() / 2;
+                if complexities.len() % 2 == 0 {
+                    (complexities[mid - 1] + complexities[mid]) as f64 / 2.0
+                } else {
+                    complexities[mid] as f64
+                }
+            };
+
             AreaEntry {
                 area,
                 files: file_count,
+                total_symbols: sym_count,
                 owners,
                 hotspot_score: max_score,
                 bug_fix_rate,
+                complexity_median,
+                complexity_max,
                 health: health.to_string(),
             }
         })
@@ -595,6 +629,96 @@ pub fn areas(map: &RepoIntelData) -> Vec<AreaEntry> {
             .partial_cmp(&a.hotspot_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    entries
+}
+
+// ─── Painspots ──────────────────────────────────────────────────────────────
+
+/// A pain spot entry: files that are hot, buggy, AND complex.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PainspotEntry {
+    pub path: String,
+    pub pain_score: f64,
+    pub hotspot_score: f64,
+    pub bug_fix_rate: f64,
+    pub complexity_max: u32,
+    pub owners: Vec<String>,
+    pub owner_stale: bool,
+}
+
+/// Files that are simultaneously hot (frequent changes), buggy (high fix rate), and complex
+/// (high cyclomatic complexity). Pain score = hotspot_score * (1 + bug_fix_rate) * (1 + complexity/30).
+pub fn painspots(map: &RepoIntelData, limit: usize) -> Vec<PainspotEntry> {
+    let repo_last = &map.git.last_commit_date;
+    let deleted: HashSet<&str> = map.deletions.iter().map(|d| d.path.as_str()).collect();
+    let renamed_from: HashSet<&str> = map.renames.iter().map(|r| r.from.as_str()).collect();
+
+    let mut entries: Vec<PainspotEntry> = map
+        .file_activity
+        .iter()
+        .filter(|(path, _)| {
+            !deleted.contains(path.as_str()) && !renamed_from.contains(path.as_str())
+        })
+        .map(|(path, activity)| {
+            let hotspot_score = (activity.recent_changes as f64 * 2.0 + activity.changes as f64)
+                / (activity.changes as f64 + 1.0);
+            let bug_fix_rate = if activity.changes > 0 {
+                activity.bug_fix_changes as f64 / activity.changes as f64
+            } else {
+                0.0
+            };
+
+            // Get max complexity from Phase 2 symbols (0 if unavailable)
+            let complexity_max = map
+                .symbols
+                .as_ref()
+                .and_then(|syms| syms.get(path))
+                .map(|file_syms| {
+                    file_syms
+                        .definitions
+                        .iter()
+                        .map(|d| d.complexity)
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+
+            let complexity_normalized = complexity_max as f64 / 30.0;
+            let pain_score = hotspot_score * (1.0 + bug_fix_rate) * (1.0 + complexity_normalized);
+
+            // Owner staleness: is the primary owner stale?
+            let mut author_changes: HashMap<&str, u64> = HashMap::new();
+            for author in &activity.authors {
+                *author_changes.entry(author.as_str()).or_insert(0) += 1;
+            }
+            let primary_owner = author_changes
+                .iter()
+                .max_by_key(|&(_, &c)| c)
+                .map(|(name, _)| *name);
+            let owner_stale = primary_owner
+                .and_then(|name| map.contributors.humans.get(name))
+                .map(|c| is_stale(&c.last_seen, repo_last))
+                .unwrap_or(false);
+
+            PainspotEntry {
+                path: path.clone(),
+                pain_score,
+                hotspot_score,
+                bug_fix_rate,
+                complexity_max,
+                owners: activity.authors.clone(),
+                owner_stale,
+            }
+        })
+        .collect();
+
+    entries.sort_by(|a, b| {
+        b.pain_score
+            .partial_cmp(&a.pain_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    entries.truncate(limit);
     entries
 }
 
@@ -2852,5 +2976,120 @@ mod tests {
         assert!(json.contains("\"needsHelp\""));
         assert!(json.contains("\"recentActivity\""));
         assert!(json.contains("\"commitStyle\""));
+    }
+
+    #[test]
+    fn test_painspots_empty_symbols() {
+        let map = make_test_map();
+        // No Phase 2 symbols - painspots should work gracefully on git data alone.
+        let result = painspots(&map, 10);
+        assert!(
+            !result.is_empty(),
+            "should return entries even without symbol data"
+        );
+        for entry in &result {
+            assert!(entry.pain_score >= 0.0);
+            assert_eq!(entry.complexity_max, 0, "no AST data means complexity 0");
+        }
+    }
+
+    #[test]
+    fn test_painspots_with_symbols() {
+        use analyzer_core::types::{DefinitionEntry, FileSymbols, SymbolKind};
+        let mut map = make_test_map();
+        let mut symbols = HashMap::new();
+        // src/engine.rs - high complexity
+        symbols.insert(
+            "src/engine.rs".to_string(),
+            FileSymbols {
+                exports: vec![],
+                imports: vec![],
+                definitions: vec![DefinitionEntry {
+                    name: "process".to_string(),
+                    kind: SymbolKind::Function,
+                    line: 1,
+                    complexity: 25,
+                }],
+            },
+        );
+        // src/config.rs - low complexity
+        symbols.insert(
+            "src/config.rs".to_string(),
+            FileSymbols {
+                exports: vec![],
+                imports: vec![],
+                definitions: vec![DefinitionEntry {
+                    name: "load".to_string(),
+                    kind: SymbolKind::Function,
+                    line: 1,
+                    complexity: 2,
+                }],
+            },
+        );
+        map.symbols = Some(symbols);
+
+        let result = painspots(&map, 10);
+        assert!(!result.is_empty());
+
+        let engine = result.iter().find(|e| e.path == "src/engine.rs");
+        let config = result.iter().find(|e| e.path == "src/config.rs");
+
+        assert!(engine.is_some(), "src/engine.rs should be in painspots");
+        assert_eq!(engine.unwrap().complexity_max, 25);
+
+        // engine.rs has higher hotspot score + higher complexity → higher pain_score
+        if let (Some(eng), Some(cfg)) = (engine, config) {
+            assert!(
+                eng.pain_score > cfg.pain_score,
+                "higher complexity should give higher pain_score (eng={}, cfg={})",
+                eng.pain_score,
+                cfg.pain_score
+            );
+        }
+    }
+
+    #[test]
+    fn test_areas_includes_symbol_counts() {
+        use analyzer_core::types::{DefinitionEntry, FileSymbols, SymbolKind};
+        let mut map = make_test_map();
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            "src/engine.rs".to_string(),
+            FileSymbols {
+                exports: vec![],
+                imports: vec![],
+                definitions: vec![
+                    DefinitionEntry {
+                        name: "run".to_string(),
+                        kind: SymbolKind::Function,
+                        line: 1,
+                        complexity: 10,
+                    },
+                    DefinitionEntry {
+                        name: "stop".to_string(),
+                        kind: SymbolKind::Function,
+                        line: 20,
+                        complexity: 3,
+                    },
+                ],
+            },
+        );
+        map.symbols = Some(symbols);
+
+        let area_list = areas(&map);
+        let src = area_list.iter().find(|a| a.area == "src/").unwrap();
+
+        assert!(
+            src.total_symbols > 0,
+            "total_symbols should be > 0 when symbols present"
+        );
+        assert_eq!(src.total_symbols, 2, "src/ has 2 definitions");
+        assert_eq!(src.complexity_max, 10, "max complexity in src/ is 10");
+        // median of [3, 10] = 6.5
+        assert!(
+            (src.complexity_median - 6.5).abs() < 0.01,
+            "median should be 6.5, got {}",
+            src.complexity_median
+        );
     }
 }

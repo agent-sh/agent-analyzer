@@ -283,6 +283,17 @@ pub enum QueryAction {
         #[arg(long)]
         map_file: PathBuf,
     },
+    /// Show pain spots (hotspot × complexity × bug density intersection)
+    Painspots {
+        /// Repository path
+        path: PathBuf,
+        /// Maximum number of results
+        #[arg(long, default_value = "10")]
+        top: usize,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
 }
 
 pub fn run(action: RepoIntelAction) -> Result<()> {
@@ -632,6 +643,11 @@ fn run_query(query: QueryAction) -> Result<()> {
                     println!("null");
                 }
             }
+        }
+        QueryAction::Painspots { top, map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = queries::painspots(&map, top);
+            println!("{}", output::to_json(&result));
         }
     }
     Ok(())
