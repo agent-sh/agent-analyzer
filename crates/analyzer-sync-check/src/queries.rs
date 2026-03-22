@@ -6,9 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde::Serialize;
 
-use analyzer_core::types::{
-    CodeRef, DocRefEntry, FileSymbols, RepoIntelData,
-};
+use analyzer_core::types::{CodeRef, DocRefEntry, FileSymbols, RepoIntelData};
 use analyzer_core::walk;
 
 use crate::checker;
