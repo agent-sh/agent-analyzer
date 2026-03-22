@@ -148,7 +148,7 @@ All queries operate on the cached `RepoIntelData` - no git commands needed.
 | `norms(map)` | `NormsResult` | Commit conventions (Phase 2 adds code norms) |
 | `areas(map)` | `Vec<AreaEntry>` | Directory-level health with `total_symbols`, `complexity_median`, `complexity_max` from Phase 2 |
 | `painspots(map, limit)` | `Vec<PainspotEntry>` | Files ranked by `hotspot × (1+bug_rate) × (1+complexity/30)` - requires Phase 2 for full score |
-| `contributors(map, months)` | `Vec<ContributorEntry>` | Sorted by commit count |
+| `contributors(map, months)` | `Vec<ContributorEntry>` | Sorted by commit count; includes `recent_activity` (90-day commits) and `stale: bool` |
 | `ai_ratio(map, path_filter)` | `AiRatioResult` | Repo-wide or per-path |
 | `release_info(map)` | `ReleaseInfo` | Cadence, last release, unreleased |
 | `health(map)` | `HealthResult` | Active, bus_factor, frequency, ai_ratio |
@@ -234,7 +234,7 @@ cargo run -p analyzer-cli -- --version  # Run CLI
 ## Current State
 
 - Phase 1-4 complete
-- 145 passing tests (24 analyzer-core, 56 analyzer-git-map, 30 analyzer-repo-map, 16 analyzer-collectors, 19 analyzer-sync-check)
+- 146 passing tests (24 analyzer-core, 57 analyzer-git-map, 30 analyzer-repo-map, 16 analyzer-collectors, 19 analyzer-sync-check)
 - CI: cargo test + clippy + fmt on push/PR
 - Release: 5-target cross-platform builds on tag push
 

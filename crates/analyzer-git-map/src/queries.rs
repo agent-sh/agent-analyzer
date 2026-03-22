@@ -731,13 +731,15 @@ pub struct ContributorEntry {
     pub name: String,
     pub commits: u64,
     pub pct: f64,
-    pub ai_assisted_pct: f64,
+    pub recent_activity: u64,
+    pub stale: bool,
 }
 
 /// Get contributors filtered by recent activity.
 pub fn contributors(map: &RepoIntelData, _months: Option<u32>) -> Vec<ContributorEntry> {
     let total: u64 = map.contributors.humans.values().map(|c| c.commits).sum();
 
+    let repo_last = &map.git.last_commit_date;
     let mut entries: Vec<ContributorEntry> = map
         .contributors
         .humans
@@ -748,16 +750,12 @@ pub fn contributors(map: &RepoIntelData, _months: Option<u32>) -> Vec<Contributo
             } else {
                 0.0
             };
-            let ai_assisted_pct = if c.commits > 0 {
-                (c.ai_assisted_commits as f64 / c.commits as f64) * 100.0
-            } else {
-                0.0
-            };
             ContributorEntry {
                 name: name.clone(),
                 commits: c.commits,
                 pct,
-                ai_assisted_pct,
+                recent_activity: c.recent_commits,
+                stale: is_stale(&c.last_seen, repo_last),
             }
         })
         .collect();
@@ -2258,6 +2256,10 @@ mod tests {
         assert_eq!(contribs[0].commits, 3);
         assert_eq!(contribs[1].name, "bob");
         assert_eq!(contribs[1].commits, 1);
+        // All commits are within 90 days so recent_activity == commits
+        assert_eq!(contribs[0].recent_activity, contribs[0].commits);
+        // stale field is present and false (all recent)
+        assert!(!contribs[0].stale);
     }
 
     #[test]
