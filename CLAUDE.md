@@ -146,7 +146,8 @@ All queries operate on the cached `RepoIntelData` - no git commands needed.
 | `bus_factor(map, adjust_for_ai)` | `usize` | People covering 80% of commits |
 | `bus_factor_detailed(map, adjust_for_ai)` | `BusFactorResult` | With critical_owners, at_risk_areas |
 | `norms(map)` | `NormsResult` | Commit conventions (Phase 2 adds code norms) |
-| `areas(map)` | `Vec<AreaEntry>` | Directory-level health (healthy/needs-attention/at-risk) |
+| `areas(map)` | `Vec<AreaEntry>` | Directory-level health with `total_symbols`, `complexity_median`, `complexity_max` from Phase 2 |
+| `painspots(map, limit)` | `Vec<PainspotEntry>` | Files ranked by `hotspot × (1+bug_rate) × (1+complexity/30)` - requires Phase 2 for full score |
 | `contributors(map, months)` | `Vec<ContributorEntry>` | Sorted by commit count |
 | `ai_ratio(map, path_filter)` | `AiRatioResult` | Repo-wide or per-path |
 | `release_info(map)` | `ReleaseInfo` | Cadence, last release, unreleased |
@@ -201,6 +202,7 @@ agent-analyzer repo-intel query doc-drift [--top=N] --map-file=<file> <path>
 agent-analyzer repo-intel query recent-ai [--top=N] --map-file=<file> <path>
 agent-analyzer repo-intel query onboard --map-file=<file> <path>
 agent-analyzer repo-intel query can-i-help --map-file=<file> <path>
+agent-analyzer repo-intel query painspots [--top=N] --map-file=<file> <path>
 agent-analyzer repo-map generate <path>
 agent-analyzer repo-map symbols <file> --map-file=<file>
 agent-analyzer repo-map dependents <symbol> [--file=<file>] --map-file=<file>
@@ -232,7 +234,7 @@ cargo run -p analyzer-cli -- --version  # Run CLI
 ## Current State
 
 - Phase 1-4 complete
-- 142 passing tests (24 analyzer-core, 53 analyzer-git-map, 30 analyzer-repo-map, 16 analyzer-collectors, 19 analyzer-sync-check)
+- 145 passing tests (24 analyzer-core, 56 analyzer-git-map, 30 analyzer-repo-map, 16 analyzer-collectors, 19 analyzer-sync-check)
 - CI: cargo test + clippy + fmt on push/PR
 - Release: 5-target cross-platform builds on tag push
 
