@@ -489,7 +489,26 @@ pub struct AreaEntry {
 /// - "healthy": active non-stale owner + bug_fix_rate < 0.3
 /// - "needs-attention": stale primary owner OR high bug rate
 /// - "at-risk": both stale primary owner AND high bug rate
+// When `active_areas()` is used internally by `onboard`/`can-i-help`, repos
+// above this file-count use a fast path that limits directory grouping to
+// files with recent activity.  The public `areas()` always returns all areas.
+const LARGE_REPO_FILE_THRESHOLD: usize = 10_000;
+
 pub fn areas(map: &RepoIntelData) -> Vec<AreaEntry> {
+    areas_impl(map, false)
+}
+
+/// Variant of `areas()` used by `onboard` and `can-i-help`: on large repos
+/// (> `LARGE_REPO_FILE_THRESHOLD` tracked files) only files with recent
+/// activity are included.  This still scans the full `file_activity` map to
+/// apply the filter, but it reduces the downstream grouped working set and
+/// number of directories processed, avoiding timeouts on repos like TypeScript
+/// (81K files) or Deno (28K files) where most files are dormant.
+fn active_areas(map: &RepoIntelData) -> Vec<AreaEntry> {
+    areas_impl(map, true)
+}
+
+fn areas_impl(map: &RepoIntelData, active_only: bool) -> Vec<AreaEntry> {
     let repo_last = &map.git.last_commit_date;
 
     // Build set of deleted file paths for filtering
@@ -498,15 +517,40 @@ pub fn areas(map: &RepoIntelData) -> Vec<AreaEntry> {
     // Also collect old paths from renames
     let renamed_from: HashSet<&str> = map.renames.iter().map(|r| r.from.as_str()).collect();
 
+    let large_repo = active_only && map.file_activity.len() > LARGE_REPO_FILE_THRESHOLD;
+
     // Group files by directory, excluding deleted and renamed-from files
     let mut dir_files: HashMap<String, Vec<(&String, &FileActivity)>> = HashMap::new();
     for (path, activity) in &map.file_activity {
         if deleted_paths.contains(path.as_str()) || renamed_from.contains(path.as_str()) {
             continue;
         }
+        if large_repo && activity.recent_changes == 0 {
+            continue;
+        }
         let dir = file_dir(path);
         dir_files.entry(dir).or_default().push((path, activity));
     }
+
+    // Pre-index symbols by directory: O(S) instead of O(D * S).
+    // Without this, the inner loop below would iterate the entire symbols map
+    // once per directory, making the total cost O(directories * symbols).
+    let dir_sym_index: HashMap<String, (usize, Vec<u32>)> = if let Some(ref symbols) = map.symbols {
+        let mut index: HashMap<String, (usize, Vec<u32>)> = HashMap::new();
+        for (file_path, file_syms) in symbols {
+            let dir = file_dir(file_path);
+            let entry = index.entry(dir).or_default();
+            entry.0 += file_syms.definitions.len();
+            for def in &file_syms.definitions {
+                if def.complexity > 0 {
+                    entry.1.push(def.complexity);
+                }
+            }
+        }
+        index
+    } else {
+        HashMap::new()
+    };
 
     let mut entries: Vec<AreaEntry> = dir_files
         .into_iter()
@@ -582,21 +626,9 @@ pub fn areas(map: &RepoIntelData) -> Vec<AreaEntry> {
                 "healthy"
             };
 
-            // Gather complexity and symbol counts from Phase 2 data (if available)
-            let mut complexities: Vec<u32> = Vec::new();
-            let mut sym_count: usize = 0;
-            if let Some(ref symbols) = map.symbols {
-                for (file_path, file_syms) in symbols {
-                    if file_dir(file_path) == area {
-                        sym_count += file_syms.definitions.len();
-                        for def in &file_syms.definitions {
-                            if def.complexity > 0 {
-                                complexities.push(def.complexity);
-                            }
-                        }
-                    }
-                }
-            }
+            // Look up pre-indexed symbol and complexity data for this directory.
+            let (sym_count, mut complexities) =
+                dir_sym_index.get(&area).cloned().unwrap_or_default();
             complexities.sort_unstable();
             let complexity_max = complexities.last().copied().unwrap_or(0);
             let complexity_median = if complexities.is_empty() {
@@ -1347,16 +1379,17 @@ fn detect_structure(map: &RepoIntelData) -> String {
 
 /// Detect build and test commands from file patterns.
 fn detect_commands(map: &RepoIntelData) -> GettingStarted {
-    let paths: Vec<&str> = map.file_activity.keys().map(|s| s.as_str()).collect();
+    // Use a HashSet for O(1) membership tests instead of Vec::contains() O(N).
+    let paths_set: HashSet<&str> = map.file_activity.keys().map(|s| s.as_str()).collect();
 
-    let has_cargo = paths.contains(&"Cargo.toml");
-    let has_package_json = paths.contains(&"package.json");
-    let has_go_mod = paths.contains(&"go.mod");
-    let has_pyproject = paths.contains(&"pyproject.toml");
-    let has_setup_py = paths.contains(&"setup.py");
-    let has_pom = paths.contains(&"pom.xml");
-    let has_gradle = paths.contains(&"build.gradle") || paths.contains(&"build.gradle.kts");
-    let has_makefile = paths.contains(&"Makefile") || paths.contains(&"makefile");
+    let has_cargo = paths_set.contains("Cargo.toml");
+    let has_package_json = paths_set.contains("package.json");
+    let has_go_mod = paths_set.contains("go.mod");
+    let has_pyproject = paths_set.contains("pyproject.toml");
+    let has_setup_py = paths_set.contains("setup.py");
+    let has_pom = paths_set.contains("pom.xml");
+    let has_gradle = paths_set.contains("build.gradle") || paths_set.contains("build.gradle.kts");
+    let has_makefile = paths_set.contains("Makefile") || paths_set.contains("makefile");
 
     let (build_cmd, test_cmd) = if has_cargo {
         ("cargo build", "cargo test")
@@ -1405,30 +1438,29 @@ fn detect_commands(map: &RepoIntelData) -> GettingStarted {
         "src/main/java/App.java",
     ];
     for candidate in &entry_candidates {
-        if paths.contains(candidate) {
+        if paths_set.contains(candidate) {
             entry_points.push(candidate.to_string());
         }
     }
 
     // Also look for main.rs in crate subdirs and main.go in cmd/ subdirs
-    for path in &paths {
-        if (path.ends_with("/main.rs") || path.ends_with("/main.go"))
-            && !entry_points.contains(&path.to_string())
-        {
-            entry_points.push(path.to_string());
+    for path in map.file_activity.keys() {
+        let p = path.as_str();
+        if (p.ends_with("/main.rs") || p.ends_with("/main.go")) && !entry_points.contains(path) {
+            entry_points.push(path.clone());
         }
     }
 
     if entry_points.is_empty() {
         // Fallback: take the first source file
-        if let Some(first) = paths.iter().find(|p| {
+        if let Some(first) = map.file_activity.keys().find(|p| {
             p.ends_with(".rs")
                 || p.ends_with(".ts")
                 || p.ends_with(".js")
                 || p.ends_with(".py")
                 || p.ends_with(".go")
         }) {
-            entry_points.push(first.to_string());
+            entry_points.push(first.clone());
         }
     }
 
@@ -1605,8 +1637,9 @@ pub fn onboard(map: &RepoIntelData, repo_path: Option<&Path>) -> OnboardResult {
         uses_scopes: n.commits.uses_scopes,
     };
 
-    // Key areas from areas() - prioritize source code over tests/docs/benchmarks
-    let area_list = areas(map);
+    // Key areas - prioritize source code over tests/docs/benchmarks.
+    // Uses active_areas() to skip dormant directories on large repos.
+    let area_list = active_areas(map);
     let mut meaningful_areas: Vec<&AreaEntry> = area_list
         .iter()
         .filter(|a| {
@@ -1764,10 +1797,8 @@ pub fn can_i_help(map: &RepoIntelData, repo_path: Option<&Path>) -> CanIHelpResu
         uses_scopes: n.commits.uses_scopes,
     };
 
-    let area_list = areas(map);
+    let area_list = active_areas(map);
     let repo_last = &map.git.last_commit_date;
-
-    // Good first areas: low hotspot score AND non-stale primary owner
     let mut good_first_areas: Vec<GoodFirstArea> = area_list
         .iter()
         .filter(|a| {
@@ -3093,5 +3124,194 @@ mod tests {
             "median should be 6.5, got {}",
             src.complexity_median
         );
+    }
+
+    /// Build a map that simulates a large repo (> LARGE_REPO_FILE_THRESHOLD files).
+    /// Files in `dormant/` have no recent changes; `active/lib.ts` does.
+    /// Uses direct field manipulation to avoid the O(N²) cost of calling
+    /// `merge_delta` N times (each call resets all `recent_changes` counts).
+    fn make_large_repo_map(file_count: usize) -> RepoIntelData {
+        let mut map = create_empty_map();
+
+        // Set up git metadata so the recency window is 90 days before this date
+        map.git.last_commit_date = "2026-03-14T00:00:00Z".to_string();
+        map.git.first_commit_date = "2024-01-01T00:00:00Z".to_string();
+        map.git.analyzed_up_to = "new001".to_string();
+        map.git.total_commits_analyzed = (file_count as u64) + 2;
+
+        // Contributor: alice (not stale - last commit is the recent date above)
+        map.contributors.humans.insert(
+            "alice".to_string(),
+            analyzer_core::types::HumanContributor {
+                commits: (file_count as u64) + 2,
+                recent_commits: 1,
+                first_seen: "2024-01-01T00:00:00Z".to_string(),
+                last_seen: "2026-03-14T00:00:00Z".to_string(),
+                ai_assisted_commits: 0,
+            },
+        );
+
+        // Insert dormant files directly: changes > 0 but recent_changes == 0
+        for i in 0..file_count {
+            map.file_activity.insert(
+                format!("dormant/file_{i}.ts"),
+                FileActivity {
+                    changes: 1,
+                    recent_changes: 0,
+                    authors: vec!["alice".to_string()],
+                    created: "2024-01-01T00:00:00Z".to_string(),
+                    last_changed: "2024-01-01T00:00:00Z".to_string(),
+                    additions: 5,
+                    deletions: 0,
+                    ai_changes: 0,
+                    ai_additions: 0,
+                    ai_deletions: 0,
+                    bug_fix_changes: 0,
+                    refactor_changes: 0,
+                    last_bug_fix: String::new(),
+                },
+            );
+        }
+
+        // Insert the active file: has both historic and recent changes
+        map.file_activity.insert(
+            "active/lib.ts".to_string(),
+            FileActivity {
+                changes: 2,
+                recent_changes: 1,
+                authors: vec!["alice".to_string()],
+                created: "2024-01-01T00:00:00Z".to_string(),
+                last_changed: "2026-03-14T00:00:00Z".to_string(),
+                additions: 13,
+                deletions: 1,
+                ai_changes: 0,
+                ai_additions: 0,
+                ai_deletions: 0,
+                bug_fix_changes: 0,
+                refactor_changes: 0,
+                last_bug_fix: String::new(),
+            },
+        );
+
+        map
+    }
+
+    #[test]
+    fn test_areas_large_repo_includes_all_dirs() {
+        // Public `areas()` must always return all dirs regardless of repo size.
+        // Build a map with LARGE_REPO_FILE_THRESHOLD dormant files so the
+        // fast-path would fire in active_areas(), but NOT in areas().
+        let map = make_large_repo_map(LARGE_REPO_FILE_THRESHOLD);
+
+        // All dormant/ files have recent_changes == 0 because their only commit
+        // is outside the 90-day window relative to the last commit (2026-03-14).
+        let dormant_zero_recent = map
+            .file_activity
+            .iter()
+            .filter(|(p, _)| p.starts_with("dormant/"))
+            .all(|(_, a)| a.recent_changes == 0);
+        assert!(
+            dormant_zero_recent,
+            "dormant files should have no recent changes"
+        );
+        assert!(
+            map.file_activity
+                .get("active/lib.ts")
+                .unwrap()
+                .recent_changes
+                > 0,
+            "active file should have recent changes"
+        );
+
+        let area_list = areas(&map);
+
+        // The public `areas()` must include dormant/ even on large repos
+        let has_dormant = area_list.iter().any(|a| a.area == "dormant/");
+        assert!(
+            has_dormant,
+            "public areas() must include dormant/ directory regardless of repo size"
+        );
+
+        // The active/ directory should also appear
+        let has_active = area_list.iter().any(|a| a.area == "active/");
+        assert!(has_active, "active/ directory must be included");
+    }
+
+    #[test]
+    fn test_active_areas_large_repo_skips_dormant_dirs() {
+        // active_areas() (used by onboard / can-i-help) should skip dormant
+        // directories when file count exceeds LARGE_REPO_FILE_THRESHOLD.
+        let map = make_large_repo_map(LARGE_REPO_FILE_THRESHOLD);
+
+        let area_list = active_areas(&map);
+
+        // dormant/ should be excluded by the fast path
+        let has_dormant = area_list.iter().any(|a| a.area == "dormant/");
+        assert!(
+            !has_dormant,
+            "active_areas() should exclude dormant/ directory on large repos"
+        );
+
+        // The active/ directory should still appear
+        let has_active = area_list.iter().any(|a| a.area == "active/");
+        assert!(has_active, "active/ directory must be included");
+    }
+
+    #[test]
+    fn test_areas_small_repo_includes_dormant_dirs() {
+        // Below the threshold: dormant dirs should still appear in both
+        // areas() and active_areas().
+        let map = make_large_repo_map(5);
+
+        let area_list = areas(&map);
+
+        // Both dormant/ and active/ should be present
+        let has_dormant = area_list.iter().any(|a| a.area == "dormant/");
+        assert!(
+            has_dormant,
+            "small repo should include dormant/ directory in areas"
+        );
+
+        // active_areas() should also include dormant/ for small repos
+        let active_area_list = active_areas(&map);
+        let active_has_dormant = active_area_list.iter().any(|a| a.area == "dormant/");
+        assert!(
+            active_has_dormant,
+            "active_areas() should include dormant/ for small repos (below threshold)"
+        );
+    }
+
+    #[test]
+    fn test_areas_symbols_pre_index_consistent() {
+        // Verify that the pre-indexed symbols path gives the same result as a
+        // direct loop would for a small repo (where the threshold is not hit).
+        use analyzer_core::types::{DefinitionEntry, FileSymbols, SymbolKind};
+
+        let mut map = make_test_map();
+        let mut symbols = HashMap::new();
+        for name in &["engine.rs", "config.rs"] {
+            symbols.insert(
+                format!("src/{name}"),
+                FileSymbols {
+                    exports: vec![],
+                    imports: vec![],
+                    definitions: vec![DefinitionEntry {
+                        name: format!("fn_{name}"),
+                        kind: SymbolKind::Function,
+                        line: 1,
+                        complexity: 5,
+                    }],
+                },
+            );
+        }
+        map.symbols = Some(symbols);
+
+        let area_list = areas(&map);
+        let src = area_list.iter().find(|a| a.area == "src/").unwrap();
+
+        // Two definitions, both with complexity 5
+        assert_eq!(src.total_symbols, 2);
+        assert_eq!(src.complexity_max, 5);
+        assert!((src.complexity_median - 5.0).abs() < 0.01);
     }
 }
