@@ -489,12 +489,26 @@ pub struct AreaEntry {
 /// - "healthy": active non-stale owner + bug_fix_rate < 0.3
 /// - "needs-attention": stale primary owner OR high bug rate
 /// - "at-risk": both stale primary owner AND high bug rate
-// For repos above this size, `areas()` only processes files with recent
-// activity.  This avoids O(N) overhead over 80K+ file_activity entries on
-// large repos like TypeScript or Deno.
+// When `active_areas()` is used internally by `onboard`/`can-i-help`, repos
+// above this file-count use a fast path that limits directory grouping to
+// files with recent activity.  The public `areas()` always returns all areas.
 const LARGE_REPO_FILE_THRESHOLD: usize = 10_000;
 
 pub fn areas(map: &RepoIntelData) -> Vec<AreaEntry> {
+    areas_impl(map, false)
+}
+
+/// Variant of `areas()` used by `onboard` and `can-i-help`: on large repos
+/// (> `LARGE_REPO_FILE_THRESHOLD` tracked files) only files with recent
+/// activity are included.  This still scans the full `file_activity` map to
+/// apply the filter, but it reduces the downstream grouped working set and
+/// number of directories processed, avoiding timeouts on repos like TypeScript
+/// (81K files) or Deno (28K files) where most files are dormant.
+fn active_areas(map: &RepoIntelData) -> Vec<AreaEntry> {
+    areas_impl(map, true)
+}
+
+fn areas_impl(map: &RepoIntelData, active_only: bool) -> Vec<AreaEntry> {
     let repo_last = &map.git.last_commit_date;
 
     // Build set of deleted file paths for filtering
@@ -503,10 +517,7 @@ pub fn areas(map: &RepoIntelData) -> Vec<AreaEntry> {
     // Also collect old paths from renames
     let renamed_from: HashSet<&str> = map.renames.iter().map(|r| r.from.as_str()).collect();
 
-    // For large repos, skip dormant files (no recent changes) to keep the
-    // working set manageable.  `onboard` and `can-i-help` only need active
-    // areas; showing thousands of dormant directories adds no value.
-    let large_repo = map.file_activity.len() > LARGE_REPO_FILE_THRESHOLD;
+    let large_repo = active_only && map.file_activity.len() > LARGE_REPO_FILE_THRESHOLD;
 
     // Group files by directory, excluding deleted and renamed-from files
     let mut dir_files: HashMap<String, Vec<(&String, &FileActivity)>> = HashMap::new();
@@ -1626,8 +1637,9 @@ pub fn onboard(map: &RepoIntelData, repo_path: Option<&Path>) -> OnboardResult {
         uses_scopes: n.commits.uses_scopes,
     };
 
-    // Key areas from areas() - prioritize source code over tests/docs/benchmarks
-    let area_list = areas(map);
+    // Key areas - prioritize source code over tests/docs/benchmarks.
+    // Uses active_areas() to skip dormant directories on large repos.
+    let area_list = active_areas(map);
     let mut meaningful_areas: Vec<&AreaEntry> = area_list
         .iter()
         .filter(|a| {
@@ -1785,10 +1797,8 @@ pub fn can_i_help(map: &RepoIntelData, repo_path: Option<&Path>) -> CanIHelpResu
         uses_scopes: n.commits.uses_scopes,
     };
 
-    let area_list = areas(map);
+    let area_list = active_areas(map);
     let repo_last = &map.git.last_commit_date;
-
-    // Good first areas: low hotspot score AND non-stale primary owner
     let mut good_first_areas: Vec<GoodFirstArea> = area_list
         .iter()
         .filter(|a| {
@@ -3187,9 +3197,11 @@ mod tests {
     }
 
     #[test]
-    fn test_areas_large_repo_skips_dormant_dirs() {
-        // Use a file count just above the threshold so the large-repo path fires
-        let map = make_large_repo_map(LARGE_REPO_FILE_THRESHOLD + 1);
+    fn test_areas_large_repo_includes_all_dirs() {
+        // Public `areas()` must always return all dirs regardless of repo size.
+        // Build a map with LARGE_REPO_FILE_THRESHOLD dormant files so the
+        // fast-path would fire in active_areas(), but NOT in areas().
+        let map = make_large_repo_map(LARGE_REPO_FILE_THRESHOLD);
 
         // All dormant/ files have recent_changes == 0 because their only commit
         // is outside the 90-day window relative to the last commit (2026-03-14).
@@ -3213,11 +3225,31 @@ mod tests {
 
         let area_list = areas(&map);
 
-        // The dormant/ directory should be excluded from the output
+        // The public `areas()` must include dormant/ even on large repos
+        let has_dormant = area_list.iter().any(|a| a.area == "dormant/");
+        assert!(
+            has_dormant,
+            "public areas() must include dormant/ directory regardless of repo size"
+        );
+
+        // The active/ directory should also appear
+        let has_active = area_list.iter().any(|a| a.area == "active/");
+        assert!(has_active, "active/ directory must be included");
+    }
+
+    #[test]
+    fn test_active_areas_large_repo_skips_dormant_dirs() {
+        // active_areas() (used by onboard / can-i-help) should skip dormant
+        // directories when file count exceeds LARGE_REPO_FILE_THRESHOLD.
+        let map = make_large_repo_map(LARGE_REPO_FILE_THRESHOLD);
+
+        let area_list = active_areas(&map);
+
+        // dormant/ should be excluded by the fast path
         let has_dormant = area_list.iter().any(|a| a.area == "dormant/");
         assert!(
             !has_dormant,
-            "large-repo threshold should exclude dormant/ directory"
+            "active_areas() should exclude dormant/ directory on large repos"
         );
 
         // The active/ directory should still appear
@@ -3227,7 +3259,8 @@ mod tests {
 
     #[test]
     fn test_areas_small_repo_includes_dormant_dirs() {
-        // Below the threshold: dormant dirs should still appear
+        // Below the threshold: dormant dirs should still appear in both
+        // areas() and active_areas().
         let map = make_large_repo_map(5);
 
         let area_list = areas(&map);
@@ -3237,6 +3270,14 @@ mod tests {
         assert!(
             has_dormant,
             "small repo should include dormant/ directory in areas"
+        );
+
+        // active_areas() should also include dormant/ for small repos
+        let active_area_list = active_areas(&map);
+        let active_has_dormant = active_area_list.iter().any(|a| a.area == "dormant/");
+        assert!(
+            active_has_dormant,
+            "active_areas() should include dormant/ for small repos (below threshold)"
         );
     }
 
