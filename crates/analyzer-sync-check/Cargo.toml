@@ -1,6 +1,6 @@
 [package]
 name = "analyzer-sync-check"
-description = "Doc-code sync analysis for agent-analyzer (Phase 4 stub)"
+description = "Doc-code sync analysis for agent-analyzer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

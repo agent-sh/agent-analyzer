@@ -1,6 +1,6 @@
 [package]
 name = "analyzer-repo-map"
-description = "AST-based symbol mapping for agent-analyzer (Phase 2 stub)"
+description = "AST-based symbol mapping for agent-analyzer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

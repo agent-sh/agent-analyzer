@@ -37,7 +37,7 @@ cargo install --path crates/analyzer-cli
 
 ### Via agent-sh plugins
 
-If you use the [git-map](https://github.com/agent-sh/git-map) plugin, the binary is downloaded automatically on first use. No manual install needed.
+If you use the [repo-intel](https://github.com/agent-sh/repo-intel) plugin, the binary is downloaded automatically on first use. No manual install needed.
 
 ## Quick start
 
@@ -92,7 +92,7 @@ agent-analyzer repo-intel init /path/to/repo > repo-intel.json
 ### Incremental update
 
 ```bash
-agent-analyzer repo-intel update /path/to/repo --map-file repo-intel.json > git-map-updated.json
+agent-analyzer repo-intel update /path/to/repo --map-file repo-intel.json > repo-intel-updated.json
 ```
 
 ### Check status
@@ -160,12 +160,11 @@ Signatures are loaded from an embedded JSON registry (`ai_signatures.json`). To 
 - **Merge commits are skipped** - only non-merge commits are analyzed, which matches how most tools attribute changes
 - **Shallow clones** - work but produce incomplete history; the output includes a `shallow: true` flag
 - **Large monorepos** - initial scan scales linearly with commit count; use `--max-commits` to bound the scan
-- **Stub crates** - `repo-map`, `collectors`, and `sync-check` subcommands print "not yet implemented" (Phases 2-4)
 
 ## Development
 
 ```bash
-cargo test                            # 77 tests across all crates
+cargo test                            # 146 tests across all crates
 cargo clippy -- -D warnings           # lint
 cargo fmt --check                     # format check
 cargo build --release                 # optimized binary (LTO + stripped)
@@ -179,13 +178,10 @@ This binary is consumed by JS plugins in the agent-sh ecosystem via a binary res
 - Binary location: `~/.agent-sh/bin/agent-analyzer[.exe]`
 - No manual install - lazy download on first use
 
-Current consumers:
-- [git-map](https://github.com/agent-sh/git-map) plugin (JS wrapper for `/git-map` command)
-
-Planned consumers (Phases 2-4):
-- `repo-map` plugin (replace ast-grep subprocess)
-- `agent-core/lib/collectors/` (replace JS implementations)
-- `sync-docs` plugin (replace JS analysis)
+Consumers:
+- [repo-intel](https://github.com/agent-sh/repo-intel) plugin (unified static analysis wrapper - git history, AST symbols, project metadata, doc-code sync)
+- `agent-core/lib/collectors/` (uses `collect` CLI for project metadata)
+- [sync-docs](https://github.com/agent-sh/sync-docs) plugin (uses `sync-check` CLI for doc-code cross-references)
 
 ## Contributing
 

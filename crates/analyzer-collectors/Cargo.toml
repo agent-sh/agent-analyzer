@@ -1,6 +1,6 @@
 [package]
 name = "analyzer-collectors"
-description = "Project data gathering for agent-analyzer (Phase 3 stub)"
+description = "Project metadata gathering for agent-analyzer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
