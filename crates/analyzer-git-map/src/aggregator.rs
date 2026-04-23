@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 
 use analyzer_core::bot_detect::is_bot;
 use analyzer_core::bug_fix_detect::is_bug_fix;
+use analyzer_core::generated_detect::is_generated_path;
 use analyzer_core::types::{
     CommitDelta, Contributors, ConventionInfo, FileActivity, GitInfo, Releases, RepoIntelData,
     extract_conventional_prefix,
@@ -134,6 +135,7 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
                     bug_fix_changes: 0,
                     refactor_changes: 0,
                     last_bug_fix: String::new(),
+                    generated: is_generated_path(&file.path),
                 });
 
             entry.changes += 1;
@@ -150,7 +152,13 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
                 entry.authors.push(commit.author_name.clone());
             }
 
-            if is_bug_fix(&commit.subject) {
+            // Bug-fix attribution is suppressed for generated files: a
+            // "fix(schema): ..." commit touches both the .proto source
+            // and its mechanically-derived .pb.go bindings, but only the
+            // source is actually being fixed. Counting the bindings as
+            // bug-fix activity floats them up bugspots/painspots queries
+            // and drowns out actually-broken code.
+            if !entry.generated && is_bug_fix(&commit.subject) {
                 entry.bug_fix_changes += 1;
                 if commit.date > entry.last_bug_fix {
                     entry.last_bug_fix.clone_from(&commit.date);
@@ -365,6 +373,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn test_merge_delta_bug_fix_counts_freeform_subjects() {
         // Verifies the broader bug-fix detection: subjects without a `fix:`
         // prefix still count as bug fixes when they use fix-related keywords
@@ -400,6 +409,55 @@ mod tests {
     }
 
     #[test]
+||||||| parent of 6c54d0d (feat(generated-detect): suppress bug-fix attribution for auto-generated files)
+=======
+    fn test_merge_delta_suppresses_bugfix_attribution_for_generated_files() {
+        // A "fix(schema): ..." commit touches both the source (.proto)
+        // and the generated bindings (.pb.go). Only the source should
+        // be credited with a bug fix; the bindings are mechanical.
+        let mut map = create_empty_map();
+        let delta = make_delta(vec![make_commit(
+            "alice",
+            "fix(schema): correct field type",
+            vec![
+                FileChange {
+                    path: "api/user.proto".to_string(),
+                    additions: 1,
+                    deletions: 1,
+                },
+                FileChange {
+                    path: "api/user.pb.go".to_string(),
+                    additions: 50,
+                    deletions: 50,
+                },
+                FileChange {
+                    path: "src/generated/user_types.rs".to_string(),
+                    additions: 20,
+                    deletions: 20,
+                },
+            ],
+        )]);
+
+        merge_delta(&mut map, &delta);
+
+        // Source file: counted as bug fix, marked human-authored.
+        let proto = &map.file_activity["api/user.proto"];
+        assert_eq!(proto.bug_fix_changes, 1);
+        assert!(!proto.generated);
+
+        // Generated bindings: not counted, marked generated.
+        let pb_go = &map.file_activity["api/user.pb.go"];
+        assert_eq!(pb_go.bug_fix_changes, 0);
+        assert!(pb_go.generated);
+
+        // Codegen output dir: same.
+        let gen_rs = &map.file_activity["src/generated/user_types.rs"];
+        assert_eq!(gen_rs.bug_fix_changes, 0);
+        assert!(gen_rs.generated);
+    }
+
+    #[test]
+>>>>>>> 6c54d0d (feat(generated-detect): suppress bug-fix attribution for auto-generated files)
     fn test_merge_delta_noise_filtering() {
         let mut map = create_empty_map();
         let delta = make_delta(vec![make_commit(

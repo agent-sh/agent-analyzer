@@ -92,6 +92,13 @@ pub struct FileActivity {
     pub bug_fix_changes: u64,
     pub refactor_changes: u64,
     pub last_bug_fix: String,
+    /// Heuristically classified as auto-generated (protobuf bindings,
+    /// type declarations, codegen output dirs). Bug-fix attribution is
+    /// suppressed for these files because the human author was fixing
+    /// the upstream source, not the mechanical artifact. Defaults to
+    /// false when deserializing older artifacts that pre-date this field.
+    #[serde(default)]
+    pub generated: bool,
 }
 
 /// Coupling entry for co-change tracking between files.

@@ -204,6 +204,7 @@ mod tests {
                     bug_fix_changes: 0,
                     refactor_changes: 0,
                     last_bug_fix: String::new(),
+                    generated: false,
                 },
             );
         }
