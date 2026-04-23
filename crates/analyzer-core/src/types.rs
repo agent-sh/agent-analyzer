@@ -16,7 +16,6 @@ pub struct RepoIntelData {
     pub file_activity: HashMap<String, FileActivity>,
     pub coupling: HashMap<String, HashMap<String, CouplingEntry>>,
     pub conventions: ConventionInfo,
-    pub ai_attribution: AiAttribution,
     pub releases: Releases,
     pub renames: Vec<RenameEntry>,
     pub deletions: Vec<DeletionEntry>,
@@ -67,7 +66,6 @@ pub struct HumanContributor {
     pub recent_commits: u64,
     pub first_seen: String,
     pub last_seen: String,
-    pub ai_assisted_commits: u64,
 }
 
 /// A bot contributor's aggregated stats.
@@ -91,9 +89,6 @@ pub struct FileActivity {
     pub last_changed: String,
     pub additions: u64,
     pub deletions: u64,
-    pub ai_changes: u64,
-    pub ai_additions: u64,
-    pub ai_deletions: u64,
     pub bug_fix_changes: u64,
     pub refactor_changes: u64,
     pub last_bug_fix: String,
@@ -104,8 +99,6 @@ pub struct FileActivity {
 #[serde(rename_all = "camelCase")]
 pub struct CouplingEntry {
     pub cochanges: u64,
-    pub human_cochanges: u64,
-    pub ai_cochanges: u64,
 }
 
 /// Commit message convention tracking.
@@ -119,16 +112,6 @@ pub struct ConventionInfo {
     pub naming_patterns: Option<NamingPatterns>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub test_patterns: Option<TestPatterns>,
-}
-
-/// AI attribution statistics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AiAttribution {
-    pub attributed: u64,
-    pub heuristic: u64,
-    pub none: u64,
-    pub tools: HashMap<String, u64>,
-    pub confidence: String,
 }
 
 /// Release tag tracking.
@@ -293,36 +276,6 @@ pub struct CodeRef {
     pub line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub issue: Option<String>,
-}
-
-// ─── AI Detection Types ─────────────────────────────────────────
-
-/// AI detection signal for a single commit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AiSignal {
-    pub detected: bool,
-    pub tool: Option<String>,
-    pub method: Option<String>,
-}
-
-impl AiSignal {
-    /// Create a signal indicating no AI was detected.
-    pub fn none() -> Self {
-        Self {
-            detected: false,
-            tool: None,
-            method: None,
-        }
-    }
-
-    /// Create a signal indicating AI was detected.
-    pub fn detected(tool: impl Into<String>, method: impl Into<String>) -> Self {
-        Self {
-            detected: true,
-            tool: Some(tool.into()),
-            method: Some(method.into()),
-        }
-    }
 }
 
 /// Raw extraction output - the delta from one extraction pass.
@@ -553,19 +506,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ai_signal_constructors() {
-        let none = AiSignal::none();
-        assert!(!none.detected);
-        assert!(none.tool.is_none());
-        assert!(none.method.is_none());
-
-        let detected = AiSignal::detected("claude", "trailer");
-        assert!(detected.detected);
-        assert_eq!(detected.tool.as_deref(), Some("claude"));
-        assert_eq!(detected.method.as_deref(), Some("trailer"));
-    }
-
-    #[test]
     fn test_repo_intel_data_serialization() {
         let data = RepoIntelData {
             version: "1.0".to_string(),
@@ -593,13 +533,6 @@ mod tests {
                 naming_patterns: None,
                 test_patterns: None,
             },
-            ai_attribution: AiAttribution {
-                attributed: 0,
-                heuristic: 0,
-                none: 0,
-                tools: HashMap::new(),
-                confidence: "low".to_string(),
-            },
             releases: Releases {
                 tags: vec![],
                 cadence: "unknown".to_string(),
@@ -617,7 +550,6 @@ mod tests {
         let roundtrip: RepoIntelData = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip.version, "1.0");
         assert_eq!(roundtrip.git.analyzed_up_to, "abc123");
-        assert_eq!(roundtrip.ai_attribution.confidence, "low");
     }
 
     #[test]

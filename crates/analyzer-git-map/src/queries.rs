@@ -34,7 +34,6 @@ pub struct HotspotEntry {
     pub recent_changes: u64,
     pub score: f64,
     pub authors: Vec<String>,
-    pub ai_ratio: f64,
     pub bug_fixes: u64,
 }
 
@@ -48,11 +47,6 @@ pub fn hotspots(map: &RepoIntelData, _months: Option<u32>, limit: usize) -> Vec<
         .file_activity
         .iter()
         .map(|(path, activity)| {
-            let ai_ratio = if activity.changes > 0 {
-                activity.ai_changes as f64 / activity.changes as f64
-            } else {
-                0.0
-            };
             let score = (activity.recent_changes as f64 * 2.0 + activity.changes as f64)
                 / (activity.changes as f64 + 1.0);
             HotspotEntry {
@@ -61,7 +55,6 @@ pub fn hotspots(map: &RepoIntelData, _months: Option<u32>, limit: usize) -> Vec<
                 recent_changes: activity.recent_changes,
                 score,
                 authors: activity.authors.clone(),
-                ai_ratio,
                 bug_fixes: activity.bug_fix_changes,
             }
         })
@@ -152,11 +145,10 @@ pub struct CouplingResult {
     pub path: String,
     pub strength: f64,
     pub cochanges: u64,
-    pub human_cochanges: u64,
 }
 
 /// Get files coupled with a given file.
-pub fn coupling(map: &RepoIntelData, file: &str, human_only: bool) -> Vec<CouplingResult> {
+pub fn coupling(map: &RepoIntelData, file: &str) -> Vec<CouplingResult> {
     let mut results = Vec::new();
 
     // Check forward coupling (file as key)
@@ -165,19 +157,10 @@ pub fn coupling(map: &RepoIntelData, file: &str, human_only: bool) -> Vec<Coupli
             let total = map.file_activity.get(file).map(|f| f.changes).unwrap_or(1);
             let strength = entry.cochanges as f64 / total as f64;
 
-            if human_only && entry.human_cochanges == 0 {
-                continue;
-            }
-
             results.push(CouplingResult {
                 path: other.clone(),
                 strength,
-                cochanges: if human_only {
-                    entry.human_cochanges
-                } else {
-                    entry.cochanges
-                },
-                human_cochanges: entry.human_cochanges,
+                cochanges: entry.cochanges,
             });
         }
     }
@@ -188,19 +171,10 @@ pub fn coupling(map: &RepoIntelData, file: &str, human_only: bool) -> Vec<Coupli
             let total = map.file_activity.get(file).map(|f| f.changes).unwrap_or(1);
             let strength = entry.cochanges as f64 / total as f64;
 
-            if human_only && entry.human_cochanges == 0 {
-                continue;
-            }
-
             results.push(CouplingResult {
                 path: key.clone(),
                 strength,
-                cochanges: if human_only {
-                    entry.human_cochanges
-                } else {
-                    entry.cochanges
-                },
-                human_cochanges: entry.human_cochanges,
+                cochanges: entry.cochanges,
             });
         }
     }
@@ -219,7 +193,6 @@ pub struct OwnershipResult {
     pub primary: String,
     pub pct: f64,
     pub owners: Vec<OwnerEntry>,
-    pub ai_ratio: f64,
     pub bus_factor_risk: bool,
 }
 
@@ -238,12 +211,10 @@ pub struct OwnerEntry {
 pub fn ownership(map: &RepoIntelData, dir_or_file: &str) -> OwnershipResult {
     let mut author_changes: HashMap<String, u64> = HashMap::new();
     let mut total_changes: u64 = 0;
-    let mut ai_changes: u64 = 0;
 
     for (path, activity) in &map.file_activity {
         if path.starts_with(dir_or_file) || path == dir_or_file {
             total_changes += activity.changes;
-            ai_changes += activity.ai_changes;
             for author in &activity.authors {
                 *author_changes.entry(author.clone()).or_insert(0) += activity.changes;
             }
@@ -285,11 +256,6 @@ pub fn ownership(map: &RepoIntelData, dir_or_file: &str) -> OwnershipResult {
 
     let primary = owners.first().map(|c| c.name.clone()).unwrap_or_default();
     let primary_pct = owners.first().map(|c| c.pct).unwrap_or(0.0);
-    let ai_ratio = if total_changes > 0 {
-        ai_changes as f64 / total_changes as f64
-    } else {
-        0.0
-    };
 
     // Bus factor risk: only 1 non-stale owner
     let non_stale_count = owners.iter().filter(|o| !o.stale).count();
@@ -300,7 +266,6 @@ pub fn ownership(map: &RepoIntelData, dir_or_file: &str) -> OwnershipResult {
         primary,
         pct: primary_pct,
         owners,
-        ai_ratio,
         bus_factor_risk,
     }
 }
@@ -312,7 +277,6 @@ pub fn ownership(map: &RepoIntelData, dir_or_file: &str) -> OwnershipResult {
 #[serde(rename_all = "camelCase")]
 pub struct BusFactorResult {
     pub bus_factor: usize,
-    pub adjust_for_ai: bool,
     pub critical_owners: Vec<CriticalOwner>,
     pub at_risk_areas: Vec<String>,
 }
@@ -328,27 +292,19 @@ pub struct CriticalOwner {
 }
 
 /// Calculate bus factor - the minimum number of people covering 80% of commits.
-pub fn bus_factor(map: &RepoIntelData, adjust_for_ai: bool) -> usize {
-    bus_factor_detailed(map, adjust_for_ai).bus_factor
+pub fn bus_factor(map: &RepoIntelData) -> usize {
+    bus_factor_detailed(map).bus_factor
 }
 
 /// Calculate detailed bus factor with critical owners and at-risk areas.
-pub fn bus_factor_detailed(map: &RepoIntelData, adjust_for_ai: bool) -> BusFactorResult {
+pub fn bus_factor_detailed(map: &RepoIntelData) -> BusFactorResult {
     let repo_last = &map.git.last_commit_date;
 
     let mut human_commits: Vec<(String, f64)> = map
         .contributors
         .humans
         .iter()
-        .map(|(name, c)| {
-            let effective = if adjust_for_ai && c.commits > 0 {
-                let human_ratio = 1.0 - (c.ai_assisted_commits as f64 / c.commits as f64);
-                c.commits as f64 * human_ratio
-            } else {
-                c.commits as f64
-            };
-            (name.clone(), effective)
-        })
+        .map(|(name, c)| (name.clone(), c.commits as f64))
         .collect();
 
     human_commits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -357,7 +313,6 @@ pub fn bus_factor_detailed(map: &RepoIntelData, adjust_for_ai: bool) -> BusFacto
     if total == 0.0 {
         return BusFactorResult {
             bus_factor: 0,
-            adjust_for_ai,
             critical_owners: vec![],
             at_risk_areas: vec![],
         };
@@ -426,7 +381,6 @@ pub fn bus_factor_detailed(map: &RepoIntelData, adjust_for_ai: bool) -> BusFacto
 
     BusFactorResult {
         bus_factor: count,
-        adjust_for_ai,
         critical_owners,
         at_risk_areas,
     }
@@ -796,55 +750,6 @@ pub fn contributors(map: &RepoIntelData, _months: Option<u32>) -> Vec<Contributo
     entries
 }
 
-// ─── AI Ratio ───────────────────────────────────────────────────────────────
-
-/// AI ratio result.
-#[derive(Debug, Clone, Serialize)]
-pub struct AiRatioResult {
-    pub ratio: f64,
-    pub attributed: u64,
-    pub total: u64,
-    pub tools: HashMap<String, u64>,
-}
-
-/// Get AI ratio for the entire repo or a path filter.
-pub fn ai_ratio(map: &RepoIntelData, path_filter: Option<&str>) -> AiRatioResult {
-    if let Some(filter) = path_filter {
-        let mut total_changes: u64 = 0;
-        let mut ai_changes: u64 = 0;
-
-        for (path, activity) in &map.file_activity {
-            if path.starts_with(filter) {
-                total_changes += activity.changes;
-                ai_changes += activity.ai_changes;
-            }
-        }
-
-        AiRatioResult {
-            ratio: if total_changes > 0 {
-                ai_changes as f64 / total_changes as f64
-            } else {
-                0.0
-            },
-            attributed: ai_changes,
-            total: total_changes,
-            tools: map.ai_attribution.tools.clone(),
-        }
-    } else {
-        let total = map.ai_attribution.attributed + map.ai_attribution.none;
-        AiRatioResult {
-            ratio: if total > 0 {
-                map.ai_attribution.attributed as f64 / total as f64
-            } else {
-                0.0
-            },
-            attributed: map.ai_attribution.attributed,
-            total,
-            tools: map.ai_attribution.tools.clone(),
-        }
-    }
-}
-
 // ─── Release Info ───────────────────────────────────────────────────────────
 
 /// Release info result.
@@ -884,26 +789,17 @@ pub struct HealthResult {
     pub active: bool,
     pub bus_factor: usize,
     pub commit_frequency: f64,
-    pub ai_ratio: f64,
 }
 
 /// Get repository health summary.
 pub fn health(map: &RepoIntelData) -> HealthResult {
-    let bf = bus_factor(map, false);
-    let total = map.ai_attribution.attributed + map.ai_attribution.none;
-    let ai_r = if total > 0 {
-        map.ai_attribution.attributed as f64 / total as f64
-    } else {
-        0.0
-    };
-
+    let bf = bus_factor(map);
     let active = map.git.total_commits_analyzed > 0;
 
     HealthResult {
         active,
         bus_factor: bf,
         commit_frequency: map.git.total_commits_analyzed as f64,
-        ai_ratio: ai_r,
     }
 }
 
@@ -1018,14 +914,15 @@ pub struct DiffRiskEntry {
     pub bug_fix_rate: f64,
     pub churn: u64,
     pub author_count: usize,
-    pub ai_ratio: f64,
     pub known: bool,
 }
 
 /// Score a list of changed files by composite risk.
 ///
-/// Risk formula: `bug_fix_rate * 0.4 + single_author * 0.3 + ai_ratio * 0.3`
-/// Files not in the map get `known: false` and risk_score 0.5 (unknown = moderate risk).
+/// Risk formula (after dropping the AI-ratio component which was unreliable):
+///   `risk_score = bug_fix_rate * 0.6 + single_author * 0.4`
+/// Files not in the map get `known: false` and risk_score 0.5 (unknown =
+/// moderate risk).
 pub fn diff_risk(map: &RepoIntelData, files: &[String]) -> Vec<DiffRiskEntry> {
     let mut entries: Vec<DiffRiskEntry> = files
         .iter()
@@ -1036,27 +933,31 @@ pub fn diff_risk(map: &RepoIntelData, files: &[String]) -> Vec<DiffRiskEntry> {
                 } else {
                     0.0
                 };
-                let ai_ratio = if activity.changes > 0 {
-                    activity.ai_changes as f64 / activity.changes as f64
-                } else {
-                    0.0
-                };
-                let single_author = if activity.authors.len() <= 1 {
+                // Count only human authors. `activity.authors` is the
+                // raw list of every commit author, which includes bots
+                // like dependabot[bot]. A file touched by alice and
+                // dependabot has effectively one human owner, not two,
+                // so the bot must not dilute the single-author signal.
+                let human_author_count = activity
+                    .authors
+                    .iter()
+                    .filter(|a| !map.contributors.bots.contains_key(a.as_str()))
+                    .count();
+                let single_author = if human_author_count <= 1 {
                     1.0
                 } else {
-                    1.0 / activity.authors.len() as f64
+                    1.0 / human_author_count as f64
                 };
                 let churn = activity.additions + activity.deletions;
 
-                let risk_score = bug_fix_rate * 0.4 + single_author * 0.3 + ai_ratio * 0.3;
+                let risk_score = bug_fix_rate * 0.6 + single_author * 0.4;
 
                 DiffRiskEntry {
                     path: path.clone(),
                     risk_score,
                     bug_fix_rate,
                     churn,
-                    author_count: activity.authors.len(),
-                    ai_ratio,
+                    author_count: human_author_count,
                     known: true,
                 }
             } else {
@@ -1066,7 +967,6 @@ pub fn diff_risk(map: &RepoIntelData, files: &[String]) -> Vec<DiffRiskEntry> {
                     bug_fix_rate: 0.0,
                     churn: 0,
                     author_count: 0,
-                    ai_ratio: 0.0,
                     known: false,
                 }
             }
@@ -1134,56 +1034,6 @@ pub fn doc_drift(map: &RepoIntelData, limit: usize) -> Vec<DocDriftEntry> {
 
     // Sort by coupling ascending (least coupled = most drifted)
     entries.sort_by_key(|e| e.code_coupling);
-    entries.truncate(limit);
-    entries
-}
-
-// ─── Recent AI ──────────────────────────────────────────────────────────────
-
-/// A file with recent AI-authored changes.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecentAiEntry {
-    pub path: String,
-    pub ai_changes: u64,
-    pub total_changes: u64,
-    pub ai_ratio: f64,
-    pub recent_changes: u64,
-    pub ai_additions: u64,
-    pub ai_deletions: u64,
-}
-
-/// Find files with recent AI changes, sorted by AI ratio descending.
-///
-/// Only includes files where both `ai_changes > 0` and `recent_changes > 0`.
-pub fn recent_ai(map: &RepoIntelData, limit: usize) -> Vec<RecentAiEntry> {
-    let mut entries: Vec<RecentAiEntry> = map
-        .file_activity
-        .iter()
-        .filter(|(_, activity)| activity.ai_changes > 0 && activity.recent_changes > 0)
-        .map(|(path, activity)| {
-            let ai_ratio = if activity.changes > 0 {
-                activity.ai_changes as f64 / activity.changes as f64
-            } else {
-                0.0
-            };
-            RecentAiEntry {
-                path: path.clone(),
-                ai_changes: activity.ai_changes,
-                total_changes: activity.changes,
-                ai_ratio,
-                recent_changes: activity.recent_changes,
-                ai_additions: activity.ai_additions,
-                ai_deletions: activity.ai_deletions,
-            }
-        })
-        .collect();
-
-    entries.sort_by(|a, b| {
-        b.ai_ratio
-            .partial_cmp(&a.ai_ratio)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
     entries.truncate(limit);
     entries
 }
@@ -1610,7 +1460,7 @@ pub fn onboard(map: &RepoIntelData, repo_path: Option<&Path>) -> OnboardResult {
     let language = detect_language(map);
     let structure = detect_structure(map);
     let total_files = map.file_activity.len();
-    let bf = bus_factor(map, false);
+    let bf = bus_factor(map);
 
     let total_contributors = map.contributors.humans.len();
     let h = health(map);
@@ -1919,7 +1769,7 @@ pub fn can_i_help(map: &RepoIntelData, repo_path: Option<&Path>) -> CanIHelpResu
     let recent_activity = RecentActivitySummary {
         active_contributors,
         total_commits: map.git.total_commits_analyzed,
-        bus_factor: bus_factor(map, false),
+        bus_factor: bus_factor(map),
     };
 
     CanIHelpResult {
@@ -2213,14 +2063,14 @@ mod tests {
     #[test]
     fn test_bus_factor() {
         let map = make_test_map();
-        let bf = bus_factor(&map, false);
+        let bf = bus_factor(&map);
         assert_eq!(bf, 2);
     }
 
     #[test]
     fn test_bus_factor_with_staleness() {
         let map = make_staleness_test_map();
-        let result = bus_factor_detailed(&map, false);
+        let result = bus_factor_detailed(&map);
         // Should identify alice as stale in critical owners
         let alice = result.critical_owners.iter().find(|o| o.name == "alice");
         if let Some(a) = alice {
@@ -2271,14 +2121,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ai_ratio_no_ai() {
-        let map = make_test_map();
-        let ratio = ai_ratio(&map, None);
-        assert_eq!(ratio.attributed, 0);
-        assert_eq!(ratio.ratio, 0.0);
-    }
-
-    #[test]
     fn test_contributors() {
         let map = make_test_map();
         let contribs = contributors(&map, None);
@@ -2314,7 +2156,7 @@ mod tests {
     #[test]
     fn test_coupling() {
         let map = make_test_map();
-        let coupled = coupling(&map, "src/engine.rs", false);
+        let coupled = coupling(&map, "src/engine.rs");
         let test_coupling = coupled.iter().find(|c| c.path == "src/engine_test.rs");
         assert!(test_coupling.is_some());
         assert_eq!(test_coupling.unwrap().cochanges, 3);
@@ -2410,6 +2252,51 @@ mod tests {
     }
 
     #[test]
+    fn test_diff_risk_excludes_bots_from_author_count() {
+        // Reviewer-caught: a file touched by alice + dependabot[bot]
+        // has effectively one human owner. The previous code counted
+        // bots, halving single_author and lowering the risk score for
+        // files that should actually look bus-factor-fragile.
+        let mut map = create_empty_map();
+        map.contributors.bots.insert(
+            "dependabot[bot]".to_string(),
+            analyzer_core::types::BotContributor {
+                commits: 50,
+                recent_commits: 5,
+                first_seen: "2026-01-01T00:00:00Z".to_string(),
+                last_seen: "2026-04-01T00:00:00Z".to_string(),
+            },
+        );
+        map.file_activity.insert(
+            "src/lib.rs".to_string(),
+            FileActivity {
+                changes: 10,
+                recent_changes: 0,
+                authors: vec!["alice".to_string(), "dependabot[bot]".to_string()],
+                created: "2026-01-01T00:00:00Z".to_string(),
+                last_changed: "2026-03-01T00:00:00Z".to_string(),
+                additions: 100,
+                deletions: 50,
+                bug_fix_changes: 0,
+                refactor_changes: 0,
+                last_bug_fix: String::new(),
+            },
+        );
+
+        let risks = diff_risk(&map, &["src/lib.rs".to_string()]);
+        assert_eq!(
+            risks[0].author_count, 1,
+            "dependabot must not count toward author_count"
+        );
+        // single_author = 1.0 (one human), so risk gets the full 0.4
+        // bonus from that term.
+        assert!(
+            risks[0].risk_score >= 0.4,
+            "single human owner should yield single_author=1.0"
+        );
+    }
+
+    #[test]
     fn test_doc_drift() {
         // Create a map with an md file that has no code coupling
         let mut map = create_empty_map();
@@ -2458,14 +2345,6 @@ mod tests {
     }
 
     #[test]
-    fn test_recent_ai_empty() {
-        let map = make_test_map();
-        // No AI commits in test map
-        let ai = recent_ai(&map, 10);
-        assert!(ai.is_empty());
-    }
-
-    #[test]
     fn test_is_test_file() {
         assert!(is_test_file("src/engine.test.ts"));
         assert!(is_test_file("src/engine_test.rs"));
@@ -2504,131 +2383,6 @@ mod tests {
     }
 
     #[test]
-    fn test_recent_ai_with_data() {
-        let mut map = create_empty_map();
-        let delta = CommitDelta {
-            head: "abc".to_string(),
-            commits: vec![
-                CommitInfo {
-                    hash: "ai1".to_string(),
-                    author_name: "dev".to_string(),
-                    author_email: "dev@test.com".to_string(),
-                    date: "2026-03-10T10:00:00Z".to_string(),
-                    subject: "feat: ai work".to_string(),
-                    body: "Generated with Claude Code".to_string(),
-                    trailers: vec![],
-                    files: vec![FileChange {
-                        path: "src/ai_file.rs".to_string(),
-                        additions: 50,
-                        deletions: 0,
-                    }],
-                },
-                CommitInfo {
-                    hash: "h1".to_string(),
-                    author_name: "dev".to_string(),
-                    author_email: "dev@test.com".to_string(),
-                    date: "2026-03-11T10:00:00Z".to_string(),
-                    subject: "feat: human work".to_string(),
-                    body: String::new(),
-                    trailers: vec![],
-                    files: vec![
-                        FileChange {
-                            path: "src/ai_file.rs".to_string(),
-                            additions: 10,
-                            deletions: 5,
-                        },
-                        FileChange {
-                            path: "src/human_file.rs".to_string(),
-                            additions: 30,
-                            deletions: 0,
-                        },
-                    ],
-                },
-            ],
-            renames: vec![],
-            deletions: vec![],
-        };
-        merge_delta(&mut map, &delta);
-
-        let ai = recent_ai(&map, 10);
-        assert!(!ai.is_empty());
-        // ai_file.rs has 1 AI change out of 2 total
-        let ai_file = ai.iter().find(|e| e.path == "src/ai_file.rs").unwrap();
-        assert_eq!(ai_file.ai_changes, 1);
-        assert_eq!(ai_file.total_changes, 2);
-        assert!((ai_file.ai_ratio - 0.5).abs() < 0.01);
-        // human_file.rs should not appear (0 ai changes)
-        assert!(ai.iter().all(|e| e.path != "src/human_file.rs"));
-    }
-
-    #[test]
-    fn test_ai_ratio_with_path_filter() {
-        let mut map = create_empty_map();
-        let delta = CommitDelta {
-            head: "abc".to_string(),
-            commits: vec![
-                CommitInfo {
-                    hash: "ai1".to_string(),
-                    author_name: "dev".to_string(),
-                    author_email: "dev@test.com".to_string(),
-                    date: "2026-03-10T10:00:00Z".to_string(),
-                    subject: "feat: ai work".to_string(),
-                    body: "Generated with Claude Code".to_string(),
-                    trailers: vec![],
-                    files: vec![FileChange {
-                        path: "src/module.rs".to_string(),
-                        additions: 50,
-                        deletions: 0,
-                    }],
-                },
-                CommitInfo {
-                    hash: "h1".to_string(),
-                    author_name: "dev".to_string(),
-                    author_email: "dev@test.com".to_string(),
-                    date: "2026-03-11T10:00:00Z".to_string(),
-                    subject: "feat: other".to_string(),
-                    body: String::new(),
-                    trailers: vec![],
-                    files: vec![FileChange {
-                        path: "lib/other.rs".to_string(),
-                        additions: 30,
-                        deletions: 0,
-                    }],
-                },
-            ],
-            renames: vec![],
-            deletions: vec![],
-        };
-        merge_delta(&mut map, &delta);
-
-        // With path filter "src/" should only count src/module.rs
-        let filtered = ai_ratio(&map, Some("src/"));
-        assert!(filtered.attributed > 0);
-        assert!(filtered.ratio > 0.0);
-
-        // With path filter "lib/" should have 0 AI
-        let lib = ai_ratio(&map, Some("lib/"));
-        assert_eq!(lib.attributed, 0);
-        assert_eq!(lib.ratio, 0.0);
-    }
-
-    #[test]
-    fn test_coupling_human_only() {
-        let map = make_test_map();
-        // human_only=false should include all cochanges
-        let all = coupling(&map, "src/engine.rs", false);
-        assert!(!all.is_empty());
-        // human_only=true should also work (all commits in test map are human)
-        let human = coupling(&map, "src/engine.rs", true);
-        assert!(!human.is_empty());
-        // Both should find engine_test.rs coupling
-        let all_test = all.iter().find(|c| c.path == "src/engine_test.rs");
-        let human_test = human.iter().find(|c| c.path == "src/engine_test.rs");
-        assert!(all_test.is_some());
-        assert!(human_test.is_some());
-    }
-
-    #[test]
     fn test_coldspots_sort_order() {
         let map = make_test_map();
         let cold = coldspots(&map, None);
@@ -2659,7 +2413,7 @@ mod tests {
         // total_symbols is always 0 (Phase 2)
         assert_eq!(result.total_symbols, 0);
         // Bus factor should match bus_factor()
-        assert_eq!(result.bus_factor, bus_factor(&map, false));
+        assert_eq!(result.bus_factor, bus_factor(&map));
         // Health should be a valid label
         assert!(
             ["healthy", "moderate", "at-risk", "inactive"].contains(&result.health.as_str()),
@@ -2799,7 +2553,7 @@ mod tests {
         // Recent activity should reflect contributors
         assert!(result.recent_activity.active_contributors > 0);
         assert!(result.recent_activity.total_commits > 0);
-        assert_eq!(result.recent_activity.bus_factor, bus_factor(&map, false));
+        assert_eq!(result.recent_activity.bus_factor, bus_factor(&map));
 
         // good_first_areas and needs_help should be populated (all commits recent in test map)
         // With all-recent commits: areas have high hotspot scores, so good_first_areas may be empty
@@ -3147,7 +2901,6 @@ mod tests {
                 recent_commits: 1,
                 first_seen: "2024-01-01T00:00:00Z".to_string(),
                 last_seen: "2026-03-14T00:00:00Z".to_string(),
-                ai_assisted_commits: 0,
             },
         );
 
@@ -3163,9 +2916,6 @@ mod tests {
                     last_changed: "2024-01-01T00:00:00Z".to_string(),
                     additions: 5,
                     deletions: 0,
-                    ai_changes: 0,
-                    ai_additions: 0,
-                    ai_deletions: 0,
                     bug_fix_changes: 0,
                     refactor_changes: 0,
                     last_bug_fix: String::new(),
@@ -3184,9 +2934,6 @@ mod tests {
                 last_changed: "2026-03-14T00:00:00Z".to_string(),
                 additions: 13,
                 deletions: 1,
-                ai_changes: 0,
-                ai_additions: 0,
-                ai_deletions: 0,
                 bug_fix_changes: 0,
                 refactor_changes: 0,
                 last_bug_fix: String::new(),
