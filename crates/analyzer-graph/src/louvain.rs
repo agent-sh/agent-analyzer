@@ -178,8 +178,7 @@ impl State {
             // Remove node from its current community to evaluate fairly.
             let k_in_current = weights_to.get(&current_comm).copied().unwrap_or(0.0);
             *self.comm_total.entry(current_comm).or_insert(0.0) -= k_i;
-            *self.comm_internal.entry(current_comm).or_insert(0.0) -=
-                k_in_current + self_loop;
+            *self.comm_internal.entry(current_comm).or_insert(0.0) -= k_in_current + self_loop;
 
             // Pick the best target community (default = stay put).
             let mut best_comm = current_comm;
@@ -196,8 +195,7 @@ impl State {
             // Re-insert into chosen community.
             let k_in_best = weights_to.get(&best_comm).copied().unwrap_or(0.0);
             *self.comm_total.entry(best_comm).or_insert(0.0) += k_i;
-            *self.comm_internal.entry(best_comm).or_insert(0.0) +=
-                k_in_best + self_loop;
+            *self.comm_internal.entry(best_comm).or_insert(0.0) += k_in_best + self_loop;
             self.node_to_comm[node] = best_comm;
 
             if best_comm != current_comm {

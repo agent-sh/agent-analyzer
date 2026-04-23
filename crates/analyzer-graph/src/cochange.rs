@@ -18,9 +18,7 @@ use std::collections::HashMap;
 use petgraph::Undirected;
 use petgraph::graph::{Graph, NodeIndex};
 
-use analyzer_core::types::{
-    CochangeEdge, CochangeGraph, CochangeParams, RepoIntelData,
-};
+use analyzer_core::types::{CochangeEdge, CochangeGraph, CochangeParams, RepoIntelData};
 
 use crate::{centrality, louvain};
 
@@ -107,11 +105,7 @@ pub fn build_with(map: &RepoIntelData, params: CochangeParams) -> Option<Cochang
     }
 
     // Louvain partition with our resolution + small-community merge.
-    let partition = louvain::run(
-        &graph,
-        params.louvain_resolution,
-        params.min_community_size,
-    );
+    let partition = louvain::run(&graph, params.louvain_resolution, params.min_community_size);
 
     // Communities: u32 -> [paths].
     let mut communities: HashMap<u32, Vec<String>> = HashMap::new();
@@ -226,17 +220,14 @@ mod tests {
 
         for (a, b, cochanges) in coupling_pairs {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-            data.coupling
-                .entry((*lo).to_string())
-                .or_default()
-                .insert(
-                    (*hi).to_string(),
-                    CouplingEntry {
-                        cochanges: *cochanges,
-                        human_cochanges: *cochanges,
-                        ai_cochanges: 0,
-                    },
-                );
+            data.coupling.entry((*lo).to_string()).or_default().insert(
+                (*hi).to_string(),
+                CouplingEntry {
+                    cochanges: *cochanges,
+                    human_cochanges: *cochanges,
+                    ai_cochanges: 0,
+                },
+            );
         }
         data
     }
@@ -293,7 +284,10 @@ mod tests {
 
         let comm_a = g.file_to_community["a.rs"];
         let comm_d = g.file_to_community["d.rs"];
-        assert_ne!(comm_a, comm_d, "two triangles should land in distinct communities");
+        assert_ne!(
+            comm_a, comm_d,
+            "two triangles should land in distinct communities"
+        );
         assert_eq!(g.file_to_community["b.rs"], comm_a);
         assert_eq!(g.file_to_community["c.rs"], comm_a);
         assert_eq!(g.file_to_community["e.rs"], comm_d);

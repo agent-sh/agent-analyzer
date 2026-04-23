@@ -282,17 +282,14 @@ mod tests {
         }
         for (a, b, cochanges) in coupling {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-            data.coupling
-                .entry(lo.to_string())
-                .or_default()
-                .insert(
-                    hi.to_string(),
-                    CouplingEntry {
-                        cochanges,
-                        human_cochanges: cochanges,
-                        ai_cochanges: 0,
-                    },
-                );
+            data.coupling.entry(lo.to_string()).or_default().insert(
+                hi.to_string(),
+                CouplingEntry {
+                    cochanges,
+                    human_cochanges: cochanges,
+                    ai_cochanges: 0,
+                },
+            );
         }
         let g = cochange::build(&data).expect("graph builds");
         data.graph = Some(analyzer_core::types::GraphData {

@@ -401,11 +401,7 @@ fn run_init(path: &Path, _max_commits: Option<usize>) -> Result<()> {
     // Phase 5: Graph-derived analytics (co-change communities + centrality)
     eprintln!("[INFO] Building co-change graph...");
     analyzer_graph::finalize(&mut map);
-    if let Some(cg) = map
-        .graph
-        .as_ref()
-        .and_then(|g| g.cochange.as_ref())
-    {
+    if let Some(cg) = map.graph.as_ref().and_then(|g| g.cochange.as_ref()) {
         eprintln!(
             "[INFO] Discovered {} communities from {} edges",
             cg.communities.len(),
@@ -720,9 +716,7 @@ fn run_query(query: QueryAction) -> Result<()> {
             let result = analyzer_graph::queries::boundaries(&map, top);
             println!("{}", output::to_json(&result));
         }
-        QueryAction::AreaOf {
-            file, map_file, ..
-        } => {
+        QueryAction::AreaOf { file, map_file, .. } => {
             let map = load_map(&map_file)?;
             let result = analyzer_graph::queries::area_of(&map, &file);
             println!("{}", output::to_json(&result));
