@@ -148,7 +148,7 @@ fn compute_hotspot_set(map: &RepoIntelData) -> HashSet<String> {
         .iter()
         .map(|(path, activity)| (path, activity.changes))
         .collect();
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|f| std::cmp::Reverse(f.1));
 
     let top_10_pct = (files.len() as f64 * 0.1).ceil() as usize;
     files
@@ -313,6 +313,7 @@ mod tests {
             import_graph: None,
             project: None,
             doc_refs: None,
+            graph: None,
         }
     }
 }

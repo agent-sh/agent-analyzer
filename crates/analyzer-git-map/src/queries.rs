@@ -205,7 +205,7 @@ pub fn coupling(map: &RepoIntelData, file: &str, human_only: bool) -> Vec<Coupli
         }
     }
 
-    results.sort_by(|a, b| b.cochanges.cmp(&a.cochanges));
+    results.sort_by_key(|r| std::cmp::Reverse(r.cochanges));
     results
 }
 
@@ -281,7 +281,7 @@ pub fn ownership(map: &RepoIntelData, dir_or_file: &str) -> OwnershipResult {
         })
         .collect();
 
-    owners.sort_by(|a, b| b.commits.cmp(&a.commits));
+    owners.sort_by_key(|c| std::cmp::Reverse(c.commits));
 
     let primary = owners.first().map(|c| c.name.clone()).unwrap_or_default();
     let primary_pct = owners.first().map(|c| c.pct).unwrap_or(0.0);
@@ -612,7 +612,7 @@ fn areas_impl(map: &RepoIntelData, active_only: bool) -> Vec<AreaEntry> {
                 })
                 .collect();
 
-            owners.sort_by(|a, b| b.commits.cmp(&a.commits));
+            owners.sort_by_key(|c| std::cmp::Reverse(c.commits));
 
             // Health classification
             let primary_stale = owners.first().map(|o| o.stale).unwrap_or(true);
@@ -792,7 +792,7 @@ pub fn contributors(map: &RepoIntelData, _months: Option<u32>) -> Vec<Contributo
         })
         .collect();
 
-    entries.sort_by(|a, b| b.commits.cmp(&a.commits));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.commits));
     entries
 }
 
@@ -1002,7 +1002,7 @@ pub fn test_gaps(map: &RepoIntelData, min_changes: u64, limit: usize) -> Vec<Tes
         })
         .collect();
 
-    entries.sort_by(|a, b| b.changes.cmp(&a.changes));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.changes));
     entries.truncate(limit);
     entries
 }

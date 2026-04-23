@@ -34,6 +34,10 @@ pub struct RepoIntelData {
     // Phase 4: Doc-code cross-references (optional - populated when sync-check runs)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub doc_refs: Option<HashMap<String, DocRefEntry>>,
+
+    // Phase 5: Graph-derived analytics (optional - populated by analyzer-graph)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub graph: Option<GraphData>,
 }
 
 /// Git repository metadata.
@@ -406,6 +410,106 @@ pub fn extract_conventional_prefix(subject: &str) -> Option<String> {
     None
 }
 
+// ─── Phase 5: Graph-Derived Analytics ───────────────────────────
+
+/// Graph-derived analytics: communities, centrality, expertise.
+///
+/// Three sub-graphs share this container - each is independently optional so
+/// future analyzer phases can add one without breaking older readers:
+///   - `cochange` - file co-change graph + Louvain communities (Phase 5.1)
+///   - `import`   - directed import/call graph centrality (Phase 5.2)
+///   - `author`   - author-file bipartite authority (Phase 5.3)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphData {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cochange: Option<CochangeGraph>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub import: Option<ImportGraph>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub author: Option<AuthorGraph>,
+}
+
+/// Co-change graph: undirected weighted graph over files, plus discovered
+/// communities (Louvain) and betweenness centrality.
+///
+/// Edges are sparse - only file pairs above the configured Jaccard and
+/// raw-cochange thresholds appear.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CochangeGraph {
+    /// Edges with Jaccard weights (filtered).
+    pub edges: Vec<CochangeEdge>,
+    /// Discovered communities: community_id -> file paths.
+    pub communities: HashMap<u32, Vec<String>>,
+    /// Reverse lookup: file path -> community_id.
+    pub file_to_community: HashMap<String, u32>,
+    /// Betweenness centrality per file (boundary detection).
+    pub betweenness: HashMap<String, f64>,
+    /// Threshold parameters used to build this graph (recorded for reproducibility).
+    pub params: CochangeParams,
+}
+
+/// A weighted undirected edge in the co-change graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CochangeEdge {
+    pub a: String,
+    pub b: String,
+    pub jaccard: f64,
+    pub cochanges: u64,
+}
+
+/// Co-change graph build parameters.
+///
+/// Defaults are calibrated from co-change graph literature (Zimmermann et al.,
+/// Hassan & Holt) and hold across repos from ~50 commits to 100k+.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CochangeParams {
+    pub min_jaccard: f64,
+    pub min_cochanges: u64,
+    pub louvain_resolution: f64,
+    pub min_community_size: usize,
+}
+
+impl Default for CochangeParams {
+    fn default() -> Self {
+        Self {
+            min_jaccard: 0.05,
+            min_cochanges: 3,
+            louvain_resolution: 1.0,
+            min_community_size: 3,
+        }
+    }
+}
+
+/// Import/call graph centrality (Phase 5.2 - placeholder).
+///
+/// Populated by analyzer-graph from the existing `import_graph` field. Will
+/// hold PageRank, strongly-connected components, and reverse-reachability
+/// data once Phase 5.2 lands.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportGraph {
+    /// PageRank score per file (higher = more structurally central).
+    pub pagerank: HashMap<String, f64>,
+    /// Strongly-connected components of size > 1 (architectural cycles).
+    pub cycles: Vec<Vec<String>>,
+}
+
+/// Author-file authority graph (Phase 5.3 - placeholder).
+///
+/// Populated by analyzer-graph from the existing per-file `authors` lists +
+/// `FileActivity` change counts. Will hold HITS-style authority scores per
+/// (author, area) once Phase 5.3 lands.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorGraph {
+    /// Authority score: author -> community_id -> score.
+    pub authority: HashMap<String, HashMap<u32, f64>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +610,7 @@ mod tests {
             import_graph: None,
             project: None,
             doc_refs: None,
+            graph: None,
         };
 
         let json = serde_json::to_string(&data).unwrap();

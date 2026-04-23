@@ -121,7 +121,6 @@ where
 mod tests {
     use super::*;
     use crate::extractor::extract_file_symbols;
-    use crate::parser::parse_source;
 
     /// Get complexity of the first function in source via the extractor.
     fn complexity_of(source: &str, lang: Language) -> u32 {

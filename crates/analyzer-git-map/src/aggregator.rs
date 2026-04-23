@@ -55,6 +55,7 @@ pub fn create_empty_map() -> RepoIntelData {
         import_graph: None,
         project: None,
         doc_refs: None,
+        graph: None,
     }
 }
 

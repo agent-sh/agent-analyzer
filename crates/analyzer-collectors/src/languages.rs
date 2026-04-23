@@ -207,7 +207,7 @@ pub fn detect_languages(repo_path: &Path) -> Vec<LanguageInfo> {
         })
         .collect();
 
-    langs.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+    langs.sort_by_key(|l| std::cmp::Reverse(l.file_count));
     langs
 }
 
