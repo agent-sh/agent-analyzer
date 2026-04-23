@@ -308,6 +308,14 @@ pub enum QueryAction {
         #[arg(long)]
         map_file: PathBuf,
     },
+    /// List every place execution can start (binaries, main fns, npm scripts)
+    EntryPoints {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file (optional - enables AST main detection)
+        #[arg(long)]
+        map_file: Option<PathBuf>,
+    },
 }
 
 pub fn run(action: RepoIntelAction) -> Result<()> {
@@ -689,6 +697,17 @@ fn run_query(query: QueryAction) -> Result<()> {
                     println!("null");
                 }
             }
+        }
+        QueryAction::EntryPoints { path, map_file } => {
+            // The symbol index is optional - it adds AST-derived `main`
+            // functions to the manifest-derived results. Without it the
+            // query still returns Cargo/npm/pyproject entries.
+            let symbols = match map_file.as_ref() {
+                Some(mf) => load_map(mf)?.symbols,
+                None => None,
+            };
+            let result = analyzer_collectors::entry_points::detect(&path, symbols.as_ref());
+            println!("{}", output::to_json(&result));
         }
     }
     Ok(())

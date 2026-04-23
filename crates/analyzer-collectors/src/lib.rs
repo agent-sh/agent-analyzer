@@ -3,6 +3,7 @@
 //! Collects project metadata: README, CI config, license, languages.
 
 mod ci;
+pub mod entry_points;
 mod languages;
 mod license;
 mod readme;

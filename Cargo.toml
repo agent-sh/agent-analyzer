@@ -70,6 +70,9 @@ tree-sitter-java = "0.23"
 # Markdown parsing (Phase 4)
 pulldown-cmark = "0.12"
 
+# Manifest parsing (entry-points query)
+toml = "0.8"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

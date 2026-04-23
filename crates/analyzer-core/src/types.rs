@@ -261,6 +261,40 @@ pub struct LanguageInfo {
     pub percentage: f64,
 }
 
+/// One discovered entry point - a place where the program can start running.
+///
+/// Surfaces both manifest-declared entry points (`Cargo.toml [[bin]]`,
+/// `package.json bin`/`scripts`, `pyproject.toml [project.scripts]`) and
+/// AST-derived ones (`fn main`, `def main`, `func main()`,
+/// `if __name__ == "__main__":`). Lets agents and contributors find every
+/// place execution begins without a polyglot grep.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryPoint {
+    /// File path relative to the repo root.
+    pub path: String,
+    /// 1-based line of the definition, where applicable. `None` for
+    /// manifest-declared binaries whose target file may not exist yet.
+    pub line: Option<usize>,
+    /// What flavor of entry point this is.
+    pub kind: EntryPointKind,
+    /// Human-readable name (binary name, script name, function name, etc.).
+    pub name: String,
+}
+
+/// Categorization of an entry point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EntryPointKind {
+    /// A compiled binary declared in a manifest (`Cargo.toml [[bin]]`,
+    /// `package.json bin`, `pyproject.toml [project.scripts]`, etc.).
+    Binary,
+    /// A `main` function or `__main__` block detected via AST.
+    Main,
+    /// An npm/yarn/pnpm script entry from `package.json scripts`.
+    NpmScript,
+}
+
 // ─── Phase 4: Doc-Code Cross-Reference Types ────────────────────
 
 /// A documentation file's cross-references to code.
