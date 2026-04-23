@@ -91,7 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Query flags: `--min-changes`, `--path-filter`, `--adjust-for-ai`
 - 68 tests at launch
 
-[Unreleased]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/agent-sh/agent-analyzer/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.2.0...v0.3.0
