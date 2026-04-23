@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-23
+
+### Added
+
+- **`analyzer-graph` crate** (#14, #15) - new workspace member providing graph-derived analytics on top of existing `RepoIntelData`. Reads the already-collected `coupling` + `file_activity` data and produces a sparse undirected weighted file-file graph (Jaccard similarity over commit co-occurrence), runs Louvain modularity-maximisation community detection, and computes per-node betweenness centrality via Brandes' algorithm. All thresholds are calibrated from the co-change graph literature (Zimmermann et al., Hassan & Holt) and require no flags.
+- **4 new `repo-intel query` subcommands** (#14):
+  - `communities` - lists discovered communities sorted by size
+  - `boundaries [--top N]` - high-betweenness files (architectural seams between communities)
+  - `area-of <file>` - looks up which community a file belongs to
+  - `community-health <id>` - composite per-community roll-up (size, total/recent changes, bug-fix rate, AI ratio, stale-owner count)
+- **`RepoIntelData.graph: Option<GraphData>`** - new optional field with three reserved sub-graphs (`cochange`, `import`, `author`). `cochange` ships in this release; the other two have data slots reserved for future phases so older readers stay forward-compatible.
+- **Phase 5 finalize step** runs automatically after `init` and `update` once all collectors complete. Smoke tests on agnix (~9k surviving edges, 46 communities) finish in well under a second.
+
+### Changed
+
+- **Brandes' betweenness parallelised** via rayon `into_par_iter().fold().reduce()` over source nodes (#14). Each worker keeps its own `Scratch` (pre-allocated stack/predecessors/sigma/distance/delta/queue/bc) so the previous O(V²) per-call allocation pattern is gone. Output stays deterministic - addition is commutative.
+- **Louvain `State` rewritten to use `Vec<f64>` instead of `HashMap<u32, f64>`** for `comm_total` and `comm_internal` (#15). Community ids are bounded by `n` for the entire run, so dense-vector indexing is correct and saves the per-access hash. Per-node `weights_to` accumulator is now a single reused `Vec<f64>` with a `dirty_comms` index list, eliminating per-node HashMap allocation. Per-node self-loop weights pre-computed once in `State::new` instead of being re-summed inside the local-moves loop.
+
+### Fixed
+
+- **Self-loop bookkeeping in Louvain `State::new`** (#15) - `comm_internal` is now seeded with each node's self-loop weight rather than zero. Each node initially sits in its own singleton community, and the only edge that can be internal to a 1-node community is a self-loop on that node. Pre-fix the algorithm silently dropped self-loop contributions until the affected node first moved. (No observable effect on co-change graphs, which never have self-loops, but the algorithm is now correct in general.)
+- **Rust 1.95 clippy** (`unnecessary_sort_by`) in `analyzer-collectors`, `analyzer-sync-check`, `analyzer-git-map` - replaced descending `sort_by` patterns with `sort_by_key(... Reverse)`. Local toolchain (1.92) didn't flag these but CI's stricter 1.95 did.
+- **`petgraph` dependency** moved from per-crate spec to `[workspace.dependencies]` to match the convention used for serde, rayon, chrono.
+- **Pre-existing unused import** (`parse_source` in `analyzer-repo-map/complexity.rs`) that was already breaking `cargo clippy --workspace --all-targets -- -D warnings` on main.
+
 ## [0.3.2] - 2026-03-22
 
 ### Added
@@ -66,7 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Query flags: `--min-changes`, `--path-filter`, `--adjust-for-ai`
 - 68 tests at launch
 
-[Unreleased]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/agent-sh/agent-analyzer/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.2.0...v0.3.0
