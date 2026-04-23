@@ -133,7 +133,12 @@ impl State {
 
         let node_to_comm: Vec<u32> = (0..n as u32).collect();
         let comm_total: Vec<f64> = degree.clone();
-        let comm_internal: Vec<f64> = vec![0.0; n];
+        // Each node is initially in its own singleton community. The internal
+        // edge weight of a singleton community is the node's self-loop
+        // weight (a self-loop is the only edge that can stay inside a
+        // 1-node community). Initialising to zeros instead would silently
+        // drop self-loop contributions until the node first moves.
+        let comm_internal: Vec<f64> = self_loop.clone();
 
         Self {
             node_to_comm,
@@ -412,5 +417,66 @@ mod tests {
         let unique: std::collections::HashSet<_> = p.values().collect();
         assert_eq!(unique.len() as u32, max_id + 1);
         assert!(p.values().any(|&c| c == 0));
+    }
+
+    /// Regression: `comm_internal` was previously initialised to all zeros,
+    /// which silently dropped the contribution of pre-existing self-loops
+    /// until the affected node first moved. With the fix it is initialised
+    /// to per-node self-loop weight, matching the standard Louvain bookkeeping
+    /// for singleton communities.
+    #[test]
+    fn self_loop_contributes_to_initial_internal_weight() {
+        // Two isolated triangles plus a self-loop of weight 2.5 on node 0.
+        let mut g = Graph::new_undirected();
+        let nodes: Vec<NodeIndex> = (0..6).map(|_| g.add_node(())).collect();
+        g.add_edge(nodes[0], nodes[0], 2.5); // self-loop
+        g.add_edge(nodes[0], nodes[1], 1.0);
+        g.add_edge(nodes[1], nodes[2], 1.0);
+        g.add_edge(nodes[2], nodes[0], 1.0);
+        g.add_edge(nodes[3], nodes[4], 1.0);
+        g.add_edge(nodes[4], nodes[5], 1.0);
+        g.add_edge(nodes[5], nodes[3], 1.0);
+
+        let state = State::new(&g);
+        // Direct structural check: the singleton community of node 0 has
+        // an internal edge (the self-loop) of weight 2.5. Other singletons
+        // have no self-loops so their internal weight is 0.
+        assert_eq!(state.self_loop[0], 2.5);
+        assert_eq!(state.comm_internal[0], 2.5);
+        for i in 1..6 {
+            assert_eq!(state.comm_internal[i], 0.0);
+        }
+
+        // Cross-check via modularity: with the fix, Q must equal what we
+        // get if we manually substitute the per-community values into the
+        // standard formula. Pre-fix it would be lower by exactly
+        // self_loop[0] / total_weight.
+        let q = state.modularity(1.0);
+        let expected_q = expected_modularity(&state, 1.0);
+        assert!(
+            (q - expected_q).abs() < 1e-9,
+            "Q mismatch: got {q}, expected {expected_q}"
+        );
+    }
+
+    /// Reference modularity calculator following the Newman convention,
+    /// kept independent from `State::modularity` so the test verifies the
+    /// formula rather than just echoing the implementation back.
+    fn expected_modularity(s: &State, gamma: f64) -> f64 {
+        let m = s.total_weight;
+        if m <= 0.0 {
+            return 0.0;
+        }
+        let two_m = 2.0 * m;
+        (0..s.comm_total.len())
+            .map(|c| {
+                let a = s.comm_total[c];
+                if a == 0.0 {
+                    0.0
+                } else {
+                    s.comm_internal[c] / m - gamma * (a / two_m).powi(2)
+                }
+            })
+            .sum()
     }
 }
