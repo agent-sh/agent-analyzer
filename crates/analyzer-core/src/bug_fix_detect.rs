@@ -105,38 +105,46 @@ fn has_issue_closure(lower_subject: &str) -> bool {
 }
 
 fn followed_by_issue_ref(rest: &str) -> bool {
-    // Allow optional `:` and whitespace, then either `#NNN`, `gh-NNN`, or
-    // `<owner>/<repo>#NNN`. We only need a quick check, not a full parser.
+    // Allow optional `:` and whitespace, then either `#NNN`, `gh-NNN`,
+    // or `<owner>/<repo>#NNN` (where owner/repo may contain dots,
+    // dashes, and underscores - GitHub's repo-name rules). We only
+    // need a quick check, not a full parser.
+    //
+    // Note: `rest` is already lowercased by the caller, so we only
+    // need to look for the lowercase `gh-` form.
     let trimmed = rest.trim_start_matches([':', ' ', '\t']);
     let bytes = trimmed.as_bytes();
 
-    // Skip an optional `<word>/<word>` prefix (cross-repo references).
-    let mut idx = 0;
-    while idx < bytes.len()
-        && (bytes[idx].is_ascii_alphanumeric()
-            || bytes[idx] == b'-'
-            || bytes[idx] == b'_'
-            || bytes[idx] == b'/')
-    {
-        idx += 1;
-    }
-    let after_org = if idx > 0 && idx < bytes.len() && bytes[idx - 1] == b'/' {
-        &trimmed[idx..]
-    } else {
-        trimmed
-    };
-    let bytes = after_org.as_bytes();
-
+    // Direct forms: `#123`, `gh-123`.
     if bytes.starts_with(b"#") && bytes.len() > 1 && bytes[1].is_ascii_digit() {
         return true;
     }
-    if (bytes.starts_with(b"gh-") || bytes.starts_with(b"GH-"))
-        && bytes.len() > 3
-        && bytes[3].is_ascii_digit()
-    {
+    if bytes.starts_with(b"gh-") && bytes.len() > 3 && bytes[3].is_ascii_digit() {
         return true;
     }
-    false
+
+    // Cross-repo form: scan up to the first `#` and check that what
+    // came before looked like `<owner>/<repo>` (with at least one `/`,
+    // and only repo-name-legal characters).
+    let Some(hash_pos) = trimmed.find('#') else {
+        return false;
+    };
+    let prefix = &trimmed[..hash_pos];
+    let after = &trimmed[hash_pos..];
+    if !after.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some(slash_pos) = prefix.find('/') else {
+        return false;
+    };
+    let owner = &prefix[..slash_pos];
+    let repo = &prefix[slash_pos + 1..];
+    let valid_segment = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    valid_segment(owner) && valid_segment(repo)
 }
 
 fn find_word(haystack: &str, needle: &str) -> bool {
@@ -220,6 +228,30 @@ mod tests {
         assert!(is_bug_fix("Resolves GH-7"));
         assert!(is_bug_fix("Fix: resolves agent-sh/agnix#900"));
         assert!(is_bug_fix("close #1"));
+    }
+
+    #[test]
+    fn cross_repo_issue_refs_hit() {
+        // Subjects without any fix-related keyword should still register
+        // when they close a cross-repo issue. These exercise the
+        // `<owner>/<repo>#NNN` branch of has_issue_closure.
+        assert!(is_bug_fix("Closes agent-sh/agnix#900"));
+        assert!(is_bug_fix("Resolves rust-lang/rust#12345"));
+        // Repo names may contain dots (e.g. github.com style).
+        assert!(is_bug_fix("Closes my-org/my.repo.name#1"));
+        // And underscores.
+        assert!(is_bug_fix("Fixes some_org/some_repo#42"));
+    }
+
+    #[test]
+    fn malformed_cross_repo_refs_do_not_hit() {
+        // `#` not followed by a digit - should not register.
+        assert!(!is_bug_fix("Closes agent-sh/agnix#notanumber"));
+        // No slash before `#` - that's a single-repo ref, must follow a
+        // closure verb directly without an org prefix to count.
+        assert!(!is_bug_fix("Closes weird-thing#1"));
+        // Empty before `#`.
+        assert!(!is_bug_fix("Closes /#1"));
     }
 
     #[test]

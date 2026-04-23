@@ -383,6 +383,9 @@ mod tests {
             make_commit("alice", "Fix race condition in worker pool", file()),
             make_commit("alice", "Resolves #42", file()),
             make_commit("alice", "hotfix for prod outage", file()),
+            // Cross-repo issue closure with no fix-related keyword in
+            // the subject - exercises the <owner>/<repo>#NNN branch.
+            make_commit("alice", "Closes agent-sh/agnix#900", file()),
             make_commit("alice", "feat: add login flow", file()),
             make_commit("alice", "Add prefix support to parser", file()),
         ]);
@@ -391,8 +394,8 @@ mod tests {
 
         let activity = &map.file_activity["src/lib.rs"];
         assert_eq!(
-            activity.bug_fix_changes, 4,
-            "expected 4 bug-fix commits (conventional + race + resolves + hotfix)"
+            activity.bug_fix_changes, 5,
+            "expected 5 bug-fix commits (conventional + race + resolves + hotfix + cross-repo)"
         );
     }
 
