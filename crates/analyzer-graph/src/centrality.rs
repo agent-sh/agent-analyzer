@@ -17,64 +17,123 @@ use std::collections::VecDeque;
 
 use petgraph::Undirected;
 use petgraph::graph::{Graph, NodeIndex};
+use rayon::prelude::*;
+
+/// Per-thread scratch space reused across single-source passes within one
+/// rayon worker. Pre-allocating once and clearing between passes avoids
+/// the O(V²) allocations the naive Brandes formulation would do.
+struct Scratch {
+    stack: Vec<usize>,
+    predecessors: Vec<Vec<usize>>,
+    sigma: Vec<f64>,
+    distance: Vec<i64>,
+    delta: Vec<f64>,
+    queue: VecDeque<usize>,
+    bc: Vec<f64>,
+}
+
+impl Scratch {
+    fn new(n: usize) -> Self {
+        Self {
+            stack: Vec::with_capacity(n),
+            predecessors: vec![Vec::new(); n],
+            sigma: vec![0.0; n],
+            distance: vec![-1; n],
+            delta: vec![0.0; n],
+            queue: VecDeque::with_capacity(n),
+            bc: vec![0.0; n],
+        }
+    }
+
+    /// Reset only the per-source state - `bc` accumulates across sources.
+    fn reset_for_source(&mut self) {
+        self.stack.clear();
+        for p in self.predecessors.iter_mut() {
+            p.clear();
+        }
+        self.sigma.fill(0.0);
+        self.distance.fill(-1);
+        self.delta.fill(0.0);
+        self.queue.clear();
+    }
+}
 
 /// Returns a vector indexed by `NodeIndex` with the unnormalised betweenness
 /// score of each node. Endpoints are not included in the count (standard
 /// Brandes accumulation).
+///
+/// Parallelised across source nodes via rayon. Each worker keeps its own
+/// scratch space and partial BC accumulator; partials are summed at the end.
+/// Output is deterministic - rayon `into_par_iter().fold().reduce()` does
+/// not depend on completion order because addition is commutative for the
+/// scores we produce.
 pub fn betweenness(graph: &Graph<(), f64, Undirected>) -> Vec<f64> {
     let n = graph.node_count();
-    let mut bc = vec![0.0f64; n];
     if n < 3 {
-        return bc;
+        return vec![0.0; n];
     }
 
-    for src in 0..n {
-        // Brandes' single-source pass.
-        let mut stack: Vec<usize> = Vec::with_capacity(n);
-        let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut sigma = vec![0.0f64; n];
-        let mut distance = vec![-1i64; n];
-
-        sigma[src] = 1.0;
-        distance[src] = 0;
-
-        let mut queue: VecDeque<usize> = VecDeque::new();
-        queue.push_back(src);
-
-        while let Some(v) = queue.pop_front() {
-            stack.push(v);
-            let v_node: NodeIndex = NodeIndex::new(v);
-            for neighbour in graph.neighbors(v_node) {
-                let w = neighbour.index();
-                if distance[w] < 0 {
-                    distance[w] = distance[v] + 1;
-                    queue.push_back(w);
+    let bc = (0..n)
+        .into_par_iter()
+        .fold(
+            || Scratch::new(n),
+            |mut s, src| {
+                s.reset_for_source();
+                single_source_pass(graph, src, &mut s);
+                s
+            },
+        )
+        .map(|s| s.bc)
+        .reduce(
+            || vec![0.0; n],
+            |mut acc, partial| {
+                for (a, p) in acc.iter_mut().zip(partial.iter()) {
+                    *a += *p;
                 }
-                if distance[w] == distance[v] + 1 {
-                    sigma[w] += sigma[v];
-                    predecessors[w].push(v);
-                }
-            }
-        }
-
-        // Accumulation in reverse BFS order.
-        let mut delta = vec![0.0f64; n];
-        while let Some(w) = stack.pop() {
-            for &v in &predecessors[w] {
-                delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
-            }
-            if w != src {
-                bc[w] += delta[w];
-            }
-        }
-    }
+                acc
+            },
+        );
 
     // Undirected: each pair (s, t) is counted twice across the two passes.
-    for v in bc.iter_mut() {
-        *v /= 2.0;
+    bc.into_iter().map(|v| v / 2.0).collect()
+}
+
+/// One Brandes single-source pass: BFS for shortest-path counts, then
+/// reverse-order accumulation of pair-dependencies.
+fn single_source_pass(graph: &Graph<(), f64, Undirected>, src: usize, s: &mut Scratch) {
+    s.sigma[src] = 1.0;
+    s.distance[src] = 0;
+    s.queue.push_back(src);
+
+    while let Some(v) = s.queue.pop_front() {
+        s.stack.push(v);
+        let v_node: NodeIndex = NodeIndex::new(v);
+        for neighbour in graph.neighbors(v_node) {
+            let w = neighbour.index();
+            if s.distance[w] < 0 {
+                s.distance[w] = s.distance[v] + 1;
+                s.queue.push_back(w);
+            }
+            if s.distance[w] == s.distance[v] + 1 {
+                s.sigma[w] += s.sigma[v];
+                s.predecessors[w].push(v);
+            }
+        }
     }
 
-    bc
+    while let Some(w) = s.stack.pop() {
+        // Snapshot read once - the mutable borrow on s.delta below would
+        // otherwise conflict with the immutable read of s.predecessors[w].
+        let preds_len = s.predecessors[w].len();
+        for i in 0..preds_len {
+            let v = s.predecessors[w][i];
+            let contribution = (s.sigma[v] / s.sigma[w]) * (1.0 + s.delta[w]);
+            s.delta[v] += contribution;
+        }
+        if w != src {
+            s.bc[w] += s.delta[w];
+        }
+    }
 }
 
 #[cfg(test)]

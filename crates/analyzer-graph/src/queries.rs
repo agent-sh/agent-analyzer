@@ -162,8 +162,9 @@ pub fn community_health(map: &RepoIntelData, id: u32) -> Option<CommunityHealth>
         0.0
     };
 
-    let mut sorted_files = files.clone();
-    sorted_files.sort();
+    // `files` is already sorted at construction time (cochange::build sorts
+    // each community's file list before returning), so just clone.
+    let sorted_files = files.clone();
 
     Some(CommunityHealth {
         id,

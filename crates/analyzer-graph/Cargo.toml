@@ -17,7 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
-petgraph = "0.6"
+petgraph.workspace = true
 rayon.workspace = true
 
 [dev-dependencies]
