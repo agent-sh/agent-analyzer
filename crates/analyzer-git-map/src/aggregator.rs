@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use analyzer_core::bot_detect::is_bot;
+use analyzer_core::bug_fix_detect::is_bug_fix;
 use analyzer_core::types::{
     CommitDelta, Contributors, ConventionInfo, FileActivity, GitInfo, Releases, RepoIntelData,
     extract_conventional_prefix,
@@ -149,7 +150,7 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
                 entry.authors.push(commit.author_name.clone());
             }
 
-            if prefix.as_deref() == Some("fix") {
+            if is_bug_fix(&commit.subject) {
                 entry.bug_fix_changes += 1;
                 if commit.date > entry.last_bug_fix {
                     entry.last_bug_fix.clone_from(&commit.date);
@@ -361,6 +362,41 @@ mod tests {
 
         assert_eq!(map.conventions.prefixes["feat"], 2);
         assert_eq!(map.conventions.prefixes["fix"], 1);
+    }
+
+    #[test]
+    fn test_merge_delta_bug_fix_counts_freeform_subjects() {
+        // Verifies the broader bug-fix detection: subjects without a `fix:`
+        // prefix still count as bug fixes when they use fix-related keywords
+        // or issue-closure phrases. The pre-broadening aggregator would have
+        // counted only the explicit `fix:` commit here.
+        let mut map = create_empty_map();
+        let file = || {
+            vec![FileChange {
+                path: "src/lib.rs".to_string(),
+                additions: 1,
+                deletions: 1,
+            }]
+        };
+        let delta = make_delta(vec![
+            make_commit("alice", "fix: explicit conventional fix", file()),
+            make_commit("alice", "Fix race condition in worker pool", file()),
+            make_commit("alice", "Resolves #42", file()),
+            make_commit("alice", "hotfix for prod outage", file()),
+            // Cross-repo issue closure with no fix-related keyword in
+            // the subject - exercises the <owner>/<repo>#NNN branch.
+            make_commit("alice", "Closes agent-sh/agnix#900", file()),
+            make_commit("alice", "feat: add login flow", file()),
+            make_commit("alice", "Add prefix support to parser", file()),
+        ]);
+
+        merge_delta(&mut map, &delta);
+
+        let activity = &map.file_activity["src/lib.rs"];
+        assert_eq!(
+            activity.bug_fix_changes, 5,
+            "expected 5 bug-fix commits (conventional + race + resolves + hotfix + cross-repo)"
+        );
     }
 
     #[test]
