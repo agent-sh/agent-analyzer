@@ -265,9 +265,13 @@ pub struct LanguageInfo {
 ///
 /// Surfaces both manifest-declared entry points (`Cargo.toml [[bin]]`,
 /// `package.json bin`/`scripts`, `pyproject.toml [project.scripts]`) and
-/// AST-derived ones (`fn main`, `def main`, `func main()`,
-/// `if __name__ == "__main__":`). Lets agents and contributors find every
-/// place execution begins without a polyglot grep.
+/// AST-derived `main`-named function definitions (`fn main`, `def main`,
+/// `func main()`, `function main()`). Lets agents and contributors find
+/// every place execution begins without a polyglot grep.
+///
+/// Python `if __name__ == "__main__":` blocks are *not* yet detected;
+/// they're top-level `If` statements rather than definitions, so the
+/// existing symbol index doesn't surface them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EntryPoint {

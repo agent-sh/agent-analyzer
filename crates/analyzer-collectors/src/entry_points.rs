@@ -14,9 +14,15 @@
 //! - pyproject.toml `[project.scripts]`
 //! - `main`-named function definitions from the AST symbol index
 //!
-//! Framework-registration patterns (clap subcommands, axum/actix routes,
-//! express/FastAPI routes, queue consumer registrations) are out of scope
-//! for v1 and tracked as a follow-up.
+//! # Out of scope (v1)
+//!
+//! - Framework-registration patterns (clap subcommands, axum/actix
+//!   routes, express/FastAPI routes, queue consumer registrations)
+//! - Python `if __name__ == "__main__":` blocks - these are top-level
+//!   `If` statements, not function definitions, and the symbol index
+//!   only tracks definitions today
+//! - Cargo's auto-discovered `src/bin/*.rs` files that have no matching
+//!   `[[bin]]` declaration (only declared bins are surfaced)
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -90,16 +96,7 @@ fn detect_cargo_bins(repo_path: &Path, out: &mut Vec<EntryPoint>) {
         .and_then(|m| m.as_array())
     {
         for member in members.iter().filter_map(|m| m.as_str()) {
-            let pattern = repo_path.join(member);
-            let pattern_str = pattern.to_string_lossy();
-            // glob() handles both concrete paths and `crates/*` style.
-            let Ok(paths) = glob::glob(&pattern_str) else {
-                continue;
-            };
-            for entry in paths.flatten() {
-                if !entry.is_dir() {
-                    continue;
-                }
+            for entry in expand_workspace_member(repo_path, member) {
                 let member_manifest = entry.join("Cargo.toml");
                 let Ok(text) = std::fs::read_to_string(&member_manifest) else {
                     continue;
@@ -111,6 +108,56 @@ fn detect_cargo_bins(repo_path: &Path, out: &mut Vec<EntryPoint>) {
             }
         }
     }
+}
+
+/// Resolve a `[workspace].members` entry to concrete directories.
+///
+/// Supports two forms covering ~all real Cargo workspaces:
+/// 1. concrete relative path (`crates/analyzer-cli`)
+/// 2. single-level glob with one trailing `*` segment (`crates/*`)
+///
+/// Avoids the `glob` crate entirely so we don't have to wrestle with
+/// Windows path separators or escape repo paths that themselves contain
+/// glob metacharacters (a reviewer-caught hazard).
+fn expand_workspace_member(repo_path: &Path, member: &str) -> Vec<std::path::PathBuf> {
+    if !member.contains('*') {
+        let candidate = repo_path.join(member);
+        return if candidate.is_dir() {
+            vec![candidate]
+        } else {
+            Vec::new()
+        };
+    }
+
+    // Single-trailing-`*` pattern (the Cargo idiom): split on the last
+    // `/` before the `*`, treat the prefix as a literal directory, and
+    // list its children. Anything more exotic (`*foo`, `crates/*/sub`)
+    // is treated as unsupported and yields nothing - real workspaces
+    // don't do this.
+    let trimmed = member.trim_end_matches('/');
+    let Some((prefix, last)) = trimmed.rsplit_once('/') else {
+        // member is like `*` at the workspace root - list repo_path's
+        // direct subdirectories.
+        if trimmed == "*" {
+            return list_subdirs(repo_path);
+        }
+        return Vec::new();
+    };
+    if last != "*" {
+        return Vec::new();
+    }
+    let parent = repo_path.join(prefix);
+    list_subdirs(&parent)
+}
+
+fn list_subdirs(parent: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(rd) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    rd.filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect()
 }
 
 /// Surface binaries declared in one Cargo manifest. `member_dir` is the
@@ -144,11 +191,27 @@ fn process_cargo_manifest(
                 .get("name")
                 .and_then(|n| n.as_str())
                 .map(|s| s.to_string());
+            // Cargo defaults for [[bin]] without an explicit `path`:
+            // either `src/bin/<name>.rs` or `src/bin/<name>/main.rs`.
+            // Probe both and prefer whichever exists; fall back to the
+            // flat form when neither does so the entry still surfaces.
             let path = bin
                 .get("path")
                 .and_then(|p| p.as_str())
                 .map(|s| s.to_string())
-                .or_else(|| name.as_ref().map(|n| format!("src/bin/{n}.rs")));
+                .or_else(|| {
+                    name.as_ref().map(|n| {
+                        let flat = format!("src/bin/{n}.rs");
+                        let nested = format!("src/bin/{n}/main.rs");
+                        if member_dir.join(&flat).exists() {
+                            flat
+                        } else if member_dir.join(&nested).exists() {
+                            nested
+                        } else {
+                            flat
+                        }
+                    })
+                });
             if let (Some(name), Some(path)) = (name, path) {
                 let rel = to_repo_path(&path);
                 explicit_targets.push(rel.clone());
@@ -270,6 +333,10 @@ fn detect_pyproject(repo_path: &Path, out: &mut Vec<EntryPoint>) {
 /// Surface every `main`-named function definition from the AST symbol
 /// index. Covers `fn main` (Rust), `def main` (Python), `func main()`
 /// (Go), and `function main()` (JS/TS).
+///
+/// Does NOT detect Python `if __name__ == "__main__":` guards - those
+/// are top-level `If` statements rather than function definitions, and
+/// the symbol index only tracks definitions today.
 fn detect_main_symbols(symbols: &HashMap<String, FileSymbols>, out: &mut Vec<EntryPoint>) {
     for (path, file_syms) in symbols {
         for def in &file_syms.definitions {
@@ -351,6 +418,78 @@ version = "0.1.0"
             .find(|e| e.path == "src/main.rs" && e.kind == EntryPointKind::Binary)
             .expect("implicit main binary should appear");
         assert_eq!(main_bin.name, "demo", "implicit binary uses package name");
+    }
+
+    #[test]
+    fn cargo_implicit_bin_resolves_nested_main() {
+        // Cargo also auto-resolves a [[bin]] without explicit path to
+        // `src/bin/<name>/main.rs` when that file exists. The detector
+        // should pick the nested form when only it exists.
+        let dir = make_repo();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "demo"
+version = "0.1.0"
+
+[[bin]]
+name = "nested"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src/bin/nested")).unwrap();
+        fs::write(dir.path().join("src/bin/nested/main.rs"), "fn main() {}").unwrap();
+
+        let eps = detect(dir.path(), None);
+        let nested = eps
+            .iter()
+            .find(|e| e.name == "nested")
+            .expect("nested-form bin should appear");
+        assert_eq!(nested.path, "src/bin/nested/main.rs");
+    }
+
+    #[test]
+    fn workspace_member_glob_handles_glob_metachars_in_repo_path() {
+        // Reviewer-caught: a repo path containing glob metacharacters
+        // (e.g. `[ci]` or `repo*`) would previously confuse glob::glob
+        // when joined with the workspace member pattern. The detector
+        // must escape the prefix so only the member portion is treated
+        // as a pattern.
+        let parent = TempDir::new().unwrap();
+        let weird_dir = parent.path().join("repo[ci]");
+        fs::create_dir_all(&weird_dir).unwrap();
+        fs::write(
+            weird_dir.join("Cargo.toml"),
+            r#"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(weird_dir.join("crates/cli/src")).unwrap();
+        fs::write(
+            weird_dir.join("crates/cli/Cargo.toml"),
+            r#"
+[package]
+name = "cli"
+version = "0.1.0"
+
+[[bin]]
+name = "tool"
+path = "src/main.rs"
+"#,
+        )
+        .unwrap();
+        fs::write(weird_dir.join("crates/cli/src/main.rs"), "fn main() {}").unwrap();
+
+        let eps = detect(&weird_dir, None);
+        let tool = eps
+            .iter()
+            .find(|e| e.name == "tool")
+            .expect("workspace bin must be found even when repo path contains [ci]");
+        assert_eq!(tool.path, "crates/cli/src/main.rs");
     }
 
     #[test]
