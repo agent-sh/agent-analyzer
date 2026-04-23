@@ -933,10 +933,20 @@ pub fn diff_risk(map: &RepoIntelData, files: &[String]) -> Vec<DiffRiskEntry> {
                 } else {
                     0.0
                 };
-                let single_author = if activity.authors.len() <= 1 {
+                // Count only human authors. `activity.authors` is the
+                // raw list of every commit author, which includes bots
+                // like dependabot[bot]. A file touched by alice and
+                // dependabot has effectively one human owner, not two,
+                // so the bot must not dilute the single-author signal.
+                let human_author_count = activity
+                    .authors
+                    .iter()
+                    .filter(|a| !map.contributors.bots.contains_key(a.as_str()))
+                    .count();
+                let single_author = if human_author_count <= 1 {
                     1.0
                 } else {
-                    1.0 / activity.authors.len() as f64
+                    1.0 / human_author_count as f64
                 };
                 let churn = activity.additions + activity.deletions;
 
@@ -947,7 +957,7 @@ pub fn diff_risk(map: &RepoIntelData, files: &[String]) -> Vec<DiffRiskEntry> {
                     risk_score,
                     bug_fix_rate,
                     churn,
-                    author_count: activity.authors.len(),
+                    author_count: human_author_count,
                     known: true,
                 }
             } else {
@@ -2239,6 +2249,51 @@ mod tests {
         assert!(risks[0].author_count == 1);
         // single_author contributes 0.3 to risk
         assert!(risks[0].risk_score >= 0.3);
+    }
+
+    #[test]
+    fn test_diff_risk_excludes_bots_from_author_count() {
+        // Reviewer-caught: a file touched by alice + dependabot[bot]
+        // has effectively one human owner. The previous code counted
+        // bots, halving single_author and lowering the risk score for
+        // files that should actually look bus-factor-fragile.
+        let mut map = create_empty_map();
+        map.contributors.bots.insert(
+            "dependabot[bot]".to_string(),
+            analyzer_core::types::BotContributor {
+                commits: 50,
+                recent_commits: 5,
+                first_seen: "2026-01-01T00:00:00Z".to_string(),
+                last_seen: "2026-04-01T00:00:00Z".to_string(),
+            },
+        );
+        map.file_activity.insert(
+            "src/lib.rs".to_string(),
+            FileActivity {
+                changes: 10,
+                recent_changes: 0,
+                authors: vec!["alice".to_string(), "dependabot[bot]".to_string()],
+                created: "2026-01-01T00:00:00Z".to_string(),
+                last_changed: "2026-03-01T00:00:00Z".to_string(),
+                additions: 100,
+                deletions: 50,
+                bug_fix_changes: 0,
+                refactor_changes: 0,
+                last_bug_fix: String::new(),
+            },
+        );
+
+        let risks = diff_risk(&map, &["src/lib.rs".to_string()]);
+        assert_eq!(
+            risks[0].author_count, 1,
+            "dependabot must not count toward author_count"
+        );
+        // single_author = 1.0 (one human), so risk gets the full 0.4
+        // bonus from that term.
+        assert!(
+            risks[0].risk_score >= 0.4,
+            "single human owner should yield single_author=1.0"
+        );
     }
 
     #[test]
