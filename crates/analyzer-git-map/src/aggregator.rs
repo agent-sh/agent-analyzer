@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 
 use analyzer_core::bot_detect::is_bot;
 use analyzer_core::bug_fix_detect::is_bug_fix;
+use analyzer_core::generated_detect::is_generated_path;
 use analyzer_core::types::{
     CommitDelta, Contributors, ConventionInfo, FileActivity, GitInfo, Releases, RepoIntelData,
     extract_conventional_prefix,
@@ -134,7 +135,16 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
                     bug_fix_changes: 0,
                     refactor_changes: 0,
                     last_bug_fix: String::new(),
+                    generated: false,
                 });
+
+            // Refresh `generated` on every visit, not just on insert.
+            // When merge_delta runs against a map deserialized from
+            // before this field existed, #[serde(default)] sets it to
+            // false; without this re-classification, pre-existing
+            // entries would never get marked and bug-fix attribution
+            // would silently leak through to generated files.
+            entry.generated = is_generated_path(&file.path);
 
             entry.changes += 1;
             if commit.date < entry.created {
@@ -150,7 +160,13 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
                 entry.authors.push(commit.author_name.clone());
             }
 
-            if is_bug_fix(&commit.subject) {
+            // Bug-fix attribution is suppressed for generated files: a
+            // "fix(schema): ..." commit touches both the .proto source
+            // and its mechanically-derived .pb.go bindings, but only the
+            // source is actually being fixed. Counting the bindings as
+            // bug-fix activity floats them up bugspots/painspots queries
+            // and drowns out actually-broken code.
+            if !entry.generated && is_bug_fix(&commit.subject) {
                 entry.bug_fix_changes += 1;
                 if commit.date > entry.last_bug_fix {
                     entry.last_bug_fix.clone_from(&commit.date);
@@ -396,6 +412,101 @@ mod tests {
         assert_eq!(
             activity.bug_fix_changes, 5,
             "expected 5 bug-fix commits (conventional + race + resolves + hotfix + cross-repo)"
+        );
+    }
+
+    #[test]
+    fn test_merge_delta_suppresses_bugfix_attribution_for_generated_files() {
+        // A "fix(schema): ..." commit touches both the source (.proto)
+        // and the generated bindings (.pb.go). Only the source should
+        // be credited with a bug fix; the bindings are mechanical.
+        let mut map = create_empty_map();
+        let delta = make_delta(vec![make_commit(
+            "alice",
+            "fix(schema): correct field type",
+            vec![
+                FileChange {
+                    path: "api/user.proto".to_string(),
+                    additions: 1,
+                    deletions: 1,
+                },
+                FileChange {
+                    path: "api/user.pb.go".to_string(),
+                    additions: 50,
+                    deletions: 50,
+                },
+                FileChange {
+                    path: "src/generated/user_types.rs".to_string(),
+                    additions: 20,
+                    deletions: 20,
+                },
+            ],
+        )]);
+
+        merge_delta(&mut map, &delta);
+
+        // Source file: counted as bug fix, marked human-authored.
+        let proto = &map.file_activity["api/user.proto"];
+        assert_eq!(proto.bug_fix_changes, 1);
+        assert!(!proto.generated);
+
+        // Generated bindings: not counted, marked generated.
+        let pb_go = &map.file_activity["api/user.pb.go"];
+        assert_eq!(pb_go.bug_fix_changes, 0);
+        assert!(pb_go.generated);
+
+        // Codegen output dir: same.
+        let gen_rs = &map.file_activity["src/generated/user_types.rs"];
+        assert_eq!(gen_rs.bug_fix_changes, 0);
+        assert!(gen_rs.generated);
+    }
+
+    #[test]
+    fn test_merge_delta_refreshes_generated_flag_on_existing_entries() {
+        // Reviewer-caught bug: when merge_delta runs against a map that
+        // was deserialized from before the `generated` field existed,
+        // pre-existing entries have generated=false (from
+        // #[serde(default)]). Without refreshing on every visit, the
+        // flag would stay false forever and bug-fix attribution would
+        // silently leak through. This simulates that incremental update
+        // by pre-seeding an entry with generated=false.
+        let mut map = create_empty_map();
+        map.file_activity.insert(
+            "api/user.pb.go".to_string(),
+            FileActivity {
+                changes: 5,
+                recent_changes: 0,
+                authors: vec!["alice".to_string()],
+                created: "2026-01-01T00:00:00Z".to_string(),
+                last_changed: "2026-01-01T00:00:00Z".to_string(),
+                additions: 100,
+                deletions: 50,
+                bug_fix_changes: 0,
+                refactor_changes: 0,
+                last_bug_fix: String::new(),
+                generated: false,
+            },
+        );
+
+        let delta = make_delta(vec![make_commit(
+            "alice",
+            "fix(schema): correct field type",
+            vec![FileChange {
+                path: "api/user.pb.go".to_string(),
+                additions: 10,
+                deletions: 5,
+            }],
+        )]);
+        merge_delta(&mut map, &delta);
+
+        let pb_go = &map.file_activity["api/user.pb.go"];
+        assert!(
+            pb_go.generated,
+            "generated flag must be refreshed on existing entries"
+        );
+        assert_eq!(
+            pb_go.bug_fix_changes, 0,
+            "bug-fix attribution must be suppressed once flag refreshes"
         );
     }
 
