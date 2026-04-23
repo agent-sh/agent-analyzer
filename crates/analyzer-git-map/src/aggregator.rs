@@ -135,8 +135,16 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
                     bug_fix_changes: 0,
                     refactor_changes: 0,
                     last_bug_fix: String::new(),
-                    generated: is_generated_path(&file.path),
+                    generated: false,
                 });
+
+            // Refresh `generated` on every visit, not just on insert.
+            // When merge_delta runs against a map deserialized from
+            // before this field existed, #[serde(default)] sets it to
+            // false; without this re-classification, pre-existing
+            // entries would never get marked and bug-fix attribution
+            // would silently leak through to generated files.
+            entry.generated = is_generated_path(&file.path);
 
             entry.changes += 1;
             if commit.date < entry.created {
@@ -373,7 +381,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn test_merge_delta_bug_fix_counts_freeform_subjects() {
         // Verifies the broader bug-fix detection: subjects without a `fix:`
         // prefix still count as bug fixes when they use fix-related keywords
@@ -409,8 +416,6 @@ mod tests {
     }
 
     #[test]
-||||||| parent of 6c54d0d (feat(generated-detect): suppress bug-fix attribution for auto-generated files)
-=======
     fn test_merge_delta_suppresses_bugfix_attribution_for_generated_files() {
         // A "fix(schema): ..." commit touches both the source (.proto)
         // and the generated bindings (.pb.go). Only the source should
@@ -457,7 +462,55 @@ mod tests {
     }
 
     #[test]
->>>>>>> 6c54d0d (feat(generated-detect): suppress bug-fix attribution for auto-generated files)
+    fn test_merge_delta_refreshes_generated_flag_on_existing_entries() {
+        // Reviewer-caught bug: when merge_delta runs against a map that
+        // was deserialized from before the `generated` field existed,
+        // pre-existing entries have generated=false (from
+        // #[serde(default)]). Without refreshing on every visit, the
+        // flag would stay false forever and bug-fix attribution would
+        // silently leak through. This simulates that incremental update
+        // by pre-seeding an entry with generated=false.
+        let mut map = create_empty_map();
+        map.file_activity.insert(
+            "api/user.pb.go".to_string(),
+            FileActivity {
+                changes: 5,
+                recent_changes: 0,
+                authors: vec!["alice".to_string()],
+                created: "2026-01-01T00:00:00Z".to_string(),
+                last_changed: "2026-01-01T00:00:00Z".to_string(),
+                additions: 100,
+                deletions: 50,
+                bug_fix_changes: 0,
+                refactor_changes: 0,
+                last_bug_fix: String::new(),
+                generated: false,
+            },
+        );
+
+        let delta = make_delta(vec![make_commit(
+            "alice",
+            "fix(schema): correct field type",
+            vec![FileChange {
+                path: "api/user.pb.go".to_string(),
+                additions: 10,
+                deletions: 5,
+            }],
+        )]);
+        merge_delta(&mut map, &delta);
+
+        let pb_go = &map.file_activity["api/user.pb.go"];
+        assert!(
+            pb_go.generated,
+            "generated flag must be refreshed on existing entries"
+        );
+        assert_eq!(
+            pb_go.bug_fix_changes, 0,
+            "bug-fix attribution must be suppressed once flag refreshes"
+        );
+    }
+
+    #[test]
     fn test_merge_delta_noise_filtering() {
         let mut map = create_empty_map();
         let delta = make_delta(vec![make_commit(
