@@ -68,8 +68,12 @@ pub fn run(
 
 /// Algorithm state during one Louvain run.
 ///
-/// Tracks per-node community membership plus per-community aggregates needed
-/// to compute modularity gain in O(1) when a node moves.
+/// Community ids are bounded by `n` (the node count) for the entire run -
+/// they start as `0..n` (one per node) and only ever consolidate, never
+/// expand. That lets us store all per-community aggregates in `Vec<f64>`
+/// indexed by community id, replacing the previous `HashMap<u32, f64>`.
+/// Empty (abandoned) communities just hold zeroes; they cost one f64 slot
+/// each but no hashing.
 struct State {
     /// node -> community
     node_to_comm: Vec<u32>,
@@ -78,12 +82,22 @@ struct State {
     /// Per-node weighted degree (sum of incident edge weights, with
     /// self-loops counted twice as in standard Louvain bookkeeping).
     degree: Vec<f64>,
+    /// Per-node self-loop weight, pre-computed once so the local-moves loop
+    /// doesn't iterate `neighbours[node]` for self-loop detection per pass.
+    self_loop: Vec<f64>,
     /// Sum of weighted degrees of all nodes currently in community c.
-    comm_total: HashMap<u32, f64>,
+    comm_total: Vec<f64>,
     /// Sum of edge weights internal to community c (self-loops count once).
-    comm_internal: HashMap<u32, f64>,
+    comm_internal: Vec<f64>,
     /// Total edge weight in the graph (m). Constant across moves.
     total_weight: f64,
+    /// Scratch: per-target accumulator reused across nodes in `local_moves`.
+    /// Indexed by community id (size n). Cleared lazily via `dirty_comms`.
+    weights_to: Vec<f64>,
+    /// Scratch: list of community ids touched while processing the current
+    /// node. Used to zero out only the dirty entries in `weights_to`,
+    /// avoiding the O(n) clear that a full `weights_to.fill(0.0)` would do.
+    dirty_comms: Vec<u32>,
 }
 
 impl State {
@@ -91,6 +105,7 @@ impl State {
         let n = graph.node_count();
         let mut neighbours: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
         let mut degree = vec![0.0; n];
+        let mut self_loop = vec![0.0; n];
         let mut total_weight = 0.0;
 
         for edge in graph.edge_references() {
@@ -108,39 +123,46 @@ impl State {
                 degree[b] += w;
                 total_weight += w;
             } else {
-                // Self-loop contributes once to degree, once to total.
+                // Self-loop contributes once to degree, once to total. Cache
+                // the per-node self-loop sum so local_moves doesn't refilter.
                 degree[a] += 2.0 * w;
+                self_loop[a] += w;
                 total_weight += w;
             }
         }
 
         let node_to_comm: Vec<u32> = (0..n as u32).collect();
-        let mut comm_total: HashMap<u32, f64> = HashMap::with_capacity(n);
-        let mut comm_internal: HashMap<u32, f64> = HashMap::with_capacity(n);
-        for (i, &deg) in degree.iter().enumerate() {
-            comm_total.insert(i as u32, deg);
-            comm_internal.insert(i as u32, 0.0);
-        }
+        let comm_total: Vec<f64> = degree.clone();
+        let comm_internal: Vec<f64> = vec![0.0; n];
 
         Self {
             node_to_comm,
             neighbours,
             degree,
+            self_loop,
             comm_total,
             comm_internal,
             total_weight,
+            weights_to: vec![0.0; n],
+            dirty_comms: Vec::with_capacity(n),
         }
     }
 
-    /// Compute modularity Q = sum_c [ (e_c / m) - γ * (a_c / 2m)^2 ]
+    /// Compute modularity Q = sum_c [ (e_c / m) - γ * (a_c / 2m)^2 ].
+    /// Iterates the dense Vec; abandoned communities (zero total) drop out
+    /// to `0/2m = 0` so they cost only a comparison.
     fn modularity(&self, resolution: f64) -> f64 {
         if self.total_weight <= 0.0 {
             return 0.0;
         }
         let two_m = 2.0 * self.total_weight;
         let mut q = 0.0;
-        for (&comm, &internal) in &self.comm_internal {
-            let a = self.comm_total.get(&comm).copied().unwrap_or(0.0);
+        for c in 0..self.comm_total.len() {
+            let a = self.comm_total[c];
+            if a == 0.0 {
+                continue;
+            }
+            let internal = self.comm_internal[c];
             q += internal / self.total_weight - resolution * (a / two_m).powi(2);
         }
         q
@@ -155,36 +177,41 @@ impl State {
         }
 
         for node in 0..self.node_to_comm.len() {
+            // Clear only the entries dirtied by the previous node iteration.
+            for &c in &self.dirty_comms {
+                self.weights_to[c as usize] = 0.0;
+            }
+            self.dirty_comms.clear();
+
             let current_comm = self.node_to_comm[node];
             let k_i = self.degree[node];
+            let self_loop = self.self_loop[node];
 
-            // Sum of edge weights from node to each neighbouring community.
-            let mut weights_to: HashMap<u32, f64> = HashMap::new();
+            // Sum of edge weights from `node` to each neighbouring community.
             for &(other, w) in &self.neighbours[node] {
                 if other == node {
                     continue;
                 }
                 let c = self.node_to_comm[other];
-                *weights_to.entry(c).or_insert(0.0) += w;
+                let slot = &mut self.weights_to[c as usize];
+                if *slot == 0.0 {
+                    self.dirty_comms.push(c);
+                }
+                *slot += w;
             }
 
-            // Self-loop weight (constant for `node`).
-            let self_loop: f64 = self.neighbours[node]
-                .iter()
-                .filter(|(o, _)| *o == node)
-                .map(|(_, w)| *w)
-                .sum();
-
             // Remove node from its current community to evaluate fairly.
-            let k_in_current = weights_to.get(&current_comm).copied().unwrap_or(0.0);
-            *self.comm_total.entry(current_comm).or_insert(0.0) -= k_i;
-            *self.comm_internal.entry(current_comm).or_insert(0.0) -= k_in_current + self_loop;
+            let k_in_current = self.weights_to[current_comm as usize];
+            self.comm_total[current_comm as usize] -= k_i;
+            self.comm_internal[current_comm as usize] -= k_in_current + self_loop;
 
-            // Pick the best target community (default = stay put).
+            // Pick the best target community (default = stay put). Iterate
+            // only the touched (`dirty_comms`) entries, not all n.
             let mut best_comm = current_comm;
             let mut best_gain = 0.0;
-            for (&target, &k_in_target) in &weights_to {
-                let total_target = self.comm_total.get(&target).copied().unwrap_or(0.0);
+            for &target in &self.dirty_comms {
+                let k_in_target = self.weights_to[target as usize];
+                let total_target = self.comm_total[target as usize];
                 let gain = k_in_target - resolution * (k_i * total_target) / two_m;
                 if gain > best_gain + 1e-12 {
                     best_gain = gain;
@@ -192,10 +219,12 @@ impl State {
                 }
             }
 
-            // Re-insert into chosen community.
-            let k_in_best = weights_to.get(&best_comm).copied().unwrap_or(0.0);
-            *self.comm_total.entry(best_comm).or_insert(0.0) += k_i;
-            *self.comm_internal.entry(best_comm).or_insert(0.0) += k_in_best + self_loop;
+            // Re-insert into chosen community. Note: `best_comm` may be
+            // `current_comm` (which we just zeroed out of), and that case
+            // restores the prior value via `k_in_current`.
+            let k_in_best = self.weights_to[best_comm as usize];
+            self.comm_total[best_comm as usize] += k_i;
+            self.comm_internal[best_comm as usize] += k_in_best + self_loop;
             self.node_to_comm[node] = best_comm;
 
             if best_comm != current_comm {
