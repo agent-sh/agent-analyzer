@@ -294,6 +294,45 @@ pub enum QueryAction {
         #[arg(long)]
         map_file: PathBuf,
     },
+    /// List communities discovered by co-change graph Louvain partitioning
+    Communities {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show files bridging communities (high betweenness centrality)
+    Boundaries {
+        /// Repository path
+        path: PathBuf,
+        /// Maximum number of results
+        #[arg(long, default_value = "10")]
+        top: usize,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Look up which community a file belongs to
+    AreaOf {
+        /// File path (relative to repo root)
+        file: String,
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
+    /// Show composite health metrics for one community by id
+    CommunityHealth {
+        /// Community id (from `communities` query)
+        id: u32,
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
 }
 
 pub fn run(action: RepoIntelAction) -> Result<()> {
@@ -359,6 +398,23 @@ fn run_init(path: &Path, _max_commits: Option<usize>) -> Result<()> {
         }
     }
 
+    // Phase 5: Graph-derived analytics (co-change communities + centrality)
+    eprintln!("[INFO] Building co-change graph...");
+    analyzer_graph::finalize(&mut map);
+    if let Some(cg) = map
+        .graph
+        .as_ref()
+        .and_then(|g| g.cochange.as_ref())
+    {
+        eprintln!(
+            "[INFO] Discovered {} communities from {} edges",
+            cg.communities.len(),
+            cg.edges.len()
+        );
+    } else {
+        eprintln!("[INFO] Insufficient co-change signal - graph not built");
+    }
+
     println!("{}", output::to_json(&map));
     eprintln!("[OK] Repo intel map created successfully");
     Ok(())
@@ -418,6 +474,11 @@ fn run_update(path: &Path, map_file: &Path) -> Result<()> {
             Err(e) => eprintln!("[WARN] Doc-code sync check failed: {e}"),
         }
     }
+
+    // Refresh Phase 5 graph analytics. Full re-cluster on update for now -
+    // incremental Louvain on dirty subgraphs is a future optimisation.
+    eprintln!("[INFO] Rebuilding co-change graph...");
+    analyzer_graph::finalize(&mut map);
 
     println!("{}", output::to_json(&map));
     eprintln!("[OK] Repo intel map updated successfully");
@@ -648,6 +709,35 @@ fn run_query(query: QueryAction) -> Result<()> {
             let map = load_map(&map_file)?;
             let result = queries::painspots(&map, top);
             println!("{}", output::to_json(&result));
+        }
+        QueryAction::Communities { map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = analyzer_graph::queries::communities(&map);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::Boundaries { top, map_file, .. } => {
+            let map = load_map(&map_file)?;
+            let result = analyzer_graph::queries::boundaries(&map, top);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::AreaOf {
+            file, map_file, ..
+        } => {
+            let map = load_map(&map_file)?;
+            let result = analyzer_graph::queries::area_of(&map, &file);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::CommunityHealth { id, map_file, .. } => {
+            let map = load_map(&map_file)?;
+            match analyzer_graph::queries::community_health(&map, id) {
+                Some(health) => println!("{}", output::to_json(&health)),
+                None => {
+                    eprintln!(
+                        "[WARN] Community id {id} not found (run `repo-intel query communities` to list ids)"
+                    );
+                    println!("null");
+                }
+            }
         }
     }
     Ok(())

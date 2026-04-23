@@ -313,6 +313,7 @@ mod tests {
             import_graph: None,
             project: None,
             doc_refs: None,
+            graph: None,
         }
     }
 }
