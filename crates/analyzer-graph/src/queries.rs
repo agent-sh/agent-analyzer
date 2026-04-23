@@ -45,8 +45,6 @@ pub struct CommunityHealth {
     pub recent_changes: u64,
     pub bug_fixes: u64,
     pub bug_fix_rate: f64,
-    pub ai_changes: u64,
-    pub ai_ratio: f64,
     pub stale_owner_files: usize,
     pub files: Vec<String>,
 }
@@ -115,7 +113,7 @@ pub fn area_of(map: &RepoIntelData, file: &str) -> AreaOfResult {
 }
 
 /// Composite health roll-up for one community: aggregates per-file
-/// activity into community-level signals (bug rate, AI ratio, stale owners).
+/// activity into community-level signals (bug rate, stale owners).
 /// Returns `None` if the community id is not present.
 pub fn community_health(map: &RepoIntelData, id: u32) -> Option<CommunityHealth> {
     let g = map.graph.as_ref().and_then(|g| g.cochange.as_ref())?;
@@ -124,7 +122,6 @@ pub fn community_health(map: &RepoIntelData, id: u32) -> Option<CommunityHealth>
     let mut total_changes: u64 = 0;
     let mut recent_changes: u64 = 0;
     let mut bug_fixes: u64 = 0;
-    let mut ai_changes: u64 = 0;
     let mut stale_owner_files: usize = 0;
 
     let last_commit_date = map.git.last_commit_date.as_str();
@@ -137,7 +134,6 @@ pub fn community_health(map: &RepoIntelData, id: u32) -> Option<CommunityHealth>
         total_changes += activity.changes;
         recent_changes += activity.recent_changes;
         bug_fixes += activity.bug_fix_changes;
-        ai_changes += activity.ai_changes;
 
         // A file's primary author is the first in `authors` (insertion order
         // matches commit order in the aggregator). Mark stale if the author's
@@ -156,11 +152,6 @@ pub fn community_health(map: &RepoIntelData, id: u32) -> Option<CommunityHealth>
     } else {
         0.0
     };
-    let ai_ratio = if total_changes > 0 {
-        ai_changes as f64 / total_changes as f64
-    } else {
-        0.0
-    };
 
     // `files` is already sorted at construction time (cochange::build sorts
     // each community's file list before returning), so just clone.
@@ -173,8 +164,6 @@ pub fn community_health(map: &RepoIntelData, id: u32) -> Option<CommunityHealth>
         recent_changes,
         bug_fixes,
         bug_fix_rate,
-        ai_changes,
-        ai_ratio,
         stale_owner_files,
         files: sorted_files,
     })
@@ -241,13 +230,6 @@ mod tests {
                 naming_patterns: None,
                 test_patterns: None,
             },
-            ai_attribution: analyzer_core::types::AiAttribution {
-                attributed: 0,
-                heuristic: 0,
-                none: 0,
-                tools: HashMap::new(),
-                confidence: "low".into(),
-            },
             releases: analyzer_core::types::Releases {
                 tags: vec![],
                 cadence: "unknown".into(),
@@ -272,9 +254,6 @@ mod tests {
                     last_changed: String::new(),
                     additions: 0,
                     deletions: 0,
-                    ai_changes: 0,
-                    ai_additions: 0,
-                    ai_deletions: 0,
                     bug_fix_changes: 0,
                     refactor_changes: 0,
                     last_bug_fix: String::new(),
@@ -283,14 +262,10 @@ mod tests {
         }
         for (a, b, cochanges) in coupling {
             let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-            data.coupling.entry(lo.to_string()).or_default().insert(
-                hi.to_string(),
-                CouplingEntry {
-                    cochanges,
-                    human_cochanges: cochanges,
-                    ai_cochanges: 0,
-                },
-            );
+            data.coupling
+                .entry(lo.to_string())
+                .or_default()
+                .insert(hi.to_string(), CouplingEntry { cochanges });
         }
         let g = cochange::build(&data).expect("graph builds");
         data.graph = Some(analyzer_core::types::GraphData {

@@ -177,13 +177,6 @@ mod tests {
                 naming_patterns: None,
                 test_patterns: None,
             },
-            ai_attribution: analyzer_core::types::AiAttribution {
-                attributed: 0,
-                heuristic: 0,
-                none: 0,
-                tools: HashMap::new(),
-                confidence: "low".into(),
-            },
             releases: analyzer_core::types::Releases {
                 tags: vec![],
                 cadence: "unknown".into(),
@@ -208,9 +201,6 @@ mod tests {
                     last_changed: String::new(),
                     additions: 0,
                     deletions: 0,
-                    ai_changes: 0,
-                    ai_additions: 0,
-                    ai_deletions: 0,
                     bug_fix_changes: 0,
                     refactor_changes: 0,
                     last_bug_fix: String::new(),
@@ -224,8 +214,6 @@ mod tests {
                 (*hi).to_string(),
                 CouplingEntry {
                     cochanges: *cochanges,
-                    human_cochanges: *cochanges,
-                    ai_cochanges: 0,
                 },
             );
         }

@@ -77,9 +77,6 @@ pub enum QueryAction {
     BusFactor {
         /// Repository path
         path: PathBuf,
-        /// Adjust for AI-assisted commits
-        #[arg(long)]
-        adjust_for_ai: bool,
         /// Path to repo-intel JSON file
         #[arg(long)]
         map_file: PathBuf,
@@ -129,17 +126,6 @@ pub enum QueryAction {
         /// Number of results to show
         #[arg(long, default_value = "20")]
         top: usize,
-        /// Path to repo-intel JSON file
-        #[arg(long)]
-        map_file: PathBuf,
-    },
-    /// Show AI vs human contribution ratio
-    AiRatio {
-        /// Repository path
-        path: PathBuf,
-        /// Filter to a specific path
-        #[arg(long)]
-        path_filter: Option<String>,
         /// Path to repo-intel JSON file
         #[arg(long)]
         map_file: PathBuf,
@@ -209,17 +195,6 @@ pub enum QueryAction {
         path: PathBuf,
         /// Number of results to show
         #[arg(long, default_value = "10")]
-        top: usize,
-        /// Path to repo-intel JSON file
-        #[arg(long)]
-        map_file: PathBuf,
-    },
-    /// Show files with recent AI-authored changes
-    RecentAi {
-        /// Repository path
-        path: PathBuf,
-        /// Number of results to show
-        #[arg(long, default_value = "20")]
         top: usize,
         /// Path to repo-intel JSON file
         #[arg(long)]
@@ -519,7 +494,7 @@ fn run_query(query: QueryAction) -> Result<()> {
         }
         QueryAction::Coupling { file, map_file, .. } => {
             let map = load_map(&map_file)?;
-            let result = queries::coupling(&map, &file, false);
+            let result = queries::coupling(&map, &file);
             println!("{}", output::to_json(&result));
         }
         QueryAction::Ownership { file, map_file, .. } => {
@@ -527,13 +502,9 @@ fn run_query(query: QueryAction) -> Result<()> {
             let result = queries::ownership(&map, &file);
             println!("{}", output::to_json(&result));
         }
-        QueryAction::BusFactor {
-            map_file,
-            adjust_for_ai,
-            ..
-        } => {
+        QueryAction::BusFactor { map_file, .. } => {
             let map = load_map(&map_file)?;
-            let result = queries::bus_factor_detailed(&map, adjust_for_ai);
+            let result = queries::bus_factor_detailed(&map);
             println!("{}", output::to_json(&result));
         }
         QueryAction::Bugspots { map_file, top, .. } => {
@@ -561,15 +532,6 @@ fn run_query(query: QueryAction) -> Result<()> {
             let map = load_map(&map_file)?;
             let mut result = queries::contributors(&map, None);
             result.truncate(top);
-            println!("{}", output::to_json(&result));
-        }
-        QueryAction::AiRatio {
-            map_file,
-            path_filter,
-            ..
-        } => {
-            let map = load_map(&map_file)?;
-            let result = queries::ai_ratio(&map, path_filter.as_deref());
             println!("{}", output::to_json(&result));
         }
         QueryAction::ReleaseInfo { map_file, .. } => {
@@ -618,11 +580,6 @@ fn run_query(query: QueryAction) -> Result<()> {
         QueryAction::DocDrift { map_file, top, .. } => {
             let map = load_map(&map_file)?;
             let result = queries::doc_drift(&map, top);
-            println!("{}", output::to_json(&result));
-        }
-        QueryAction::RecentAi { map_file, top, .. } => {
-            let map = load_map(&map_file)?;
-            let result = queries::recent_ai(&map, top);
             println!("{}", output::to_json(&result));
         }
         QueryAction::Onboard { path, map_file } => {

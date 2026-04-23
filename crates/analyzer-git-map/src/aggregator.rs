@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use analyzer_core::ai_detect::{detect_ai, is_bot};
+use analyzer_core::bot_detect::is_bot;
 use analyzer_core::types::{
-    AiAttribution, CommitDelta, Contributors, ConventionInfo, FileActivity, GitInfo, Releases,
-    RepoIntelData, extract_conventional_prefix,
+    CommitDelta, Contributors, ConventionInfo, FileActivity, GitInfo, Releases, RepoIntelData,
+    extract_conventional_prefix,
 };
 use analyzer_core::walk::is_noise;
 
@@ -38,13 +38,6 @@ pub fn create_empty_map() -> RepoIntelData {
             naming_patterns: None,
             test_patterns: None,
         },
-        ai_attribution: AiAttribution {
-            attributed: 0,
-            heuristic: 0,
-            none: 0,
-            tools: HashMap::new(),
-            confidence: "low".to_string(),
-        },
         releases: Releases {
             tags: vec![],
             cadence: "unknown".to_string(),
@@ -66,7 +59,6 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
     for commit in &delta.commits {
         // Determine if author is a bot
         let is_bot_author = is_bot(&commit.author_name);
-        let ai_signal = detect_ai(commit);
 
         // Update contributor counts
         if is_bot_author {
@@ -97,7 +89,6 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
                     recent_commits: 0,
                     first_seen: commit.date.clone(),
                     last_seen: commit.date.clone(),
-                    ai_assisted_commits: 0,
                 });
             entry.commits += 1;
             if commit.date < entry.first_seen {
@@ -106,19 +97,6 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
             if commit.date > entry.last_seen {
                 entry.last_seen.clone_from(&commit.date);
             }
-
-            if ai_signal.detected {
-                entry.ai_assisted_commits += 1;
-            }
-        }
-
-        // Update AI attribution counts
-        if ai_signal.detected {
-            map.ai_attribution.attributed += 1;
-            let tool = ai_signal.tool.unwrap_or_else(|| "unknown".to_string());
-            *map.ai_attribution.tools.entry(tool).or_insert(0) += 1;
-        } else {
-            map.ai_attribution.none += 1;
         }
 
         // Update conventions
@@ -152,9 +130,6 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
                     last_changed: commit.date.clone(),
                     additions: 0,
                     deletions: 0,
-                    ai_changes: 0,
-                    ai_additions: 0,
-                    ai_deletions: 0,
                     bug_fix_changes: 0,
                     refactor_changes: 0,
                     last_bug_fix: String::new(),
@@ -172,12 +147,6 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
 
             if !entry.authors.contains(&commit.author_name) {
                 entry.authors.push(commit.author_name.clone());
-            }
-
-            if ai_signal.detected {
-                entry.ai_changes += 1;
-                entry.ai_additions += file.additions;
-                entry.ai_deletions += file.deletions;
             }
 
             if prefix.as_deref() == Some("fix") {
@@ -202,19 +171,10 @@ pub fn merge_delta(map: &mut RepoIntelData, delta: &CommitDelta) {
                 };
 
                 let pairs = map.coupling.entry(a.to_string()).or_default();
-                let entry = pairs.entry(b.to_string()).or_insert_with(|| {
-                    analyzer_core::types::CouplingEntry {
-                        cochanges: 0,
-                        human_cochanges: 0,
-                        ai_cochanges: 0,
-                    }
-                });
+                let entry = pairs
+                    .entry(b.to_string())
+                    .or_insert_with(|| analyzer_core::types::CouplingEntry { cochanges: 0 });
                 entry.cochanges += 1;
-                if ai_signal.detected {
-                    entry.ai_cochanges += 1;
-                } else {
-                    entry.human_cochanges += 1;
-                }
             }
         }
 
