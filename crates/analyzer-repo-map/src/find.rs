@@ -5,27 +5,40 @@
 //! of paths with a one-line `why` string per result so the caller can
 //! skim instead of opening every file.
 //!
-//! # Scoring (v0, deterministic)
+//! # Scoring
 //!
 //! Per query term (case-insensitive substring), each file gains:
 //! - basename match: **5.0** (e.g. query "worker" hits `worker.rs`)
 //! - path-component match: **3.0** (query "auth" hits `src/auth/login.ts`)
 //! - exported-symbol name match: **2.0** per symbol, capped at 3/term
+//! - **descriptor match: 2.5** (when the post-init weighter agent has
+//!   populated `file_descriptors` - catches semantic synonyms like
+//!   worker↔executor that substring matching against names alone misses)
 //! - top-of-file doc-comment match: **1.5** (first ~500 bytes scanned)
 //! - import-name match: **1.0**
 //!
 //! Final score is the sum across terms. Files with score 0 are dropped.
 //! Ties break on path ascending for stable output.
 //!
-//! # Out of scope (v0)
+//! # Descriptor signal (v1)
 //!
-//! - Semantic synonyms (worker ↔ executor, queue ↔ channel) - see
-//!   issue #20 v1, which layers Haiku-generated descriptors on top of
-//!   this scorer at init/update time
+//! Descriptors are 1-2 sentence per-file summaries written by the
+//! `repo-intel-weighter` Haiku agent (orchestrated from the JS skill,
+//! piped into the artifact via `repo-intel set-descriptors`). The
+//! analyzer crate never calls an LLM - it just consumes whatever
+//! descriptors the orchestrating skill has written.
+//!
+//! Unlike the doc-header signal, the descriptor pass fires even on
+//! files with zero cheap signals - that's exactly the synonym recall
+//! case (a file named `executor.rs` should match query `worker` if
+//! the descriptor calls it a "worker pool implementation").
+//!
+//! # Out of scope
+//!
 //! - Files outside the symbol index (markdown, config, manifests) -
 //!   only files that the AST extractor processed are considered
 //! - Full-body content search - that's what `grep` is for; we only
-//!   look at the doc-comment header
+//!   look at the doc-comment header and the descriptor
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -50,12 +63,18 @@ pub struct FindResult {
 ///
 /// `symbols` is the AST symbol index; `repo_path` is needed only for
 /// reading the first ~500 bytes of each candidate file to score
-/// doc-comment matches. Pass `limit = 0` to get all matches.
+/// doc-comment matches. `descriptors` is the optional per-file
+/// descriptor map populated by the post-init `repo-intel-weighter`
+/// agent - when present, each term match against a file's descriptor
+/// adds a medium-weight signal that catches semantic synonyms (worker
+/// ↔ executor, queue ↔ channel) the deterministic scorer can't see.
+/// Pass `limit = 0` to get all matches.
 pub fn find(
     symbols: &HashMap<String, FileSymbols>,
     repo_path: &Path,
     query: &str,
     limit: usize,
+    descriptors: Option<&HashMap<String, String>>,
 ) -> Vec<FindResult> {
     let terms = tokenize(query);
     if terms.is_empty() {
@@ -64,7 +83,7 @@ pub fn find(
 
     let mut results: Vec<FindResult> = symbols
         .iter()
-        .filter_map(|(path, file_syms)| score_file(path, file_syms, repo_path, &terms))
+        .filter_map(|(path, file_syms)| score_file(path, file_syms, repo_path, &terms, descriptors))
         .collect();
 
     results.sort_by(|a, b| {
@@ -102,6 +121,7 @@ fn score_file(
     file_syms: &FileSymbols,
     repo_path: &Path,
     terms: &[String],
+    descriptors: Option<&HashMap<String, String>>,
 ) -> Option<FindResult> {
     let path_lower = path.to_ascii_lowercase();
     let basename_lower = path_lower
@@ -196,6 +216,31 @@ fn score_file(
         }
     }
 
+    // Pass 3: LLM-generated descriptor. The repo-intel-weighter agent
+    // writes a 1-2 sentence descriptor per file at init/update time;
+    // matching against that text catches semantic synonyms (worker ↔
+    // executor) the substring-only signals can't see. Weight 2.5 per
+    // term hit - between path-component (3.0) and import (1.0) -
+    // because the descriptor is a curated summary, more reliable
+    // than ad-hoc imports but less direct than a basename match.
+    //
+    // Unlike the doc-header pass, this is gated only on the
+    // descriptor existing - even files with zero cheap signals can
+    // surface here, because that's exactly the synonym recall case
+    // (a file named `executor.rs` should match query `worker`).
+    let mut descriptor_hits = 0;
+    if let Some(map) = descriptors
+        && let Some(desc) = map.get(path)
+    {
+        let desc_lower = desc.to_ascii_lowercase();
+        for term in terms {
+            if desc_lower.contains(term) {
+                total_score += 2.5;
+                descriptor_hits += 1;
+            }
+        }
+    }
+
     if total_score == 0.0 {
         return None;
     }
@@ -220,6 +265,9 @@ fn score_file(
     }
     if doc_hits > 0 {
         why_fragments.push("module doc mentions term".to_string());
+    }
+    if descriptor_hits > 0 {
+        why_fragments.push("descriptor matches".to_string());
     }
     if !matched_imports.is_empty() {
         let mut imports_sorted: Vec<&String> = matched_imports.iter().collect();
@@ -365,8 +413,8 @@ mod tests {
             "src/lib.rs".to_string(),
             make_file_syms(vec![fs_with("Worker", SymbolKind::Struct)], vec![]),
         );
-        assert!(find(&syms, dir.path(), "", 10).is_empty());
-        assert!(find(&syms, dir.path(), "   ", 10).is_empty());
+        assert!(find(&syms, dir.path(), "", 10, None).is_empty());
+        assert!(find(&syms, dir.path(), "   ", 10, None).is_empty());
     }
 
     #[test]
@@ -376,7 +424,7 @@ mod tests {
         syms.insert("src/worker.rs".to_string(), make_file_syms(vec![], vec![]));
         syms.insert("src/lib.rs".to_string(), make_file_syms(vec![], vec![]));
 
-        let results = find(&syms, dir.path(), "worker", 10);
+        let results = find(&syms, dir.path(), "worker", 10, None);
         // worker.rs should appear (basename hit); lib.rs should not.
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "src/worker.rs");
@@ -396,7 +444,7 @@ mod tests {
         // "auth" appears in basename
         syms.insert("src/auth.rs".to_string(), make_file_syms(vec![], vec![]));
 
-        let results = find(&syms, dir.path(), "auth", 10);
+        let results = find(&syms, dir.path(), "auth", 10, None);
         assert_eq!(results.len(), 2);
         // basename hit (auth.rs) should rank above path-only (auth/login.ts).
         assert_eq!(results[0].path, "src/auth.rs");
@@ -422,7 +470,7 @@ mod tests {
             make_file_syms(vec![fs_with("Foo", SymbolKind::Struct)], vec![]),
         );
 
-        let results = find(&syms, dir.path(), "worker", 10);
+        let results = find(&syms, dir.path(), "worker", 10, None);
         let lib = results.iter().find(|r| r.path == "src/lib.rs").unwrap();
         assert!(lib.why.contains("exports"));
         assert!(lib.why.contains("WorkerPool"));
@@ -439,7 +487,7 @@ mod tests {
         );
         syms.insert("src/worker.rs".to_string(), make_file_syms(vec![], vec![]));
 
-        let results = find(&syms, dir.path(), "worker pool", 10);
+        let results = find(&syms, dir.path(), "worker pool", 10, None);
         // worker_pool.rs matches BOTH terms in the basename, so it
         // should outrank worker.rs which only matches one.
         assert_eq!(results[0].path, "src/worker_pool.rs");
@@ -473,7 +521,7 @@ mod tests {
             ),
         );
 
-        let results = find(&syms, dir.path(), "worker", 10);
+        let results = find(&syms, dir.path(), "worker", 10, None);
         let runtime = results.iter().find(|r| r.path == path).unwrap();
         assert!(runtime.why.contains("module doc mentions term"));
     }
@@ -485,7 +533,7 @@ mod tests {
         for n in &["a", "b", "c", "d"] {
             syms.insert(format!("src/{n}_worker.rs"), make_file_syms(vec![], vec![]));
         }
-        let results = find(&syms, dir.path(), "worker", 2);
+        let results = find(&syms, dir.path(), "worker", 2, None);
         assert_eq!(results.len(), 2);
         // All four have the same basename score; ties break on path asc,
         // so a_worker.rs and b_worker.rs come first.
@@ -524,7 +572,7 @@ mod tests {
         // Multi-term query: "worker" hits via the import (cheap
         // signal → seeds the base score → doc gets read), then
         // "pool" must match in the intermediate block-comment line.
-        let results = find(&syms, dir.path(), "worker pool", 10);
+        let results = find(&syms, dir.path(), "worker pool", 10, None);
         let r = results
             .iter()
             .find(|r| r.path == path)
@@ -558,8 +606,8 @@ mod tests {
             ),
         );
 
-        let r1 = find(&syms, dir.path(), "worker pool", 10);
-        let r2 = find(&syms, dir.path(), "pool worker", 10);
+        let r1 = find(&syms, dir.path(), "worker pool", 10, None);
+        let r2 = find(&syms, dir.path(), "pool worker", 10, None);
         let s1 = r1.iter().find(|r| r.path == "src/uses.rs").unwrap().score;
         let s2 = r2.iter().find(|r| r.path == "src/uses.rs").unwrap().score;
         assert!(
@@ -594,12 +642,12 @@ mod tests {
 
         // basename `elegant.rs` matches "elegant"; doc mentions both
         // "elegant" and "worker". Order shouldn't matter.
-        let s1 = find(&syms, dir.path(), "elegant worker", 10)
+        let s1 = find(&syms, dir.path(), "elegant worker", 10, None)
             .iter()
             .find(|r| r.path == path)
             .unwrap()
             .score;
-        let s2 = find(&syms, dir.path(), "worker elegant", 10)
+        let s2 = find(&syms, dir.path(), "worker elegant", 10, None)
             .iter()
             .find(|r| r.path == path)
             .unwrap()
@@ -628,7 +676,7 @@ mod tests {
             ),
         );
 
-        let results = find(&syms, dir.path(), "worker", 10);
+        let results = find(&syms, dir.path(), "worker", 10, None);
         let r = results
             .iter()
             .find(|r| r.path == "src/uses_lots.rs")
@@ -644,10 +692,105 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_match_surfaces_semantic_synonym() {
+        // The whole point of the descriptor signal: a file with no
+        // direct name/symbol/import match for the query should still
+        // surface when the descriptor describes the concept. Here a
+        // file named `executor.rs` (no "worker" anywhere in the
+        // symbol index) is described as a "worker pool" and must
+        // surface for the query "worker".
+        let dir = TempDir::new().unwrap();
+        let mut syms = HashMap::new();
+        syms.insert(
+            "src/executor.rs".to_string(),
+            make_file_syms(vec![fs_with("Executor", SymbolKind::Struct)], vec![]),
+        );
+        let mut descriptors = HashMap::new();
+        descriptors.insert(
+            "src/executor.rs".to_string(),
+            "Worker pool implementation - spawns N background threads, dispatches jobs from an mpsc queue, drains on shutdown.".to_string(),
+        );
+
+        // Without descriptors: no signal for "worker", file is dropped.
+        let no_desc = find(&syms, dir.path(), "worker", 10, None);
+        assert!(
+            no_desc.is_empty(),
+            "v0 substring scoring should not find executor.rs for query 'worker'"
+        );
+
+        // With descriptors: the file surfaces with descriptor-hit signal.
+        let with_desc = find(&syms, dir.path(), "worker", 10, Some(&descriptors));
+        let r = with_desc
+            .iter()
+            .find(|r| r.path == "src/executor.rs")
+            .expect("descriptor signal must surface the synonym match");
+        assert!(
+            r.score >= 2.5,
+            "expected descriptor match worth 2.5; got {}",
+            r.score
+        );
+        assert!(
+            r.why.contains("descriptor"),
+            "why should mention descriptor: {:?}",
+            r.why
+        );
+    }
+
+    #[test]
+    fn descriptor_score_adds_to_other_signals() {
+        // When both v0 signals and descriptor fire, scores add.
+        let dir = TempDir::new().unwrap();
+        let mut syms = HashMap::new();
+        syms.insert("src/worker.rs".to_string(), make_file_syms(vec![], vec![]));
+        let mut descriptors = HashMap::new();
+        descriptors.insert(
+            "src/worker.rs".to_string(),
+            "Worker pool implementation.".to_string(),
+        );
+
+        let with_desc = find(&syms, dir.path(), "worker", 10, Some(&descriptors));
+        let r = with_desc
+            .iter()
+            .find(|r| r.path == "src/worker.rs")
+            .unwrap();
+        // 5.0 (basename) + 2.5 (descriptor) = 7.5 minimum.
+        assert!(
+            r.score >= 7.5,
+            "basename (5.0) + descriptor (2.5) expected; got {}",
+            r.score
+        );
+    }
+
+    #[test]
+    fn descriptor_score_is_term_independent() {
+        // Multi-term query: each term that hits the descriptor adds 2.5.
+        let dir = TempDir::new().unwrap();
+        let mut syms = HashMap::new();
+        syms.insert(
+            "src/x.rs".to_string(),
+            make_file_syms(vec![fs_with("X", SymbolKind::Struct)], vec![]),
+        );
+        let mut descriptors = HashMap::new();
+        descriptors.insert(
+            "src/x.rs".to_string(),
+            "Background worker for the queue subsystem.".to_string(),
+        );
+
+        let with_desc = find(&syms, dir.path(), "worker queue", 10, Some(&descriptors));
+        let r = with_desc.iter().find(|r| r.path == "src/x.rs").unwrap();
+        // Two-term descriptor match should add 5.0 from descriptor alone.
+        assert!(
+            r.score >= 5.0,
+            "expected two-term descriptor signal worth 5.0; got {}",
+            r.score
+        );
+    }
+
+    #[test]
     fn no_match_returns_empty() {
         let dir = TempDir::new().unwrap();
         let mut syms = HashMap::new();
         syms.insert("src/lib.rs".to_string(), make_file_syms(vec![], vec![]));
-        assert!(find(&syms, dir.path(), "nonexistent", 10).is_empty());
+        assert!(find(&syms, dir.path(), "nonexistent", 10, None).is_empty());
     }
 }

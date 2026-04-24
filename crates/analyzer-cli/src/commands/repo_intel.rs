@@ -38,6 +38,28 @@ pub enum RepoIntelAction {
         #[command(subcommand)]
         query: QueryAction,
     },
+    /// Merge per-file descriptors (from the repo-intel-weighter agent)
+    /// into the artifact. Reads JSON object `{path: descriptor, ...}`
+    /// from --input (path or `-` for stdin).
+    SetDescriptors {
+        /// Path to the repo-intel JSON to update
+        #[arg(long)]
+        map_file: PathBuf,
+        /// Descriptors JSON file path, or `-` for stdin
+        #[arg(long, default_value = "-")]
+        input: String,
+    },
+    /// Set the 3-depth narrative summary (from the
+    /// repo-intel-summarizer agent). Reads JSON object
+    /// `{depth1, depth3, depth10, inputHash}` from --input.
+    SetSummary {
+        /// Path to the repo-intel JSON to update
+        #[arg(long)]
+        map_file: PathBuf,
+        /// Summary JSON file path, or `-` for stdin
+        #[arg(long, default_value = "-")]
+        input: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -329,6 +351,18 @@ pub enum QueryAction {
         #[arg(long)]
         map_file: PathBuf,
     },
+    /// Show the cached 3-depth narrative summary
+    Summary {
+        /// Repository path
+        path: PathBuf,
+        /// Which depth to print: 1 (sentence), 3 (paragraph), 10 (page).
+        /// Omit to return the full JSON with all three depths.
+        #[arg(long)]
+        depth: Option<u8>,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+    },
 }
 
 pub fn run(action: RepoIntelAction) -> Result<()> {
@@ -337,7 +371,86 @@ pub fn run(action: RepoIntelAction) -> Result<()> {
         RepoIntelAction::Update { path, map_file } => run_update(&path, &map_file),
         RepoIntelAction::Status { path, map_file } => run_status(&path, &map_file),
         RepoIntelAction::Query { query } => run_query(query),
+        RepoIntelAction::SetDescriptors { map_file, input } => {
+            run_set_descriptors(&map_file, &input)
+        }
+        RepoIntelAction::SetSummary { map_file, input } => run_set_summary(&map_file, &input),
     }
+}
+
+/// Read --input either from a file path or stdin (when input == "-").
+fn read_input(input: &str) -> Result<String> {
+    if input == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .context("failed to read JSON from stdin")?;
+        Ok(buf)
+    } else {
+        std::fs::read_to_string(input)
+            .with_context(|| format!("failed to read input file: {input}"))
+    }
+}
+
+/// Persist a map back to disk after merging in agent-generated data.
+/// Updates the `updated` timestamp so consumers can tell the artifact
+/// changed.
+fn write_map(path: &Path, map: &analyzer_core::types::RepoIntelData) -> Result<()> {
+    let json = serde_json::to_string_pretty(map).context("failed to serialize map")?;
+    std::fs::write(path, json)
+        .with_context(|| format!("failed to write map file: {}", path.display()))
+}
+
+fn run_set_descriptors(map_file: &Path, input: &str) -> Result<()> {
+    let mut map = load_map(map_file)?;
+    let input_text = read_input(input)?;
+    let descriptors: std::collections::HashMap<String, String> = serde_json::from_str(&input_text)
+        .context("descriptors input must be a JSON object {path: descriptor, ...}")?;
+
+    // Merge into existing descriptors (keep entries the agent didn't
+    // refresh this run) so partial updates work.
+    let added = descriptors.len();
+    let total = {
+        let existing = map.file_descriptors.get_or_insert_with(Default::default);
+        for (path, desc) in descriptors {
+            existing.insert(path, desc);
+        }
+        existing.len()
+    };
+    map.updated = chrono::Utc::now();
+    write_map(map_file, &map)?;
+    eprintln!("[OK] merged {added} descriptors; total now {total}");
+    Ok(())
+}
+
+fn run_set_summary(map_file: &Path, input: &str) -> Result<()> {
+    let mut map = load_map(map_file)?;
+    let input_text = read_input(input)?;
+
+    // Accept either a full RepoSummary (with input_hash + generated_at)
+    // or just {depth1, depth3, depth10, inputHash} - we fill in
+    // generated_at ourselves so the agent doesn't need to.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SummaryInput {
+        depth1: String,
+        depth3: String,
+        depth10: String,
+        input_hash: String,
+    }
+    let parsed: SummaryInput = serde_json::from_str(&input_text)
+        .context("summary input must be {depth1, depth3, depth10, inputHash}")?;
+
+    map.summary = Some(analyzer_core::types::RepoSummary {
+        depth1: parsed.depth1,
+        depth3: parsed.depth3,
+        depth10: parsed.depth10,
+        input_hash: parsed.input_hash,
+        generated_at: chrono::Utc::now(),
+    });
+    map.updated = chrono::Utc::now();
+    write_map(map_file, &map)?;
+    eprintln!("[OK] summary updated");
+    Ok(())
 }
 
 fn run_init(path: &Path, _max_commits: Option<usize>) -> Result<()> {
@@ -731,12 +844,43 @@ fn run_query(query: QueryAction) -> Result<()> {
             let map = load_map(&map_file)?;
             match map.symbols.as_ref() {
                 Some(syms) => {
-                    let result = analyzer_repo_map::find::find(syms, &path, &query, top);
+                    let result = analyzer_repo_map::find::find(
+                        syms,
+                        &path,
+                        &query,
+                        top,
+                        map.file_descriptors.as_ref(),
+                    );
                     println!("{}", output::to_json(&result));
                 }
                 None => {
                     eprintln!("[WARN] No symbol data in map. Run repo-intel init to generate.");
                     println!("[]");
+                }
+            }
+        }
+        QueryAction::Summary {
+            map_file, depth, ..
+        } => {
+            let map = load_map(&map_file)?;
+            match map.summary.as_ref() {
+                Some(s) => match depth {
+                    Some(1) => println!("{}", s.depth1),
+                    Some(3) => println!("{}", s.depth3),
+                    Some(10) => println!("{}", s.depth10),
+                    Some(other) => {
+                        eprintln!(
+                            "[WARN] depth must be 1, 3, or 10 (got {other}); returning full JSON"
+                        );
+                        println!("{}", output::to_json(s));
+                    }
+                    None => println!("{}", output::to_json(s)),
+                },
+                None => {
+                    eprintln!(
+                        "[WARN] No summary in map. Run /repo-intel init - the post-init repo-intel-summarizer agent populates this."
+                    );
+                    println!("null");
                 }
             }
         }
@@ -748,4 +892,148 @@ fn load_map(path: &Path) -> Result<analyzer_core::types::RepoIntelData> {
     let json = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read map file: {}", path.display()))?;
     serde_json::from_str(&json).context("failed to parse map JSON")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    /// Build a minimal serializable map for round-tripping through the
+    /// set-descriptors / set-summary handlers. The actual fields don't
+    /// matter for these tests beyond round-trip correctness.
+    fn empty_map_json(dir: &Path) -> std::path::PathBuf {
+        let map = analyzer_git_map::aggregator::create_empty_map();
+        let path = dir.join("repo-intel.json");
+        std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn set_descriptors_merges_into_artifact_and_persists() {
+        let dir = TempDir::new().unwrap();
+        let map_path = empty_map_json(dir.path());
+        let input_path = dir.path().join("descriptors.json");
+        std::fs::write(
+            &input_path,
+            r#"{"src/auth.rs": "Login route handler — bcrypt + JWT.", "src/db.rs": "Postgres connection pool."}"#,
+        )
+        .unwrap();
+
+        run_set_descriptors(&map_path, input_path.to_str().unwrap()).unwrap();
+
+        let merged = load_map(&map_path).unwrap();
+        let descs = merged.file_descriptors.expect("descriptors must be set");
+        assert_eq!(descs.len(), 2);
+        assert!(descs["src/auth.rs"].contains("bcrypt"));
+        assert!(descs["src/db.rs"].contains("Postgres"));
+    }
+
+    #[test]
+    fn set_descriptors_preserves_existing_entries_on_partial_update() {
+        let dir = TempDir::new().unwrap();
+        let map_path = empty_map_json(dir.path());
+
+        // First batch: src/a.rs
+        let first = dir.path().join("first.json");
+        std::fs::write(&first, r#"{"src/a.rs": "first descriptor"}"#).unwrap();
+        run_set_descriptors(&map_path, first.to_str().unwrap()).unwrap();
+
+        // Second batch: src/b.rs only - src/a.rs must survive.
+        let second = dir.path().join("second.json");
+        std::fs::write(&second, r#"{"src/b.rs": "second descriptor"}"#).unwrap();
+        run_set_descriptors(&map_path, second.to_str().unwrap()).unwrap();
+
+        let merged = load_map(&map_path).unwrap();
+        let descs = merged.file_descriptors.unwrap();
+        assert_eq!(
+            descs.len(),
+            2,
+            "partial updates must not drop existing entries"
+        );
+        assert_eq!(descs["src/a.rs"], "first descriptor");
+        assert_eq!(descs["src/b.rs"], "second descriptor");
+    }
+
+    #[test]
+    fn set_descriptors_rejects_malformed_json() {
+        let dir = TempDir::new().unwrap();
+        let map_path = empty_map_json(dir.path());
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "not json at all").unwrap();
+        let err = run_set_descriptors(&map_path, bad.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("descriptors input"),
+            "expected user-facing error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_summary_round_trips_all_three_depths() {
+        let dir = TempDir::new().unwrap();
+        let map_path = empty_map_json(dir.path());
+        let input = dir.path().join("summary.json");
+        std::fs::write(
+            &input,
+            r#"{
+                "depth1": "one sentence",
+                "depth3": "one paragraph",
+                "depth10": "one page",
+                "inputHash": "sha256:abc123"
+            }"#,
+        )
+        .unwrap();
+
+        run_set_summary(&map_path, input.to_str().unwrap()).unwrap();
+
+        let merged = load_map(&map_path).unwrap();
+        let s = merged.summary.expect("summary must be set");
+        assert_eq!(s.depth1, "one sentence");
+        assert_eq!(s.depth3, "one paragraph");
+        assert_eq!(s.depth10, "one page");
+        assert_eq!(s.input_hash, "sha256:abc123");
+    }
+
+    #[test]
+    fn set_summary_overwrites_previous() {
+        let dir = TempDir::new().unwrap();
+        let map_path = empty_map_json(dir.path());
+        let mk_input = |name: &str, depth1: &str, hash: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(
+                &p,
+                format!(
+                    r#"{{"depth1": "{depth1}", "depth3": "x", "depth10": "x", "inputHash": "{hash}"}}"#
+                ),
+            )
+            .unwrap();
+            p
+        };
+
+        let first = mk_input("first.json", "old text", "h1");
+        run_set_summary(&map_path, first.to_str().unwrap()).unwrap();
+
+        let second = mk_input("second.json", "new text", "h2");
+        run_set_summary(&map_path, second.to_str().unwrap()).unwrap();
+
+        let merged = load_map(&map_path).unwrap();
+        let s = merged.summary.unwrap();
+        assert_eq!(s.depth1, "new text", "set_summary should fully replace");
+        assert_eq!(s.input_hash, "h2");
+    }
+
+    #[test]
+    fn read_input_handles_file_path_and_returns_contents() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("x.txt");
+        std::fs::write(&p, "hello world").unwrap();
+        assert_eq!(read_input(p.to_str().unwrap()).unwrap(), "hello world");
+    }
+
+    /// Mark this so `HashMap` import isn't dead when only tests use it.
+    #[allow(dead_code)]
+    fn _hashmap_marker() -> HashMap<String, String> {
+        HashMap::new()
+    }
 }
