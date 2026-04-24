@@ -190,9 +190,7 @@ impl FileSuppressions {
                 continue;
             };
 
-            if directive == "agentsys-ignore-all"
-                || directive.starts_with("agentsys-ignore-all ")
-            {
+            if directive == "agentsys-ignore-all" || directive.starts_with("agentsys-ignore-all ") {
                 if in_header {
                     s.header_all = true;
                 }
@@ -267,9 +265,7 @@ fn find_agentsys_directive(line: &str) -> Option<&str> {
     let pos = line.find("agentsys-ignore")?;
     // Walk back through whitespace to the comment marker.
     let prefix = line[..pos].trim_end();
-    let valid_marker = prefix.ends_with("//")
-        || prefix.ends_with('#')
-        || prefix.ends_with("--");
+    let valid_marker = prefix.ends_with("//") || prefix.ends_with('#') || prefix.ends_with("--");
     if !valid_marker {
         return None;
     }
