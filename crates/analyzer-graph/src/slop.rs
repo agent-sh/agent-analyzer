@@ -370,6 +370,86 @@ fn symbol_kind_name(k: &analyzer_core::types::SymbolKind) -> &'static str {
     }
 }
 
+/// Recognize intentional `let _ = <expr>;` shapes that are NOT slop.
+///
+/// These all match the pattern textually but represent code the
+/// author meant to write that way:
+///
+///   * `let _ = my_pattern();` / `let _ = my_regex();` — lazy-static
+///     getters being warmed up at module init or test setup.
+///   * `let _ = thread::spawn(…)` / `tokio::spawn` / `task::spawn` —
+///     fire-and-forget concurrency. The discarded JoinHandle is the
+///     point of the line.
+///   * `let _ = fs::remove_file(…)` / `remove_dir(…)` / `flush()` —
+///     best-effort cleanup; failure is acceptable.
+///   * `let _ = mutex.lock()` / `rwlock.read()` / `rwlock.write()` —
+///     hold a guard for the rest of the scope.
+///   * `let _ = identifier;` (single bare identifier) — explicit drop
+///     to silence "unused variable" without renaming the binding.
+///
+/// Returns true when the value matches one of these shapes; the
+/// caller skips emitting a slop fix in that case.
+fn is_intentional_let_underscore_discard(value_text: &str) -> bool {
+    let trimmed = value_text.trim();
+
+    // Lazy-static warmup: `xxx_pattern()` or `xxx_regex()` with no
+    // args. Common in agnix and similar Rust codebases that pre-warm
+    // lazy_static / OnceLock regexes during init or test setup.
+    if let Some(call) = trimmed.strip_suffix("()") {
+        if call.ends_with("_pattern")
+            || call.ends_with("_regex")
+            || call.ends_with("_patterns")
+            || call.ends_with("_regexes")
+        {
+            return true;
+        }
+    }
+
+    // Fire-and-forget thread/task spawns.
+    if trimmed.starts_with("thread::spawn")
+        || trimmed.starts_with("tokio::spawn")
+        || trimmed.starts_with("task::spawn")
+        || trimmed.starts_with("tokio::task::spawn")
+        || trimmed.starts_with("std::thread::spawn")
+    {
+        return true;
+    }
+
+    // Best-effort cleanup / flushes. The Result is intentionally
+    // discarded because failure is non-fatal.
+    if trimmed.starts_with("fs::remove_")
+        || trimmed.starts_with("std::fs::remove_")
+        || trimmed.contains("::Write::flush")
+        || trimmed.contains(".flush()")
+    {
+        return true;
+    }
+
+    // Lock acquisition for scope-tied guard. The result IS the value
+    // being held, not "discarded".
+    if trimmed.ends_with(".lock()")
+        || trimmed.ends_with(".lock().unwrap()")
+        || trimmed.ends_with(".read()")
+        || trimmed.ends_with(".write()")
+        || trimmed.ends_with(".read().unwrap()")
+        || trimmed.ends_with(".write().unwrap()")
+    {
+        return true;
+    }
+
+    // Explicit drop of an existing binding — `let _ = outcome;` after
+    // a pattern match. Single bare identifier.
+    if !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return true;
+    }
+
+    false
+}
+
 /// Path-based heuristic for "this file is dedicated to tests / benches"
 /// — those files freely use `let _ = …`, `.ok();`, and `.unwrap()` and
 /// flagging them as slop generates noise without value.
@@ -775,13 +855,17 @@ fn error_swallowing_rust(content: &str, rel: &str) -> Vec<SlopFix> {
     // the `_` pattern entirely (it's the default), so we can't query
     // for it as a typed node. Instead match every let_declaration
     // with a value and string-check the text starts with `let _`.
+    //
+    // Several common shapes are intentional, not slop — see
+    // `is_intentional_let_underscore_discard` for the skip list. The
+    // remaining flagged cases are genuine "silently dropped Result"
+    // candidates worth a human eye.
     out.extend(run_ast_query(
         content,
         &language,
         r#"(let_declaration value: (_)) @body"#,
         |node| {
             let text = node.utf8_text(content.as_bytes()).ok()?;
-            // Tolerate whitespace between `let` and `_`.
             let trimmed = text.trim_start_matches("let").trim_start();
             if !trimmed.starts_with('_') {
                 return None;
@@ -792,6 +876,14 @@ fn error_swallowing_rust(content: &str, rel: &str) -> Vec<SlopFix> {
             if let Some(c) = after
                 && (c.is_ascii_alphanumeric() || c == '_')
             {
+                return None;
+            }
+            // Extract the value expression text so we can recognize
+            // intentional patterns (lazy-static warmup, fire-and-forget
+            // spawns, best-effort cleanup, etc).
+            let value_node = node.child_by_field_name("value")?;
+            let value_text = value_node.utf8_text(content.as_bytes()).ok()?;
+            if is_intentional_let_underscore_discard(value_text) {
                 return None;
             }
             let start = (node.start_position().row as u32) + 1;
@@ -1773,6 +1865,92 @@ mod tests {
         assert!(
             fixes.iter().any(|f| f.reason.contains("let _")),
             "should flag `let _` in production code"
+        );
+    }
+
+    // ── let _ context-aware filter (intentional discards) ─────────
+
+    #[test]
+    fn skips_let_underscore_lazy_pattern_warmup() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "fn warmup() {\n    let _ = my_pattern();\n    let _ = url_regex();\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes.iter().any(|f| f.reason.contains("let _")),
+            "should not flag *_pattern() / *_regex() lazy-static warmup; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn skips_let_underscore_thread_spawn() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "fn f() {\n    let _ = thread::spawn(move || { run(); });\n    let _ = tokio::spawn(async {});\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes.iter().any(|f| f.reason.contains("let _")),
+            "should not flag fire-and-forget spawns; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn skips_let_underscore_best_effort_cleanup() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "fn f() {\n    let _ = fs::remove_file(&p);\n    let _ = std::io::Write::flush(&mut out);\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes.iter().any(|f| f.reason.contains("let _")),
+            "should not flag best-effort cleanup; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn skips_let_underscore_lock_acquisition() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "fn f() {\n    let _ = mutex.lock();\n    let _ = rw.read().unwrap();\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes.iter().any(|f| f.reason.contains("let _")),
+            "should not flag lock-guard acquisition; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn skips_let_underscore_bare_identifier_drop() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "fn f() {\n    let outcome = compute();\n    let _ = outcome;\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes.iter().any(|f| f.reason.contains("let _")),
+            "should not flag explicit drop of bare identifier; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn still_flags_genuine_silent_result_drop() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "fn f() {\n    let _ = file.write_all(buf);\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes.iter().any(|f| f.reason.contains("let _")),
+            "should still flag genuine silent Result drop; got {:?}",
+            fixes
         );
     }
 

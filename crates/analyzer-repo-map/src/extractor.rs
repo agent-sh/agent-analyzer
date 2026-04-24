@@ -66,6 +66,7 @@ pub fn extract_symbols(repo_path: &Path) -> Result<SymbolData> {
 
     let mut import_graph: HashMap<String, Vec<String>> = HashMap::new();
     for (path, syms) in &symbols_map {
+        let lang = detect_language(path);
         let mut imports: Vec<String> = Vec::with_capacity(syms.imports.len());
         for imp in &syms.imports {
             // Resolve `mod foo;` declarations to actual sibling files
@@ -81,6 +82,29 @@ pub fn extract_symbols(repo_path: &Path) -> Result<SymbolData> {
                 // Could not resolve — drop the synthetic edge rather
                 // than carry the sentinel through to consumers.
                 continue;
+            }
+            // TS/JS relative imports: `./foo`, `../utils/helper`, etc.
+            // Try every reasonable extension and `index.*` fallback.
+            // Bare imports (`react`, `lodash`) stay textual since they're
+            // third-party and won't match a repo file.
+            if matches!(
+                lang,
+                Some(Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx)
+            ) && (imp.from.starts_with("./") || imp.from.starts_with("../"))
+            {
+                if let Some(resolved) = resolve_ts_js_relative(path, &imp.from, &known_paths) {
+                    imports.push(resolved);
+                    continue;
+                }
+            }
+            // Python relative imports: `.foo`, `..pkg.foo`, plus absolute
+            // `pkg.module` style. Try resolving against known files;
+            // if no match, keep the textual form.
+            if matches!(lang, Some(Language::Python)) {
+                if let Some(resolved) = resolve_python_import(path, &imp.from, &known_paths) {
+                    imports.push(resolved);
+                    continue;
+                }
             }
             imports.push(imp.from.clone());
         }
@@ -148,6 +172,151 @@ fn resolve_rust_mod_decl(
     candidates.push(format!("{sibling_prefix}{mod_name}/mod.rs"));
 
     candidates.into_iter().find(|c| known_paths.contains(c))
+}
+
+/// Resolve a TS/JS relative import like `./foo` or `../utils/helper`
+/// to an actual repo file. Tries every common extension plus the
+/// `index.*` fallback for directory imports. Returns `None` when no
+/// candidate matches a known file.
+///
+/// Resolution order (per the Node module algorithm):
+///
+///   1. `<resolved>.{ts, tsx, js, jsx, mjs, cjs}` — exact file
+///   2. `<resolved>/index.{ts, tsx, js, jsx, mjs, cjs}` — dir index
+fn resolve_ts_js_relative(
+    importer_path: &str,
+    import_from: &str,
+    known_paths: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let importer_dir = match importer_path.rsplit_once('/') {
+        Some((d, _)) => d,
+        None => "",
+    };
+    let combined = if importer_dir.is_empty() {
+        import_from.to_string()
+    } else {
+        format!("{importer_dir}/{import_from}")
+    };
+    let normalized = normalize_path(&combined);
+    const EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
+    for ext in EXTS {
+        let candidate = format!("{normalized}.{ext}");
+        if known_paths.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    for ext in EXTS {
+        let candidate = format!("{normalized}/index.{ext}");
+        if known_paths.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Resolve a Python import (`from .foo import bar`, `from ..pkg.x
+/// import y`, or absolute `from pkg.module import name`) to a file
+/// path. Handles both `<name>.py` files and `<name>/__init__.py`
+/// package directories.
+///
+/// Relative imports are scoped against the importer's directory
+/// (with `.` going up one level per leading dot). Absolute imports
+/// fall back to scanning the known-paths set for any file whose
+/// trailing path components match — covers `pkg.module` regardless
+/// of whether `pkg` is a directory at the repo root or nested under
+/// `src/`. Returns `None` when nothing matches.
+fn resolve_python_import(
+    importer_path: &str,
+    import_from: &str,
+    known_paths: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let importer_dir = match importer_path.rsplit_once('/') {
+        Some((d, _)) => d.to_string(),
+        None => String::new(),
+    };
+
+    // Relative imports: count leading dots, walk up that many dirs.
+    let leading_dots = import_from.chars().take_while(|c| *c == '.').count();
+    if leading_dots > 0 {
+        let rest = &import_from[leading_dots..];
+        let rest_parts: Vec<&str> = rest.split('.').filter(|s| !s.is_empty()).collect();
+        let mut base = importer_dir.clone();
+        for _ in 0..leading_dots.saturating_sub(1) {
+            base = match base.rsplit_once('/') {
+                Some((parent, _)) => parent.to_string(),
+                None => String::new(),
+            };
+        }
+        let nested = if rest_parts.is_empty() {
+            base.clone()
+        } else if base.is_empty() {
+            rest_parts.join("/")
+        } else {
+            format!("{base}/{}", rest_parts.join("/"))
+        };
+        let candidates = [format!("{nested}.py"), format!("{nested}/__init__.py")];
+        for c in candidates {
+            if known_paths.contains(&c) {
+                return Some(c);
+            }
+        }
+        return None;
+    }
+
+    // Absolute import: `pkg.module.x` → look for any known file ending
+    // with `pkg/module/x.py` or `pkg/module/x/__init__.py`. Skips
+    // standard-library names (single component, no dot) since those
+    // won't be repo files anyway.
+    if !import_from.contains('.') {
+        // Single-component name might be a stdlib module OR a top-level
+        // repo module — check both directly under the importer's dir
+        // and at the repo root.
+        let suffixes = [
+            format!("{import_from}.py"),
+            format!("{import_from}/__init__.py"),
+        ];
+        for s in suffixes {
+            if known_paths.contains(&s) {
+                return Some(s);
+            }
+            if !importer_dir.is_empty() {
+                let scoped = format!("{importer_dir}/{s}");
+                if known_paths.contains(&scoped) {
+                    return Some(scoped);
+                }
+            }
+        }
+        return None;
+    }
+
+    let parts = import_from.replace('.', "/");
+    let suffixes = [format!("{parts}.py"), format!("{parts}/__init__.py")];
+    for suf in &suffixes {
+        for known in known_paths {
+            if known == suf || known.ends_with(&format!("/{suf}")) {
+                return Some(known.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Normalize a path by collapsing `.` and `..` segments. Pure string
+/// operation — doesn't touch the filesystem. Used by the TS/JS and
+/// Python resolvers when joining a relative import against the
+/// importer's directory.
+fn normalize_path(p: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    stack.join("/")
 }
 
 /// Extract symbols from a single file's source code.
@@ -1504,19 +1673,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
-    fn dump_mod_decl_ast() {
-        use tree_sitter::Parser;
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        let src = "pub mod foo;\nmod bar;\n#[cfg(test)]\nmod tests { fn x() {} }\n";
-        let tree = parser.parse(src, None).unwrap();
-        println!("AST: {}", tree.root_node().to_sexp());
-    }
-
-    #[test]
     fn test_rust_use() {
         let source = b"use std::collections::HashMap;";
         let syms = extract_file_symbols(source, Language::Rust).unwrap();
@@ -1617,6 +1773,100 @@ mod tests {
         known.insert("crates/x/src/builder.rs".to_string());
         let r = resolve_rust_mod_decl("crates/x/src/config.rs", "builder", &known);
         assert_eq!(r.as_deref(), Some("crates/x/src/builder.rs"));
+    }
+
+    // ── TS/JS relative import resolver ───────────
+
+    #[test]
+    fn resolve_ts_js_dot_slash_finds_sibling_ts() {
+        let mut known = std::collections::HashSet::new();
+        known.insert("editors/vscode/src/foo.ts".to_string());
+        let r = resolve_ts_js_relative("editors/vscode/src/main.ts", "./foo", &known);
+        assert_eq!(r.as_deref(), Some("editors/vscode/src/foo.ts"));
+    }
+
+    #[test]
+    fn resolve_ts_js_dot_dot_walks_up() {
+        let mut known = std::collections::HashSet::new();
+        known.insert("editors/vscode/src/util/helper.ts".to_string());
+        let r = resolve_ts_js_relative(
+            "editors/vscode/src/feature/index.ts",
+            "../util/helper",
+            &known,
+        );
+        assert_eq!(r.as_deref(), Some("editors/vscode/src/util/helper.ts"));
+    }
+
+    #[test]
+    fn resolve_ts_js_falls_back_to_index() {
+        let mut known = std::collections::HashSet::new();
+        known.insert("src/util/index.ts".to_string());
+        let r = resolve_ts_js_relative("src/main.ts", "./util", &known);
+        assert_eq!(r.as_deref(), Some("src/util/index.ts"));
+    }
+
+    #[test]
+    fn resolve_ts_js_prefers_ts_over_js() {
+        let mut known = std::collections::HashSet::new();
+        known.insert("src/foo.ts".to_string());
+        known.insert("src/foo.js".to_string());
+        let r = resolve_ts_js_relative("src/main.ts", "./foo", &known);
+        assert_eq!(r.as_deref(), Some("src/foo.ts"));
+    }
+
+    #[test]
+    fn resolve_ts_js_returns_none_for_unknown() {
+        let known = std::collections::HashSet::new();
+        let r = resolve_ts_js_relative("src/main.ts", "./ghost", &known);
+        assert!(r.is_none());
+    }
+
+    // ── Python import resolver ───────────
+
+    #[test]
+    fn resolve_python_relative_dot_imports_sibling() {
+        let mut known = std::collections::HashSet::new();
+        known.insert("scripts/utils.py".to_string());
+        let r = resolve_python_import("scripts/main.py", ".utils", &known);
+        assert_eq!(r.as_deref(), Some("scripts/utils.py"));
+    }
+
+    #[test]
+    fn resolve_python_relative_double_dot_walks_up() {
+        let mut known = std::collections::HashSet::new();
+        known.insert("pkg/util/helper.py".to_string());
+        let r = resolve_python_import("pkg/feature/main.py", "..util.helper", &known);
+        assert_eq!(r.as_deref(), Some("pkg/util/helper.py"));
+    }
+
+    #[test]
+    fn resolve_python_dotted_module_finds_nested() {
+        let mut known = std::collections::HashSet::new();
+        known.insert("scripts/lib/foo.py".to_string());
+        let r = resolve_python_import("scripts/main.py", "lib.foo", &known);
+        assert_eq!(r.as_deref(), Some("scripts/lib/foo.py"));
+    }
+
+    #[test]
+    fn resolve_python_falls_back_to_init() {
+        let mut known = std::collections::HashSet::new();
+        known.insert("pkg/sub/__init__.py".to_string());
+        let r = resolve_python_import("pkg/main.py", ".sub", &known);
+        assert_eq!(r.as_deref(), Some("pkg/sub/__init__.py"));
+    }
+
+    #[test]
+    fn resolve_python_returns_none_for_stdlib_name() {
+        let known = std::collections::HashSet::new();
+        let r = resolve_python_import("scripts/main.py", "os", &known);
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn normalize_path_collapses_dot_dot() {
+        assert_eq!(normalize_path("a/b/../c"), "a/c");
+        assert_eq!(normalize_path("./a/./b"), "a/b");
+        assert_eq!(normalize_path("a/b/c/../../d"), "a/d");
     }
 
     #[test]
