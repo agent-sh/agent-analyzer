@@ -241,6 +241,8 @@ mod tests {
             project: None,
             doc_refs: None,
             graph: None,
+            file_descriptors: None,
+            summary: None,
         };
 
         for (path, changes) in files {

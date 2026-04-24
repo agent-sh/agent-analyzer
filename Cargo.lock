@@ -30,9 +30,11 @@ dependencies = [
  "analyzer-repo-map",
  "analyzer-sync-check",
  "anyhow",
+ "chrono",
  "clap",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
