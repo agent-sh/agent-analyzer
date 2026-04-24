@@ -84,7 +84,7 @@ pub struct SlopFixesResult {
 /// project metadata, etc).
 ///
 /// Findings are filtered against per-line suppression comments
-/// (`// agnix-ignore: <category>` or `# agnix-ignore: <category>`)
+/// (`// agentsys-ignore: <category>` or `# agentsys-ignore: <category>`)
 /// before being returned — see [`apply_suppressions`].
 pub fn slop_fixes(repo_root: &Path, map: &RepoIntelData) -> SlopFixesResult {
     let mut fixes = Vec::new();
@@ -100,16 +100,16 @@ pub fn slop_fixes(repo_root: &Path, map: &RepoIntelData) -> SlopFixesResult {
 }
 
 /// Drop fixes whose target line is annotated with an
-/// `agnix-ignore: <category>` comment on the same line or the line
+/// `agentsys-ignore: <category>` comment on the same line or the line
 /// immediately above. Comment forms recognized:
 ///
-///   - `// agnix-ignore: orphan-export`           (Rust / TS / JS / Java / Go / C)
-///   - `# agnix-ignore: empty-catch`              (Python / Shell / TOML)
-///   - `// agnix-ignore: tracked-artifact, orphan-export`  (comma-separated list)
-///   - `// agnix-ignore-all`                      (suppresses every category)
+///   - `// agentsys-ignore: orphan-export`           (Rust / TS / JS / Java / Go / C)
+///   - `# agentsys-ignore: empty-catch`              (Python / Shell / TOML)
+///   - `// agentsys-ignore: tracked-artifact, orphan-export`  (comma-separated list)
+///   - `// agentsys-ignore-all`                      (suppresses every category)
 ///
 /// File-deletion fixes (`tracked-artifact`, `stale-ci-config`,
-/// `duplicate-tooling`) are suppressible by an `agnix-ignore` comment
+/// `duplicate-tooling`) are suppressible by an `agentsys-ignore` comment
 /// in the file's first 5 lines (file-header convention).
 ///
 /// Per-line fixes (`orphan-export`, `empty-catch`, `tautological-test`)
@@ -149,16 +149,16 @@ fn fix_target_path(fix: &SlopFix) -> Option<&str> {
     }
 }
 
-/// Per-file suppression index: `agnix-ignore` comments parsed once
+/// Per-file suppression index: `agentsys-ignore` comments parsed once
 /// per file and reused across every fix targeting that file.
 struct FileSuppressions {
     /// Header suppressions (lines 1-5) apply to file-level actions.
     header_categories: std::collections::HashSet<String>,
     /// Per-line suppressions: line N suppresses fixes on N or N+1.
     line_categories: std::collections::HashMap<u32, std::collections::HashSet<String>>,
-    /// `agnix-ignore-all` line numbers — suppress every category.
+    /// `agentsys-ignore-all` line numbers — suppress every category.
     line_all: std::collections::HashSet<u32>,
-    /// Header-scope `agnix-ignore-all` flag — suppresses every category
+    /// Header-scope `agentsys-ignore-all` flag — suppresses every category
     /// for any fix targeting this file.
     header_all: bool,
 }
@@ -192,14 +192,14 @@ impl FileSuppressions {
             };
             let directive = directive.trim();
 
-            if directive == "agnix-ignore-all" || directive.starts_with("agnix-ignore-all ") {
+            if directive == "agentsys-ignore-all" || directive.starts_with("agentsys-ignore-all ") {
                 if in_header {
                     s.header_all = true;
                 }
                 s.line_all.insert(line_no);
                 continue;
             }
-            if let Some(rest) = directive.strip_prefix("agnix-ignore:") {
+            if let Some(rest) = directive.strip_prefix("agentsys-ignore:") {
                 let cats = rest
                     .split(',')
                     .map(|c| c.trim().to_string())
@@ -2229,7 +2229,7 @@ mod tests {
         );
     }
 
-    // ── agnix-ignore suppression directives ─────
+    // ── agentsys-ignore suppression directives ─────
 
     fn empty_map() -> RepoIntelData {
         use chrono::Utc;
@@ -2281,7 +2281,7 @@ mod tests {
     fn suppression_on_same_line_skips_fix() {
         let dir = make_repo(&[(
             "a.ts",
-            "function f() {\n    try { call() } catch {} // agnix-ignore: empty-catch\n}\n",
+            "function f() {\n    try { call() } catch {} // agentsys-ignore: empty-catch\n}\n",
         )]);
         let map = empty_map();
         let result = slop_fixes(dir.path(), &map);
@@ -2299,7 +2299,7 @@ mod tests {
     fn suppression_on_line_above_skips_fix() {
         let dir = make_repo(&[(
             "a.ts",
-            "function f() {\n    // agnix-ignore: empty-catch\n    try { call() } catch {}\n}\n",
+            "function f() {\n    // agentsys-ignore: empty-catch\n    try { call() } catch {}\n}\n",
         )]);
         let map = empty_map();
         let result = slop_fixes(dir.path(), &map);
@@ -2317,7 +2317,7 @@ mod tests {
     fn suppression_python_uses_hash_marker() {
         let dir = make_repo(&[(
             "a.py",
-            "def f():\n    # agnix-ignore: empty-catch\n    try:\n        x = 1\n    except:\n        pass\n",
+            "def f():\n    # agentsys-ignore: empty-catch\n    try:\n        x = 1\n    except:\n        pass\n",
         )]);
         let map = empty_map();
         let result = slop_fixes(dir.path(), &map);
@@ -2337,7 +2337,7 @@ mod tests {
     fn suppression_python_directly_above_works() {
         let dir = make_repo(&[(
             "a.py",
-            "def f():\n    try:\n        x = 1\n    # agnix-ignore: empty-catch\n    except:\n        pass\n",
+            "def f():\n    try:\n        x = 1\n    # agentsys-ignore: empty-catch\n    except:\n        pass\n",
         )]);
         let map = empty_map();
         let result = slop_fixes(dir.path(), &map);
@@ -2356,7 +2356,7 @@ mod tests {
         // Directive names a different category — fix must still fire.
         let dir = make_repo(&[(
             "a.ts",
-            "// agnix-ignore: orphan-export\nfunction f() { try {} catch {} }\n",
+            "// agentsys-ignore: orphan-export\nfunction f() { try {} catch {} }\n",
         )]);
         let map = empty_map();
         let result = slop_fixes(dir.path(), &map);
@@ -2374,7 +2374,7 @@ mod tests {
     fn suppression_comma_list_covers_multiple_categories() {
         let dir = make_repo(&[(
             "a.ts",
-            "function f() {\n    // agnix-ignore: empty-catch, tautological-test\n    try {} catch {}\n}\n",
+            "function f() {\n    // agentsys-ignore: empty-catch, tautological-test\n    try {} catch {}\n}\n",
         )]);
         let map = empty_map();
         let result = slop_fixes(dir.path(), &map);
@@ -2392,7 +2392,7 @@ mod tests {
     fn suppression_ignore_all_directive_skips_any_category() {
         let dir = make_repo(&[(
             "a.ts",
-            "function f() {\n    // agnix-ignore-all\n    try {} catch {}\n}\n",
+            "function f() {\n    // agentsys-ignore-all\n    try {} catch {}\n}\n",
         )]);
         let map = empty_map();
         let result = slop_fixes(dir.path(), &map);
@@ -2401,7 +2401,7 @@ mod tests {
                 .fixes
                 .iter()
                 .any(|f| f.category == SlopCategory::EmptyCatch),
-            "agnix-ignore-all should suppress empty-catch; got {:?}",
+            "agentsys-ignore-all should suppress empty-catch; got {:?}",
             result.fixes
         );
     }
@@ -2409,10 +2409,10 @@ mod tests {
     #[test]
     fn suppression_header_directive_skips_file_deletion() {
         // File-deletion fixes (tracked-artifact) are suppressible by an
-        // agnix-ignore directive in the file's first 5 lines.
+        // agentsys-ignore directive in the file's first 5 lines.
         let dir = make_repo(&[(
             "debug.log",
-            "// agnix-ignore: tracked-artifact\nthese are intentional log fixtures\n",
+            "// agentsys-ignore: tracked-artifact\nthese are intentional log fixtures\n",
         )]);
         let result = slop_fixes(dir.path(), &empty_map());
         assert!(
