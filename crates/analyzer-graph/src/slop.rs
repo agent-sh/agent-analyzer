@@ -290,6 +290,18 @@ fn orphan_exports(map: &RepoIntelData) -> Vec<SlopFix> {
         }
     }
 
+    // External entry points: Cargo bins/tests/benches/examples,
+    // npm bin/scripts, framework configs (Docusaurus, Next.js, …),
+    // Python __main__.py. Files referenced this way look orphan to
+    // the import graph but are absolutely used. The artifact carries
+    // a precomputed list (Phase 3.5 of init); old artifacts that
+    // pre-date this field fall back to the per-path heuristic below.
+    let entry_point_paths: HashSet<&str> = map
+        .entry_points
+        .as_deref()
+        .map(|eps| eps.iter().map(|e| e.path.as_str()).collect())
+        .unwrap_or_default();
+
     let mut out = Vec::new();
     for (file_path, file_symbols) in symbols {
         // A file with zero importers and at least one export is a
@@ -313,9 +325,11 @@ fn orphan_exports(map: &RepoIntelData) -> Vec<SlopFix> {
         if file_symbols.exports.is_empty() {
             continue;
         }
-        // Skip entry-point-ish files heuristically: paths matching
-        // `main.rs`, `index.{ts,js}`, `__main__.py`, `cmd/.../main.go`.
-        if looks_like_entry_point(file_path) {
+        // Skip files registered as entry points by Cargo manifests,
+        // package.json bin/scripts, pyproject scripts, framework
+        // configs, or AST-detected `main` functions. Falls back to a
+        // path heuristic when the artifact pre-dates the cached list.
+        if entry_point_paths.contains(file_path.as_str()) || looks_like_entry_point(file_path) {
             continue;
         }
 
@@ -2032,6 +2046,7 @@ mod tests {
             file_descriptors: None,
             summary: None,
             embeddings_meta: None,
+            entry_points: None,
         };
         // Need a non-empty import_graph so the orphan check actually
         // runs (otherwise the function returns early).
