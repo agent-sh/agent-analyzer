@@ -40,7 +40,21 @@ tree-sitter-java.workspace = true
 sha2 = "0.10"
 half = "2"
 streaming-iterator = "0.1"
-fastembed = "5"
+# Use `ort-load-dynamic` instead of the default `ort-download-binaries`
+# so the build does not depend on pyke's CDN at compile time. The
+# CDN goes down occasionally (sustained 504s during this PR's CI),
+# which would otherwise fail every PR build until pyke recovers.
+#
+# Runtime trade-off: the embed binary expects ONNX Runtime to be
+# loadable at runtime via `ORT_DYLIB_PATH` or a system-default
+# location. The JS wrapper (`lib/embed/binary.js` in the repo-intel
+# plugin) downloads the lib alongside the binary on first use; users
+# running the binary directly need ONNX Runtime installed manually.
+fastembed = { version = "5", default-features = false, features = [
+    "ort-load-dynamic",
+    "hf-hub-native-tls",
+    "image-models",
+] }
 
 [dev-dependencies]
 tempfile = "3"
