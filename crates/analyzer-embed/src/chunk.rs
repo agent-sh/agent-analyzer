@@ -161,13 +161,18 @@ const RUST_QUERY: &str = r#"
 ]
 "#;
 
+// TS/JS — the bare declaration patterns match inside `export_statement`
+// nodes too (tree-sitter patterns match at any depth), so we explicitly
+// do NOT include `(export_statement (function_declaration …))` patterns.
+// Doing so would produce two overlapping chunks per exported declaration
+// (one for the export_statement, one for the inner declaration) and
+// roughly double embedding cost on TS/JS codebases where most
+// declarations are exported.
 const TS_QUERY: &str = r#"
 [
   (function_declaration name: (identifier) @name) @decl
   (class_declaration name: (type_identifier) @name) @decl
   (interface_declaration name: (type_identifier) @name) @decl
-  (export_statement (function_declaration name: (identifier) @name)) @decl
-  (export_statement (class_declaration name: (type_identifier) @name)) @decl
   (lexical_declaration
     (variable_declarator
       name: (identifier) @name
@@ -179,8 +184,6 @@ const JS_QUERY: &str = r#"
 [
   (function_declaration name: (identifier) @name) @decl
   (class_declaration name: (identifier) @name) @decl
-  (export_statement (function_declaration name: (identifier) @name)) @decl
-  (export_statement (class_declaration name: (identifier) @name)) @decl
   (lexical_declaration
     (variable_declarator
       name: (identifier) @name
@@ -257,11 +260,11 @@ fn extract_with_query(
             let start = node.start_position();
             let end = node.end_position();
             let text = content[node.byte_range()].to_string();
-            let kind = if name_text.as_deref().map(is_type_name).unwrap_or(false) {
-                ChunkKind::Type
-            } else {
-                ChunkKind::Function
-            };
+            // Classify by AST node kind, not name capitalization.
+            // Capitalization is misleading in Go (where ALL exported
+            // symbols start uppercase, including functions) and other
+            // languages where type vs. function isn't a casing cue.
+            let kind = chunk_kind_for_node(node.kind());
             chunks.push(Chunk {
                 kind,
                 name: name_text,
@@ -276,11 +279,35 @@ fn extract_with_query(
     chunks
 }
 
-fn is_type_name(name: &str) -> bool {
-    name.chars()
-        .next()
-        .map(|c| c.is_ascii_uppercase())
-        .unwrap_or(false)
+/// Map a tree-sitter node kind to our [`ChunkKind`]. Centralizes the
+/// per-language type-vs-function classification so adding a new
+/// language's queries is a one-line update here.
+///
+/// Anything not explicitly listed as a type definition falls through
+/// to [`ChunkKind::Function`] — that includes `function_item`,
+/// `function_declaration`, `function_definition`, `method_declaration`,
+/// `lexical_declaration` (`const foo = () => …`), and `mod_item`. The
+/// fallback is intentional: false-positives toward `Function` are less
+/// surprising than false-positives toward `Type`.
+fn chunk_kind_for_node(node_kind: &str) -> ChunkKind {
+    match node_kind {
+        // Rust
+        "struct_item"
+        | "enum_item"
+        | "trait_item"
+        | "impl_item"
+        // TS/JS
+        | "class_declaration"
+        | "interface_declaration"
+        // Python
+        | "class_definition"
+        // Go
+        | "type_declaration"
+        | "type_spec"
+        // Java
+        | "type_alias_declaration" => ChunkKind::Type,
+        _ => ChunkKind::Function,
+    }
 }
 
 fn extract_markdown_sections(content: &str) -> Vec<Chunk> {
@@ -428,5 +455,55 @@ mod tests {
         let chunks = chunk_file(&PathBuf::from("a.rs"), src, Granularity::PerFunction);
         assert_eq!(chunks[0].start_line, 2);
         assert_eq!(chunks[1].start_line, 3);
+    }
+
+    #[test]
+    fn go_exported_function_is_classified_as_function_not_type() {
+        // Go convention: ALL exported symbols start with uppercase. The
+        // old name-capitalization heuristic misclassified every exported
+        // function as a Type. Now uses the AST node kind.
+        let src =
+            "package x\n\nfunc HandleRequest() {}\n\nfunc helper() {}\n\ntype MyStruct struct {}\n";
+        let chunks = chunk_file(&PathBuf::from("svc.go"), src, Granularity::PerFunction);
+        let by_name: std::collections::HashMap<&str, ChunkKind> = chunks
+            .iter()
+            .filter_map(|c| c.name.as_deref().map(|n| (n, c.kind)))
+            .collect();
+        assert_eq!(
+            by_name.get("HandleRequest"),
+            Some(&ChunkKind::Function),
+            "exported Go function must be Function, not Type"
+        );
+        assert_eq!(by_name.get("helper"), Some(&ChunkKind::Function));
+        assert_eq!(
+            by_name.get("MyStruct"),
+            Some(&ChunkKind::Type),
+            "Go type declaration must be Type"
+        );
+    }
+
+    #[test]
+    fn ts_exported_function_yields_single_chunk_not_two() {
+        // The bare `function_declaration` pattern matches both
+        // `function foo() {}` AND the inner node of
+        // `export function foo() {}` because tree-sitter patterns
+        // match at any depth. Removing the wrapped pattern variant
+        // means each exported function produces exactly one chunk.
+        let src = "export function foo() { return 1; }\nfunction bar() { return 2; }\n";
+        let chunks = chunk_file(&PathBuf::from("a.ts"), src, Granularity::PerFunction);
+        let foo_count = chunks
+            .iter()
+            .filter(|c| c.name.as_deref() == Some("foo"))
+            .count();
+        let bar_count = chunks
+            .iter()
+            .filter(|c| c.name.as_deref() == Some("bar"))
+            .count();
+        assert_eq!(
+            foo_count, 1,
+            "exported `foo` should yield 1 chunk, not 2; chunks: {:?}",
+            chunks
+        );
+        assert_eq!(bar_count, 1);
     }
 }
