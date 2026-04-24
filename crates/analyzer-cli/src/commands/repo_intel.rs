@@ -389,6 +389,21 @@ pub enum QueryAction {
         #[arg(long)]
         map_file: PathBuf,
     },
+    /// Ranked targets for the deslop agent's Sonnet- and Opus-tier
+    /// scans. Sonnet tier = file-level (defensive cargo cult, bot
+    /// authored, could-be-shorter, etc); Opus tier = cross-file
+    /// (wrapper towers, single-impl traits, cliché clusters,
+    /// high-bug communities).
+    SlopTargets {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file
+        #[arg(long)]
+        map_file: PathBuf,
+        /// Max rows per tier
+        #[arg(long, default_value = "10")]
+        top: usize,
+    },
 }
 
 pub fn run(action: RepoIntelAction) -> Result<()> {
@@ -970,6 +985,15 @@ fn run_query(query: QueryAction) -> Result<()> {
         QueryAction::SlopFixes { path, map_file } => {
             let map = load_map(&map_file)?;
             let result = analyzer_graph::slop::slop_fixes(&path, &map);
+            println!("{}", output::to_json(&result));
+        }
+        QueryAction::SlopTargets {
+            path: _,
+            map_file,
+            top,
+        } => {
+            let map = load_map(&map_file)?;
+            let result = analyzer_graph::slop_targets::slop_targets(&map, top);
             println!("{}", output::to_json(&result));
         }
         QueryAction::Summary {
