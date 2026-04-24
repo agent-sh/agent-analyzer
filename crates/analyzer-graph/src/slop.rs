@@ -1452,16 +1452,17 @@ fn passthrough_wrappers_rust(content: &str, rel: &str) -> Vec<SlopFix> {
                 // valid candidates — proceed.
             }
             // Generic functions are often pragmatic wrappers
-            // providing concrete types — skip by checking for `<`
-            // before the param list opening `(`.
-            let func_text = func_node.utf8_text(content.as_bytes()).ok()?;
-            let header = func_text.split('{').next().unwrap_or("");
-            if header.contains('<') && header.contains('>') {
+            // providing concrete types over a more general API. Use
+            // tree-sitter's `type_parameters` field rather than text
+            // scanning for `<` so that ordinary return types like
+            // `Vec<Item>` or `Result<T, E>` don't trigger the skip.
+            if func_node.child_by_field_name("type_parameters").is_some() {
                 return None;
             }
-            // Trait method impls — the parent of an impl_item's
-            // function is the impl block. Skip if the impl is for a
-            // trait (`impl Trait for Type`).
+            // Trait method impls — skip if the enclosing impl is a
+            // trait impl. Uses the AST `trait` field (set on
+            // `impl Trait for Type`, absent on bare `impl Type`)
+            // rather than substring-matching " for " in the header.
             if rust_function_is_trait_impl(&func_node, content.as_bytes()) {
                 return None;
             }
@@ -1539,16 +1540,17 @@ fn rust_param_names(params: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     out
 }
 
-fn rust_function_is_trait_impl(func: &tree_sitter::Node, source: &[u8]) -> bool {
+fn rust_function_is_trait_impl(func: &tree_sitter::Node, _source: &[u8]) -> bool {
     let mut cursor = func.parent();
     while let Some(node) = cursor {
         if node.kind() == "impl_item" {
-            // Trait impl has both `trait` and `type` fields; bare
-            // impl has only `type`. Use the textual form to detect:
-            // `impl ... for ...` is a trait impl.
-            let txt = node.utf8_text(source).unwrap_or("");
-            let header = txt.split('{').next().unwrap_or("");
-            return header.contains(" for ");
+            // tree-sitter-rust sets the `trait` field only on trait
+            // impls (`impl Trait for Type`); inherent impls
+            // (`impl Type`) have no such field. Using the AST field
+            // is more robust than substring-matching " for " in the
+            // header (e.g. generic bounds like `for<'a>` would
+            // false-positive that approach).
+            return node.child_by_field_name("trait").is_some();
         }
         cursor = node.parent();
     }
@@ -1577,18 +1579,12 @@ fn rust_body_single_call(body: tree_sitter::Node) -> Option<tree_sitter::Node> {
             _ => None,
         }
     }
-    match child.kind() {
-        "call_expression" => Some(child),
-        "return_expression" => {
-            let inner = child.named_child(0)?;
-            (inner.kind() == "call_expression").then_some(inner)
-        }
-        "expression_statement" => {
-            let inner = child.named_child(0)?;
-            unwrap_return_or_call(inner)
-        }
-        _ => None,
-    }
+    let target = if child.kind() == "expression_statement" {
+        child.named_child(0)?
+    } else {
+        child
+    };
+    unwrap_return_or_call(target)
 }
 
 fn passthrough_wrappers_ts_js(
@@ -1650,17 +1646,15 @@ fn passthrough_wrappers_ts_js(
         let (Some(decl), Some(params), Some(body)) = (decl, params, body) else {
             continue;
         };
-        // Skip generics (TS): `function f<T>(x: T) { … }` is often
-        // a pragmatic wrapper providing a concrete type.
-        let header = decl
-            .utf8_text(content.as_bytes())
-            .ok()
-            .and_then(|t| t.split('{').next().or_else(|| t.split("=>").next()))
-            .unwrap_or("");
-        if header.contains('<') && header.contains('>') && !header.contains("<=") {
-            // Crude check — `<` in identifier-ish position. Skips
-            // common TS generic syntax. A more robust version would
-            // check the AST for type_parameters; this is good enough.
+        // Skip TS generics like `function f<T>(x: T) { … }` —
+        // pragmatic wrappers providing a concrete type. Use the AST
+        // `type_parameters` field rather than text scanning so we
+        // don't false-positive on return types like `Array<string>`
+        // or arrow function bodies that contain `<` (the previous
+        // header-text approach was broken for arrow expression
+        // bodies because `split('{')` returned the entire decl
+        // including the body for those).
+        if decl.child_by_field_name("type_parameters").is_some() {
             continue;
         }
 
@@ -1877,11 +1871,16 @@ fn passthrough_wrappers_go(content: &str, rel: &str) -> Vec<SlopFix> {
             parameters: (parameter_list) @params
             body: (block) @body) @decl"#,
     ));
+    // Method declaration: also capture the receiver so we can
+    // distinguish "method delegating to self" (encapsulation, skip)
+    // from "method delegating to argument or another package"
+    // (passthrough, flag).
     out.extend(go_passthrough(
         content,
         rel,
         &language,
         r#"(method_declaration
+            receiver: (parameter_list (parameter_declaration name: (identifier) @receiver))
             name: (field_identifier) @name
             parameters: (parameter_list) @params
             body: (block) @body) @decl"#,
@@ -1913,6 +1912,7 @@ fn go_passthrough(
     let name_idx = query.capture_index_for_name("name");
     let params_idx = query.capture_index_for_name("params");
     let body_idx = query.capture_index_for_name("body");
+    let receiver_idx = query.capture_index_for_name("receiver");
 
     let mut out = Vec::new();
     while let Some(m) = matches.next() {
@@ -1920,6 +1920,7 @@ fn go_passthrough(
         let mut name_node = None;
         let mut params = None;
         let mut body = None;
+        let mut receiver_text: Option<String> = None;
         for cap in m.captures {
             if Some(cap.index) == decl_idx {
                 decl = Some(cap.node);
@@ -1929,6 +1930,12 @@ fn go_passthrough(
                 params = Some(cap.node);
             } else if Some(cap.index) == body_idx {
                 body = Some(cap.node);
+            } else if Some(cap.index) == receiver_idx {
+                receiver_text = cap
+                    .node
+                    .utf8_text(content.as_bytes())
+                    .ok()
+                    .map(str::to_string);
             }
         }
         let (Some(decl), Some(name_node), Some(params), Some(body)) =
@@ -1978,12 +1985,15 @@ fn go_passthrough(
             .child_by_field_name("function")
             .and_then(|f| f.utf8_text(content.as_bytes()).ok())
             .unwrap_or("");
-        // Method delegation `(receiver) Foo() { return r.Foo() }` is
-        // intentional and shouldn't be flagged.
-        if callee.contains('.') {
-            let head = callee.split('.').next().unwrap_or("");
-            if head.len() <= 2 || head.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
-                // Receiver-style: lowercase short name like `r` or `c`.
+        // Method delegation `(r *Receiver) Foo() { return r.Foo() }`
+        // is intentional encapsulation, not slop. We capture the
+        // receiver name from the AST and only skip when the call's
+        // object exactly matches it. This correctly flags genuine
+        // passthroughs to argument methods (`func P(c *Client) {
+        // c.Process() }`) and stdlib calls (`os.Open`, `fmt.Println`).
+        if let Some(recv) = receiver_text.as_deref() {
+            let object = callee.split('.').next().unwrap_or("");
+            if object == recv {
                 continue;
             }
         }
