@@ -59,6 +59,47 @@ pub enum SlopCategory {
     OrphanExport,
     EmptyCatch,
     TautologicalTest,
+    /// A condition that always evaluates to the same value: `if true`,
+    /// `if false`, `if 1 == 1`, `if x != null && x == null`. Either
+    /// the branch is dead code or the surrounding logic is wrong.
+    AlwaysTrueCondition,
+}
+
+/// Confidence in a fix, on a 0.0-1.0 scale.
+///
+/// - **0.95+** — safe for direct apply by a Haiku-tier agent. Shape
+///   is mechanical and the action is unambiguous.
+/// - **0.80-0.95** — apply with shape-confirm. Detector is sure but
+///   the fix may need a human-readable comment added.
+/// - **0.60-0.80** — human review recommended. Detector is right
+///   often but not always (e.g. orphan-export when import graph is
+///   incomplete for a language).
+/// - **< 0.60** — flagged only; do not auto-apply.
+///
+/// Consumers can filter by threshold:
+///
+/// ```ignore
+/// let safe = result.fixes.iter().filter(|f| f.confidence >= 0.95);
+/// ```
+pub type Confidence = f32;
+
+/// Default confidence for each category. Detectors override this
+/// when they have additional context (e.g. orphan-export drops to
+/// 0.7 when the import graph completeness is uncertain). Centralized
+/// so consumers see a consistent default per category.
+pub fn default_confidence(category: SlopCategory) -> Confidence {
+    match category {
+        // Mechanical, no judgment needed
+        SlopCategory::TrackedArtifact => 0.97,
+        SlopCategory::EmptyCatch => 0.95,
+        SlopCategory::TautologicalTest => 0.95,
+        SlopCategory::AlwaysTrueCondition => 0.92,
+        // Pre-located but pattern-suggested rather than dead-certain
+        SlopCategory::StaleCiConfig => 0.90,
+        SlopCategory::DuplicateTooling => 0.85,
+        // Sensitive to import-graph completeness; recommend review
+        SlopCategory::OrphanExport => 0.75,
+    }
 }
 
 /// One finding from the `slop-fixes` query.
@@ -69,12 +110,63 @@ pub struct SlopFix {
     pub action: SlopAction,
     pub category: SlopCategory,
     pub reason: String,
+    /// 0.0-1.0 confidence. See [`default_confidence`] for the typical
+    /// value per category. Defaults to category default when omitted
+    /// from input JSON, so older consumers reading new artifacts
+    /// don't need to deal with `Option<f32>`.
+    #[serde(default = "default_confidence_full")]
+    pub confidence: Confidence,
+}
+
+fn default_confidence_full() -> Confidence {
+    // Used by serde when deserializing artifacts that pre-date the
+    // confidence field. The category-aware default isn't reachable
+    // here (we'd need access to the surrounding struct) so we return
+    // a conservative middle value. Real per-category defaults come
+    // from the in-process detectors via [`default_confidence`].
+    0.80
 }
 
 /// Aggregate output piped to the deslop agent.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SlopFixesResult {
     pub fixes: Vec<SlopFix>,
+    /// Convenience grouping: same `fixes` content, partitioned by
+    /// target file path. Lets consumers apply edits in batch per
+    /// file (one open/edit/save cycle for N fixes against the same
+    /// file) rather than re-opening the file once per fix.
+    /// Populated by [`group_by_file`]; an alphabetically-sorted
+    /// `Vec<FileFixes>` keeps output deterministic and diffable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_file: Vec<FileFixes>,
+}
+
+/// All fixes targeting one source file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileFixes {
+    pub path: String,
+    pub fixes: Vec<SlopFix>,
+}
+
+/// Group flat fixes by their target path, sorted alphabetically by
+/// path. File-level deletions (`tracked-artifact`) and per-line
+/// fixes share the same group when they hit the same file.
+pub fn group_by_file(fixes: &[SlopFix]) -> Vec<FileFixes> {
+    use std::collections::BTreeMap;
+    let mut by_path: BTreeMap<String, Vec<SlopFix>> = BTreeMap::new();
+    for fix in fixes {
+        let path = match &fix.action {
+            SlopAction::DeleteFile { path } => path.clone(),
+            SlopAction::DeleteLines { path, .. } => path.clone(),
+            SlopAction::ReplaceLines { path, .. } => path.clone(),
+        };
+        by_path.entry(path).or_default().push(fix.clone());
+    }
+    by_path
+        .into_iter()
+        .map(|(path, fixes)| FileFixes { path, fixes })
+        .collect()
 }
 
 /// Run every detector and aggregate.
@@ -91,7 +183,8 @@ pub fn slop_fixes(repo_root: &Path, map: &RepoIntelData) -> SlopFixesResult {
     fixes.extend(orphan_exports(map));
     fixes.extend(ast_findings(repo_root));
 
-    SlopFixesResult { fixes }
+    let by_file = group_by_file(&fixes);
+    SlopFixesResult { fixes, by_file }
 }
 
 // ── Path-based detectors ─────────────────────────────────────────
@@ -106,6 +199,7 @@ fn tracked_artifacts(repo_root: &Path) -> Vec<SlopFix> {
             out.push(SlopFix {
                 action: SlopAction::DeleteFile { path: rel },
                 category: SlopCategory::TrackedArtifact,
+                confidence: default_confidence(SlopCategory::TrackedArtifact),
                 reason,
             });
         }
@@ -189,6 +283,7 @@ fn stale_ci_configs(repo_root: &Path) -> Vec<SlopFix> {
                     path: file.to_string(),
                 },
                 category: SlopCategory::StaleCiConfig,
+                confidence: default_confidence(SlopCategory::StaleCiConfig),
                 reason: format!("{name} config present alongside active {other}"),
             });
         }
@@ -214,6 +309,7 @@ fn duplicate_tooling(repo_root: &Path) -> Vec<SlopFix> {
                 path: ".eslintrc.json".into(),
             },
             category: SlopCategory::DuplicateTooling,
+            confidence: default_confidence(SlopCategory::DuplicateTooling),
             reason: "Biome present — ESLint config can usually be removed".into(),
         });
     }
@@ -228,6 +324,7 @@ fn duplicate_tooling(repo_root: &Path) -> Vec<SlopFix> {
                 path: ".prettierrc".into(),
             },
             category: SlopCategory::DuplicateTooling,
+            confidence: default_confidence(SlopCategory::DuplicateTooling),
             reason: "Biome present — Prettier config can usually be removed".into(),
         });
     }
@@ -253,6 +350,7 @@ fn duplicate_tooling(repo_root: &Path) -> Vec<SlopFix> {
                     path: lockfile.to_string(),
                 },
                 category: SlopCategory::DuplicateTooling,
+                confidence: default_confidence(SlopCategory::DuplicateTooling),
                 reason: format!(
                     "multiple JS lockfiles present ({}); only one package manager should be active",
                     lockfiles.join(", ")
@@ -333,6 +431,7 @@ fn orphan_exports(map: &RepoIntelData) -> Vec<SlopFix> {
                     lines: [export.line as u32, export.line as u32],
                 },
                 category: SlopCategory::OrphanExport,
+                confidence: default_confidence(SlopCategory::OrphanExport),
                 reason: format!(
                     "exported {kind} `{name}` — file has zero importers in the project graph",
                     kind = symbol_kind_name(&export.kind),
@@ -531,34 +630,36 @@ fn ast_findings(repo_root: &Path) -> Vec<SlopFix> {
                 out.extend(empty_catches_ts_js(&content, &rel, &lang));
                 out.extend(promise_empty_catches_ts_js(&content, &rel, &lang));
                 out.extend(tautological_tests_ts_js(&content, &rel, &lang));
+                out.extend(always_true_conditions_ts_js(&content, &rel, &lang));
             }
             "js" | "jsx" | "mjs" | "cjs" => {
                 let lang = tree_sitter_javascript::LANGUAGE.into();
                 out.extend(empty_catches_ts_js(&content, &rel, &lang));
                 out.extend(promise_empty_catches_ts_js(&content, &rel, &lang));
                 out.extend(tautological_tests_ts_js(&content, &rel, &lang));
+                out.extend(always_true_conditions_ts_js(&content, &rel, &lang));
             }
             "py" => {
                 out.extend(empty_excepts_python(&content, &rel));
                 out.extend(tautological_tests_python(&content, &rel));
+                out.extend(always_true_conditions_python(&content, &rel));
             }
             "rs" => {
-                // Tautological assertions still fire in test files (they're
-                // FOUND in test files by definition). Error-discard
-                // patterns (`let _ = …`, `.ok();`) are conventional in
-                // tests so we skip those for test files only.
                 if !is_rust_test_file(&rel) {
                     out.extend(error_swallowing_rust(&content, &rel));
                 }
                 out.extend(tautological_tests_rust(&content, &rel));
+                out.extend(always_true_conditions_rust(&content, &rel));
             }
             "go" => {
                 out.extend(error_swallowing_go(&content, &rel));
                 out.extend(tautological_tests_go(&content, &rel));
+                out.extend(always_true_conditions_go(&content, &rel));
             }
             "java" => {
                 out.extend(empty_catches_java(&content, &rel));
                 out.extend(tautological_tests_java(&content, &rel));
+                out.extend(always_true_conditions_java(&content, &rel));
             }
             _ => {}
         }
@@ -581,6 +682,7 @@ fn empty_catches_ts_js(content: &str, rel: &str, language: &tree_sitter::Languag
                 lines: [start, end],
             },
             category: SlopCategory::EmptyCatch,
+            confidence: default_confidence(SlopCategory::EmptyCatch),
             reason: "empty catch block silently swallows errors".into(),
         })
     })
@@ -610,6 +712,7 @@ fn empty_excepts_python(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::EmptyCatch,
+                confidence: default_confidence(SlopCategory::EmptyCatch),
                 reason: "bare except: pass silently swallows errors".into(),
             });
         }
@@ -695,6 +798,7 @@ fn tautological_tests_ts_js(
                 lines: [start, end],
             },
             category: SlopCategory::TautologicalTest,
+            confidence: default_confidence(SlopCategory::TautologicalTest),
             reason: format!(
                 "tautological assertion: `expect({left}).{}` always passes",
                 "toBe(...)"
@@ -779,6 +883,7 @@ fn empty_catches_java(content: &str, rel: &str) -> Vec<SlopFix> {
                 lines: [start, end],
             },
             category: SlopCategory::EmptyCatch,
+            confidence: default_confidence(SlopCategory::EmptyCatch),
             reason: "empty Java catch block silently swallows the exception".into(),
         })
     })
@@ -841,6 +946,7 @@ fn promise_empty_catches_ts_js(
                 lines: [start, end],
             },
             category: SlopCategory::EmptyCatch,
+            confidence: default_confidence(SlopCategory::EmptyCatch),
             reason: "Promise .catch() with empty handler silently swallows rejections".into(),
         });
     }
@@ -894,6 +1000,7 @@ fn error_swallowing_rust(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::EmptyCatch,
+                confidence: default_confidence(SlopCategory::EmptyCatch),
                 reason: "Rust `let _ = …` discards the value (often an unhandled Result)".into(),
             })
         },
@@ -917,6 +1024,7 @@ fn error_swallowing_rust(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::EmptyCatch,
+                confidence: default_confidence(SlopCategory::EmptyCatch),
                 reason: "Rust `.ok();` as a statement drops the Err variant".into(),
             })
         },
@@ -942,6 +1050,7 @@ fn error_swallowing_rust(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::EmptyCatch,
+                confidence: default_confidence(SlopCategory::EmptyCatch),
                 reason: "Rust `if let Err(_) = … {}` empty body silently ignores errors".into(),
             })
         },
@@ -976,6 +1085,7 @@ fn error_swallowing_go(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::EmptyCatch,
+                confidence: default_confidence(SlopCategory::EmptyCatch),
                 reason: "Go `if err != nil { }` empty block silently ignores the error".into(),
             })
         },
@@ -997,6 +1107,7 @@ fn error_swallowing_go(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::EmptyCatch,
+                confidence: default_confidence(SlopCategory::EmptyCatch),
                 reason: "Go `_ = …` explicitly discards the value (often an unchecked error)"
                     .into(),
             })
@@ -1038,6 +1149,7 @@ fn tautological_tests_rust(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::TautologicalTest,
+                confidence: default_confidence(SlopCategory::TautologicalTest),
                 reason: "Rust `assert!(true)` always passes".into(),
             })
         },
@@ -1098,6 +1210,7 @@ fn detect_rust_assert_eq_pairs(
                     lines: [start, end],
                 },
                 category: SlopCategory::TautologicalTest,
+                confidence: default_confidence(SlopCategory::TautologicalTest),
                 reason: format!(
                     "Rust `{}!({lhs}, {rhs})` always passes",
                     macro_name(macro_text)
@@ -1154,6 +1267,7 @@ fn tautological_tests_python(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::TautologicalTest,
+                confidence: default_confidence(SlopCategory::TautologicalTest),
                 reason: "Python `assert <truthy literal>` always passes".into(),
             })
         },
@@ -1189,6 +1303,7 @@ fn tautological_tests_python(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::TautologicalTest,
+                confidence: default_confidence(SlopCategory::TautologicalTest),
                 reason: format!("Python `assert {lhs} == {rhs}` always passes"),
             })
         },
@@ -1255,6 +1370,7 @@ fn detect_python_unittest_assert(
                     lines: [start, end],
                 },
                 category: SlopCategory::TautologicalTest,
+                confidence: default_confidence(SlopCategory::TautologicalTest),
                 reason: format!("Python `{method}({args_text})` always passes"),
             });
             None
@@ -1322,6 +1438,7 @@ fn tautological_tests_java(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::TautologicalTest,
+                confidence: default_confidence(SlopCategory::TautologicalTest),
                 reason: format!("Java `{method}{args_text}` always passes"),
             });
             None
@@ -1393,12 +1510,271 @@ fn tautological_tests_go(content: &str, rel: &str) -> Vec<SlopFix> {
                     lines: [start, end],
                 },
                 category: SlopCategory::TautologicalTest,
+                confidence: default_confidence(SlopCategory::TautologicalTest),
                 reason: format!("Go testify `{method}{args_text}` always passes"),
             });
             None
         },
     );
     out
+}
+
+// ── Always-true / always-false condition detection ─────────────
+//
+// Conditions that always evaluate to a known value: `if true`,
+// `if false`, `if 1 == 1`, `if x != null && x == null`. Either the
+// branch is dead code (always-false) or the condition is structurally
+// wrong (always-true masking a real check that was meant). Both are
+// worth a human eye.
+//
+// Detection strategy: per-language tree-sitter query for `if`
+// conditions, then string-classify the condition text. Same approach
+// works across all 5 languages because the patterns are identical at
+// the textual level (`true`, `false`, `x == x`, `x && !x`).
+
+fn always_true_conditions_rust(content: &str, rel: &str) -> Vec<SlopFix> {
+    let language = tree_sitter_rust::LANGUAGE.into();
+    run_ast_query(
+        content,
+        &language,
+        r#"(if_expression condition: (_) @body) @decl"#,
+        |cond_node| classify_always_true(cond_node, content.as_bytes(), rel, "Rust `if`"),
+    )
+}
+
+fn always_true_conditions_ts_js(
+    content: &str,
+    rel: &str,
+    language: &tree_sitter::Language,
+) -> Vec<SlopFix> {
+    let mut out = Vec::new();
+    out.extend(run_ast_query(
+        content,
+        language,
+        r#"(if_statement condition: (parenthesized_expression (_) @body)) @decl"#,
+        |cond_node| classify_always_true(cond_node, content.as_bytes(), rel, "TS/JS `if`"),
+    ));
+    // Ternary `x ? a : b` with constant condition.
+    out.extend(run_ast_query(
+        content,
+        language,
+        r#"(ternary_expression condition: (_) @body) @decl"#,
+        |cond_node| classify_always_true(cond_node, content.as_bytes(), rel, "TS/JS ternary"),
+    ));
+    out
+}
+
+fn always_true_conditions_python(content: &str, rel: &str) -> Vec<SlopFix> {
+    let language = tree_sitter_python::LANGUAGE.into();
+    run_ast_query(
+        content,
+        &language,
+        r#"(if_statement condition: (_) @body) @decl"#,
+        |cond_node| classify_always_true(cond_node, content.as_bytes(), rel, "Python `if`"),
+    )
+}
+
+fn always_true_conditions_go(content: &str, rel: &str) -> Vec<SlopFix> {
+    let language = tree_sitter_go::LANGUAGE.into();
+    run_ast_query(
+        content,
+        &language,
+        r#"(if_statement condition: (_) @body) @decl"#,
+        |cond_node| classify_always_true(cond_node, content.as_bytes(), rel, "Go `if`"),
+    )
+}
+
+fn always_true_conditions_java(content: &str, rel: &str) -> Vec<SlopFix> {
+    let language = tree_sitter_java::LANGUAGE.into();
+    run_ast_query(
+        content,
+        &language,
+        r#"(if_statement condition: (parenthesized_expression (_) @body)) @decl"#,
+        |cond_node| classify_always_true(cond_node, content.as_bytes(), rel, "Java `if`"),
+    )
+}
+
+/// Inspect a condition text. If it's structurally always-true or
+/// always-false, emit a fix pointing at the condition's line range.
+/// Returns None for normal conditions.
+fn classify_always_true(
+    cond_node: tree_sitter::Node,
+    source: &[u8],
+    rel: &str,
+    lang_label: &str,
+) -> Option<SlopFix> {
+    let text = cond_node.utf8_text(source).ok()?.trim();
+
+    // Direct boolean literals.
+    let constant = matches!(text, "true" | "True" | "false" | "False");
+
+    // `x == x` / `x === x` / `x is x` — same expression both sides.
+    let same_eq = is_same_expression_compare(text, &["==", "===", " is "]);
+
+    // Contradictory conjunction: `x != null && x == null`,
+    // `x && !x`, etc.
+    let contradiction = is_contradiction(text);
+
+    if !constant && !same_eq && !contradiction {
+        return None;
+    }
+    let kind = if constant {
+        format!("constant condition `{text}` always evaluates the same way")
+    } else if same_eq {
+        format!("self-comparison `{text}` always evaluates true")
+    } else {
+        format!("contradictory condition `{text}` always evaluates false")
+    };
+
+    let start = (cond_node.start_position().row as u32) + 1;
+    let end = (cond_node.end_position().row as u32) + 1;
+    let category = SlopCategory::AlwaysTrueCondition;
+    Some(SlopFix {
+        action: SlopAction::DeleteLines {
+            path: rel.to_string(),
+            lines: [start, end],
+        },
+        category,
+        reason: format!("{lang_label}: {kind}"),
+        confidence: default_confidence(category),
+    })
+}
+
+fn is_same_expression_compare(text: &str, ops: &[&str]) -> bool {
+    for op in ops {
+        if let Some(pos) = text.find(op) {
+            let lhs = text[..pos].trim();
+            let rhs = text[pos + op.len()..].trim();
+            // Strip optional outer parentheses
+            let lhs_inner = strip_one_paren_pair(lhs);
+            let rhs_inner = strip_one_paren_pair(rhs);
+            if !lhs_inner.is_empty() && lhs_inner == rhs_inner && is_simple_atom(lhs_inner) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn strip_one_paren_pair(s: &str) -> &str {
+    let trimmed = s.trim();
+    if trimmed.starts_with('(') && trimmed.ends_with(')') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        // Only strip if the parens are balanced as a single outer pair.
+        let mut depth = 0i32;
+        for (i, c) in inner.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return trimmed;
+                    }
+                }
+                _ => {}
+            }
+            if depth == 0 && i + 1 < inner.len() {
+                // Closing paren in middle — original was something like
+                // `(a) + (b)`, not a single outer pair.
+                return trimmed;
+            }
+        }
+        if depth == 0 {
+            return inner.trim();
+        }
+    }
+    trimmed
+}
+
+fn is_simple_atom(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if matches!(
+        s,
+        "true" | "false" | "null" | "undefined" | "None" | "True" | "False"
+    ) {
+        return true;
+    }
+    if s.starts_with('"') || s.starts_with('\'') || s.starts_with('`') {
+        return true;
+    }
+    if s.chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    // Bare identifier or simple field access (`x.y`, `x.y.z`).
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
+fn is_contradiction(text: &str) -> bool {
+    // `x && !x` — same atom both sides of `&&`, one negated.
+    if let Some((lhs, rhs)) = split_top_level_op(text, "&&") {
+        let lhs = lhs.trim();
+        let rhs = rhs.trim();
+        if let Some(neg_lhs) = rhs.strip_prefix('!') {
+            if lhs == neg_lhs.trim() && is_simple_atom(lhs) {
+                return true;
+            }
+        }
+        if let Some(neg_rhs) = lhs.strip_prefix('!') {
+            if neg_rhs.trim() == rhs && is_simple_atom(rhs) {
+                return true;
+            }
+        }
+        // `x == null && x != null`
+        if let (Some((l_lhs, l_rhs)), Some((r_lhs, r_rhs))) =
+            (split_first_compare(lhs), split_first_compare(rhs))
+            && l_lhs.trim() == r_lhs.trim()
+            && l_rhs.trim() == r_rhs.trim()
+        {
+            // Compare ops are opposite (`==` vs `!=`).
+            let l_op = compare_op(lhs).unwrap_or("");
+            let r_op = compare_op(rhs).unwrap_or("");
+            if (l_op == "==" && r_op == "!=") || (l_op == "!=" && r_op == "==") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn split_top_level_op<'a>(text: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
+    let mut depth = 0i32;
+    let bytes = text.as_bytes();
+    let op_bytes = op.as_bytes();
+    let mut i = 0;
+    while i + op_bytes.len() <= bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && &bytes[i..i + op_bytes.len()] == op_bytes {
+            return Some((&text[..i], &text[i + op_bytes.len()..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn split_first_compare(text: &str) -> Option<(&str, &str)> {
+    for op in ["===", "!==", "==", "!=", "<=", ">=", "<", ">"] {
+        if let Some(pos) = text.find(op) {
+            return Some((&text[..pos], &text[pos + op.len()..]));
+        }
+    }
+    None
+}
+
+fn compare_op(text: &str) -> Option<&'static str> {
+    ["===", "!==", "==", "!=", "<=", ">=", "<", ">"]
+        .into_iter()
+        .find(|op| text.contains(op))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -1633,6 +2009,7 @@ mod tests {
                 path: "x.log".into(),
             },
             category: SlopCategory::TrackedArtifact,
+            confidence: default_confidence(SlopCategory::TrackedArtifact),
             reason: "test".into(),
         };
         let json = serde_json::to_string(&fix).unwrap();
@@ -2049,6 +2426,194 @@ mod tests {
         );
         assert!(fixes[0].reason.contains("MyStruct"));
         assert!(fixes[0].reason.contains("struct"));
+    }
+
+    // ── Always-true conditions ─────
+
+    #[test]
+    fn detects_rust_if_true_constant() {
+        let dir = make_repo(&[("src/lib.rs", "fn f() {\n    if true { return; }\n}\n")]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::AlwaysTrueCondition
+                    && f.reason.contains("constant")),
+            "should flag `if true`; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn detects_typescript_if_x_eq_x() {
+        let dir = make_repo(&[("a.ts", "function f(x) { if (x === x) return; }\n")]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::AlwaysTrueCondition
+                    && f.reason.contains("self-comparison")),
+            "should flag `if (x === x)`; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn detects_python_if_true() {
+        let dir = make_repo(&[("a.py", "def f():\n    if True:\n        return\n")]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::AlwaysTrueCondition),
+            "should flag `if True`; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn detects_go_if_x_eq_x() {
+        let dir = make_repo(&[(
+            "x.go",
+            "package x\nfunc f(a int) {\n    if a == a { return }\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::AlwaysTrueCondition),
+            "should flag `if a == a`; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn detects_typescript_contradiction() {
+        // x != null && x == null — always false.
+        let dir = make_repo(&[(
+            "a.ts",
+            "function f(x) { if (x != null && x == null) return; }\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::AlwaysTrueCondition
+                    && f.reason.contains("contradictory")),
+            "should flag `x != null && x == null`; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn ignores_normal_condition() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "fn f(x: i32) {\n    if x > 0 { return; }\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::AlwaysTrueCondition),
+            "should not flag normal `if x > 0`; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn ignores_function_call_condition() {
+        // `if check()` — `check` could return either true or false; not constant.
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "fn f() {\n    if check() { return; }\n}\nfn check() -> bool { true }\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::AlwaysTrueCondition),
+            "should not flag `if check()`; got {:?}",
+            fixes
+        );
+    }
+
+    // ── Confidence + grouping ─────
+
+    #[test]
+    fn fix_carries_default_confidence_for_category() {
+        let fix = SlopFix {
+            action: SlopAction::DeleteFile {
+                path: "x.log".into(),
+            },
+            category: SlopCategory::TrackedArtifact,
+            reason: "test".into(),
+            confidence: default_confidence(SlopCategory::TrackedArtifact),
+        };
+        assert!((fix.confidence - 0.97).abs() < 1e-3);
+    }
+
+    #[test]
+    fn confidence_is_serialized_in_json() {
+        let fix = SlopFix {
+            action: SlopAction::DeleteFile {
+                path: "x.log".into(),
+            },
+            category: SlopCategory::TrackedArtifact,
+            reason: "test".into(),
+            confidence: 0.95,
+        };
+        let json = serde_json::to_string(&fix).unwrap();
+        assert!(json.contains("\"confidence\":0.95"));
+    }
+
+    #[test]
+    fn confidence_default_when_missing_from_input() {
+        // A pre-confidence-field artifact deserializes with the
+        // category-agnostic default (0.80).
+        let json = r#"{"action":"delete-file","path":"x.log","category":"tracked-artifact","reason":"test"}"#;
+        let fix: SlopFix = serde_json::from_str(json).unwrap();
+        assert!((fix.confidence - 0.80).abs() < 1e-3);
+    }
+
+    #[test]
+    fn group_by_file_clusters_fixes_per_path_alphabetically() {
+        let fixes = vec![
+            SlopFix {
+                action: SlopAction::DeleteLines {
+                    path: "z.rs".into(),
+                    lines: [1, 1],
+                },
+                category: SlopCategory::EmptyCatch,
+                reason: "x".into(),
+                confidence: 0.95,
+            },
+            SlopFix {
+                action: SlopAction::DeleteLines {
+                    path: "a.rs".into(),
+                    lines: [1, 1],
+                },
+                category: SlopCategory::EmptyCatch,
+                reason: "x".into(),
+                confidence: 0.95,
+            },
+            SlopFix {
+                action: SlopAction::DeleteLines {
+                    path: "a.rs".into(),
+                    lines: [10, 10],
+                },
+                category: SlopCategory::OrphanExport,
+                reason: "x".into(),
+                confidence: 0.75,
+            },
+        ];
+        let grouped = group_by_file(&fixes);
+        assert_eq!(grouped.len(), 2);
+        // Alphabetically sorted by path.
+        assert_eq!(grouped[0].path, "a.rs");
+        assert_eq!(grouped[0].fixes.len(), 2);
+        assert_eq!(grouped[1].path, "z.rs");
+        assert_eq!(grouped[1].fixes.len(), 1);
     }
 
     #[test]
