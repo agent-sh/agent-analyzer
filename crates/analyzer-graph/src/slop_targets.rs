@@ -537,7 +537,7 @@ fn high_bug_communities(map: &RepoIntelData) -> Vec<SlopTarget> {
     if totals.is_empty() {
         return Vec::new();
     }
-    totals.sort_by(|a, b| b.2.cmp(&a.2));
+    totals.sort_by_key(|b| std::cmp::Reverse(b.2));
     let cutoff_count = ((totals.len() as f32) * 0.10).ceil() as usize;
     let take = cutoff_count.max(1);
     totals
