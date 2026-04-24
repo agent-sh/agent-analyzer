@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use analyzer_core::types::{EntryPoint, EntryPointKind, FileSymbols};
+use analyzer_core::types::{EntryPoint, EntryPointKind, FileSymbols, SymbolKind};
 
 /// Detect entry points in `repo_path`, optionally augmenting with the
 /// AST symbol index from a previously-collected repo-intel artifact.
@@ -334,13 +334,17 @@ fn detect_pyproject(repo_path: &Path, out: &mut Vec<EntryPoint>) {
 /// index. Covers `fn main` (Rust), `def main` (Python), `func main()`
 /// (Go), and `function main()` (JS/TS).
 ///
+/// Filters by `SymbolKind::Function` so a struct, constant, or module
+/// that happens to be named `main` does not get reported as an entry
+/// point.
+///
 /// Does NOT detect Python `if __name__ == "__main__":` guards - those
 /// are top-level `If` statements rather than function definitions, and
 /// the symbol index only tracks definitions today.
 fn detect_main_symbols(symbols: &HashMap<String, FileSymbols>, out: &mut Vec<EntryPoint>) {
     for (path, file_syms) in symbols {
         for def in &file_syms.definitions {
-            if def.name == "main" {
+            if def.name == "main" && def.kind == SymbolKind::Function {
                 out.push(EntryPoint {
                     path: path.clone(),
                     line: Some(def.line),
@@ -667,6 +671,43 @@ mytool = "demo.cli:main"
         assert_eq!(main.name, "main");
         // Non-main definitions must not show up.
         assert!(eps.iter().all(|e| e.name != "helper"));
+    }
+
+    #[test]
+    fn ast_main_only_matches_functions_not_other_symbol_kinds() {
+        // Reviewer-caught: a struct, constant, or module literally named
+        // `main` would previously surface as a Main entry point because
+        // detect_main_symbols only filtered on the name. Filter on kind
+        // too so only actual `fn main` / `def main` / `func main` hit.
+        let dir = make_repo();
+        let mut syms = HashMap::new();
+        syms.insert(
+            "src/types.rs".to_string(),
+            FileSymbols {
+                exports: vec![],
+                imports: vec![],
+                definitions: vec![
+                    DefinitionEntry {
+                        name: "main".to_string(),
+                        kind: SymbolKind::Struct,
+                        line: 5,
+                        complexity: 1,
+                    },
+                    DefinitionEntry {
+                        name: "main".to_string(),
+                        kind: SymbolKind::Constant,
+                        line: 10,
+                        complexity: 1,
+                    },
+                ],
+            },
+        );
+
+        let eps = detect(dir.path(), Some(&syms));
+        assert!(
+            eps.iter().all(|e| e.kind != EntryPointKind::Main),
+            "non-function `main` symbols must not surface as entry points"
+        );
     }
 
     #[test]
