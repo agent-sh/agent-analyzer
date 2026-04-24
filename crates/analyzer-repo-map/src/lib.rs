@@ -6,5 +6,6 @@
 pub mod complexity;
 pub mod conventions;
 pub mod extractor;
+pub mod find;
 pub mod parser;
 pub mod queries;
