@@ -316,6 +316,19 @@ pub enum QueryAction {
         #[arg(long)]
         map_file: Option<PathBuf>,
     },
+    /// Find files relevant to a fuzzy concept (collapses `grep -r` into ranked output)
+    Find {
+        /// Concept to search for (e.g. "worker pool", "auth flow")
+        query: String,
+        /// Repository path
+        path: PathBuf,
+        /// Maximum results
+        #[arg(long, default_value = "10")]
+        top: usize,
+        /// Path to repo-intel JSON file (required - reads the symbol index)
+        #[arg(long)]
+        map_file: PathBuf,
+    },
 }
 
 pub fn run(action: RepoIntelAction) -> Result<()> {
@@ -708,6 +721,24 @@ fn run_query(query: QueryAction) -> Result<()> {
             };
             let result = analyzer_collectors::entry_points::detect(&path, symbols.as_ref());
             println!("{}", output::to_json(&result));
+        }
+        QueryAction::Find {
+            query,
+            path,
+            top,
+            map_file,
+        } => {
+            let map = load_map(&map_file)?;
+            match map.symbols.as_ref() {
+                Some(syms) => {
+                    let result = analyzer_repo_map::find::find(syms, &path, &query, top);
+                    println!("{}", output::to_json(&result));
+                }
+                None => {
+                    eprintln!("[WARN] No symbol data in map. Run repo-intel init to generate.");
+                    println!("[]");
+                }
+            }
         }
     }
     Ok(())
