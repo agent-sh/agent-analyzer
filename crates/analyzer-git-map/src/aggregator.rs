@@ -53,6 +53,7 @@ pub fn create_empty_map() -> RepoIntelData {
         graph: None,
         file_descriptors: None,
         summary: None,
+        embeddings_meta: None,
     }
 }
 

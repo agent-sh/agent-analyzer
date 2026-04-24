@@ -52,6 +52,32 @@ pub struct RepoIntelData {
     /// `repo-intel-summarizer` agent. Read by the `summary` query.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub summary: Option<RepoSummary>,
+
+    // Phase 7: Embedding metadata. Vector data lives in a sidecar binary
+    // file alongside this artifact (`<stem>.embeddings.bin`). The
+    // metadata kept here lets `agent-analyzer-embed update` detect
+    // changed files without parsing the sidecar.
+    /// Bookkeeping for the embedding sidecar. Absent when the user has
+    /// not opted into the embedder.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub embeddings_meta: Option<EmbeddingsMeta>,
+}
+
+/// Metadata for the on-disk embedding sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingsMeta {
+    /// Stable identifier of the model that produced the vectors. Used
+    /// to detect a model swap and trigger a full rebuild.
+    pub model_id: String,
+    /// Stored vector dimensionality.
+    pub dim: usize,
+    /// `"perFile"` or `"perFunction"` — string for forward-compat.
+    pub granularity: String,
+    pub generated_at: DateTime<Utc>,
+    /// `path -> "sha256:<hex>"`. Used by `update` to skip re-embedding
+    /// unchanged files.
+    pub file_hashes: HashMap<String, String>,
 }
 
 /// Git repository metadata.
@@ -633,6 +659,7 @@ mod tests {
             graph: None,
             file_descriptors: None,
             summary: None,
+            embeddings_meta: None,
         };
 
         let json = serde_json::to_string(&data).unwrap();

@@ -1,0 +1,60 @@
+[package]
+name = "analyzer-embed"
+description = "Local embedding generation for agent-analyzer (semantic slop detection, find, stylometry)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "agent-analyzer-embed"
+path = "src/main.rs"
+
+[lib]
+name = "analyzer_embed"
+path = "src/lib.rs"
+
+[dependencies]
+analyzer-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+chrono.workspace = true
+walkdir.workspace = true
+ignore.workspace = true
+rayon.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-java.workspace = true
+sha2 = "0.10"
+half = "2"
+streaming-iterator = "0.1"
+# Use `ort-load-dynamic` instead of the default `ort-download-binaries`
+# so the build does not depend on pyke's CDN at compile time. The
+# CDN goes down occasionally (sustained 504s during this PR's CI),
+# which would otherwise fail every PR build until pyke recovers.
+#
+# Runtime trade-off: the embed binary expects ONNX Runtime to be
+# loadable at runtime via `ORT_DYLIB_PATH` or a system-default
+# location. The JS wrapper (`lib/embed/binary.js` in the repo-intel
+# plugin) downloads the lib alongside the binary on first use; users
+# running the binary directly need ONNX Runtime installed manually.
+fastembed = { version = "5", default-features = false, features = [
+    "ort-load-dynamic",
+    "hf-hub-native-tls",
+    "image-models",
+] }
+
+[dev-dependencies]
+tempfile = "3"

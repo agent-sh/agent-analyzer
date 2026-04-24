@@ -14,6 +14,7 @@ members = [
     "crates/analyzer-collectors",
     "crates/analyzer-sync-check",
     "crates/analyzer-graph",
+    "crates/analyzer-embed",
     "crates/analyzer-cli",
 ]
 
@@ -36,6 +37,7 @@ analyzer-repo-map = { path = "crates/analyzer-repo-map" }
 analyzer-collectors = { path = "crates/analyzer-collectors" }
 analyzer-sync-check = { path = "crates/analyzer-sync-check" }
 analyzer-graph = { path = "crates/analyzer-graph" }
+analyzer-embed = { path = "crates/analyzer-embed" }
 
 # Core dependencies
 serde = { version = "1", features = ["derive"] }
