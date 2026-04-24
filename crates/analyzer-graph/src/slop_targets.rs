@@ -265,7 +265,15 @@ fn cliche_name_clusters(map: &RepoIntelData) -> Vec<SlopTarget> {
         Some(s) => s,
         None => return Vec::new(),
     };
+    // Substrings flagged as cliché in identifier names. Matched
+    // case-insensitively. Kept conservative — common-but-meaningful
+    // names (Service, Controller, Provider, Factory, Builder) are
+    // intentionally excluded because they're load-bearing in real
+    // architectures (MVC controllers, Service Locator, Factory
+    // Method, Builder pattern). Add them via project-level config if
+    // a particular codebase wants the stricter rule.
     const CLICHE: &[&str] = &[
+        // Vague responsibility ("does stuff for things")
         "helper",
         "helpers",
         "utility",
@@ -275,9 +283,35 @@ fn cliche_name_clusters(map: &RepoIntelData) -> Vec<SlopTarget> {
         "manager",
         "handler",
         "processor",
+        "wrapper",
+        // Vague type-like names
         "data",
         "info",
-        "wrapper",
+        "stuff",
+        "thing",
+        "things",
+        // Module / file naming smells
+        "misc",
+        "common",
+        "shared",
+        "generic",
+        "abstract",
+        "base",
+        // Throwaway / placeholder names
+        "temp",
+        "tmp",
+        "dummy",
+        "foo",
+        "bar",
+        "baz",
+        "qux",
+        "scratch",
+        // Java/C# pattern-suffix soup ("FooImpl wraps Foo")
+        "impl",
+        "dao",
+        "dto",
+        "vo",
+        "pojo",
     ];
 
     let mut by_dir: HashMap<String, Vec<String>> = HashMap::new();
