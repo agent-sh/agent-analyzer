@@ -117,6 +117,21 @@ pub fn slop_targets(
     SlopTargetsResult { targets: all }
 }
 
+/// Keep only targets that touch any path for which `predicate` returns
+/// true. For a `File` target the path is the target's own file; for an
+/// `Area` target at least one of its paths must match. Used by the CLI
+/// `--files` filter so consumers can scope results to a PR diff without
+/// doing a JS-side intersection pass.
+pub fn retain_targets_touching<F>(result: &mut SlopTargetsResult, predicate: F)
+where
+    F: Fn(&str) -> bool,
+{
+    result.targets.retain(|t| match t {
+        SlopTarget::File { path, .. } => predicate(path),
+        SlopTarget::Area { paths, .. } => paths.iter().any(|p| predicate(p)),
+    });
+}
+
 // ── Sonnet tier (file-level scoring) ─────────────────────────────
 
 fn sonnet_file_targets(map: &RepoIntelData, top: usize) -> Vec<SlopTarget> {

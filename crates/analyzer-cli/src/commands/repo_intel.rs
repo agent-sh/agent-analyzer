@@ -351,6 +351,9 @@ pub enum QueryAction {
         /// Path to repo-intel JSON file (optional - enables AST main detection)
         #[arg(long)]
         map_file: Option<PathBuf>,
+        /// Restrict results to this comma-separated list of repo-relative files
+        #[arg(long, value_delimiter = ',')]
+        files: Vec<String>,
     },
     /// Find files relevant to a fuzzy concept (collapses `grep -r` into ranked output)
     Find {
@@ -388,6 +391,9 @@ pub enum QueryAction {
         /// Path to repo-intel JSON file (provides import graph + symbols)
         #[arg(long)]
         map_file: PathBuf,
+        /// Restrict results to this comma-separated list of repo-relative files
+        #[arg(long, value_delimiter = ',')]
+        files: Vec<String>,
     },
     /// Ranked targets for the deslop agent's Sonnet- and Opus-tier
     /// scans. Sonnet tier = file-level (defensive cargo cult, bot
@@ -403,6 +409,9 @@ pub enum QueryAction {
         /// Max rows per tier
         #[arg(long, default_value = "10")]
         top: usize,
+        /// Restrict results to targets touching this comma-separated list of repo-relative files
+        #[arg(long, value_delimiter = ',')]
+        files: Vec<String>,
     },
 }
 
@@ -559,6 +568,27 @@ fn run_set_embeddings(map_file: &Path, input: &str) -> Result<()> {
         sidecar_path.display()
     );
     Ok(())
+}
+
+/// Normalize a repo-relative path so the `--files` filter matches
+/// regardless of whether callers pass `src/foo.rs` or `src\\foo.rs`
+/// (Windows) or a leading `./`. Trailing slashes stripped.
+fn normalize_rel_path(p: &str) -> String {
+    let s = p.replace('\\', "/");
+    let s = s.strip_prefix("./").unwrap_or(&s);
+    s.trim_end_matches('/').to_string()
+}
+
+/// Build a HashSet from a `--files` comma-separated list, normalizing
+/// each entry. Clap's `value_delimiter = ','` already split on commas;
+/// here we just trim + normalize + dedupe.
+fn file_filter_set(files: &[String]) -> std::collections::HashSet<String> {
+    files
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(normalize_rel_path)
+        .collect()
 }
 
 fn derive_sidecar_path(map_file: &Path) -> PathBuf {
@@ -955,7 +985,11 @@ fn run_query(query: QueryAction) -> Result<()> {
                 }
             }
         }
-        QueryAction::EntryPoints { path, map_file } => {
+        QueryAction::EntryPoints {
+            path,
+            map_file,
+            files,
+        } => {
             // The symbol index is optional - it adds AST-derived `main`
             // functions to the manifest-derived results. Without it the
             // query still returns Cargo/npm/pyproject entries.
@@ -963,7 +997,11 @@ fn run_query(query: QueryAction) -> Result<()> {
                 Some(mf) => load_map(mf)?.symbols,
                 None => None,
             };
-            let result = analyzer_collectors::entry_points::detect(&path, symbols.as_ref());
+            let mut result = analyzer_collectors::entry_points::detect(&path, symbols.as_ref());
+            if !files.is_empty() {
+                let allowed = file_filter_set(&files);
+                result.retain(|ep| allowed.contains(&normalize_rel_path(&ep.path)));
+            }
             println!("{}", output::to_json(&result));
         }
         QueryAction::Find {
@@ -990,15 +1028,31 @@ fn run_query(query: QueryAction) -> Result<()> {
                 }
             }
         }
-        QueryAction::SlopFixes { path, map_file } => {
+        QueryAction::SlopFixes {
+            path,
+            map_file,
+            files,
+        } => {
             let map = load_map(&map_file)?;
-            let result = analyzer_graph::slop::slop_fixes(&path, &map);
+            let mut result = analyzer_graph::slop::slop_fixes(&path, &map);
+            if !files.is_empty() {
+                let allowed = file_filter_set(&files);
+                result.fixes.retain(|f| {
+                    f.action
+                        .path()
+                        .map(|p| allowed.contains(&normalize_rel_path(p)))
+                        .unwrap_or(false)
+                });
+                // by_file is derived from fixes; regenerate to stay in sync.
+                result.by_file = analyzer_graph::slop::group_by_file(&result.fixes);
+            }
             println!("{}", output::to_json(&result));
         }
         QueryAction::SlopTargets {
             path: _,
             map_file,
             top,
+            files,
         } => {
             let map = load_map(&map_file)?;
             let sidecar_path = derive_sidecar_path(&map_file);
@@ -1009,7 +1063,14 @@ fn run_query(query: QueryAction) -> Result<()> {
             } else {
                 None
             };
-            let result = analyzer_graph::slop_targets::slop_targets(&map, sidecar.as_ref(), top);
+            let mut result =
+                analyzer_graph::slop_targets::slop_targets(&map, sidecar.as_ref(), top);
+            if !files.is_empty() {
+                let allowed = file_filter_set(&files);
+                analyzer_graph::slop_targets::retain_targets_touching(&mut result, |p| {
+                    allowed.contains(&normalize_rel_path(p))
+                });
+            }
             println!("{}", output::to_json(&result));
         }
         QueryAction::Summary {
