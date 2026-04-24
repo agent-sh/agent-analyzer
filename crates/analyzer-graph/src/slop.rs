@@ -2840,18 +2840,49 @@ const COMMENT_NOTE_MARKERS: &[&str] = &[
     "SPDX-License",
 ];
 
+/// A note comment is any comment group where ANY line starts with a
+/// well-known marker. Checking per-line matters because
+/// `// cleanup\n// TODO: re-enable\n// fn pending() {}` should be
+/// suppressed even though the TODO is on line 2.
 fn is_note_comment(stripped: &str) -> bool {
-    let trimmed = stripped.trim_start();
-    let head: String = trimmed.chars().take(40).collect();
-    COMMENT_NOTE_MARKERS.iter().any(|m| head.contains(m))
+    stripped.lines().any(|l| {
+        let trimmed = l.trim_start();
+        let head: &str = trimmed.get(..trimmed.len().min(40)).unwrap_or("");
+        COMMENT_NOTE_MARKERS.iter().any(|m| head.contains(m))
+    })
+}
+
+/// Strip leading whitespace-one-space after a comment marker, preserving
+/// any additional indentation past that. Commented-out Python or any
+/// indented block needs its relative indent kept so it re-parses:
+///
+///   `// body()`           → `body()`
+///   `//     do_work()`    → `    do_work()` (keeps 4 spaces)
+///   `//body()`            → `body()`
+fn strip_one_marker_space(s: &str) -> &str {
+    s.strip_prefix(' ').unwrap_or(s)
 }
 
 /// Strip the comment markers off a single comment node's text, returning
 /// the inner content. For block comments the leading `/*` and trailing
 /// `*/` are removed; for line comments the leading `//` / `#` is
 /// stripped per line. Documentation comment prefixes (`///`, `//!`,
-/// `/**`, `//*`) return `None` — those are attached to a declaration
+/// `/**`) return `None` — those are attached to a declaration
 /// and should not be flagged.
+///
+/// Block comments frequently use the "leading star" layout:
+///
+/// ```ignore
+/// /*
+///  * first line
+///  * second line
+///  */
+/// ```
+///
+/// Without normalization the content would be `"\n * first line\n *
+/// second line\n"` which won't re-parse. We detect the case by
+/// requiring every non-empty line after the first to start with
+/// optional whitespace then `*`, and strip that prefix.
 fn strip_comment(text: &str, style: CommentStyle) -> Option<String> {
     match style {
         CommentStyle::CStyle => {
@@ -2861,7 +2892,7 @@ fn strip_comment(text: &str, style: CommentStyle) -> Option<String> {
                 if inner.starts_with('*') && !inner.starts_with("**") {
                     return None;
                 }
-                return Some(inner.to_string());
+                return Some(strip_leading_stars(inner));
             }
             // Line comment: reject doc variants, strip `//`
             let rest = text.strip_prefix("//")?;
@@ -2869,16 +2900,67 @@ fn strip_comment(text: &str, style: CommentStyle) -> Option<String> {
                 // `///` or `//!` — doc comment
                 return None;
             }
-            Some(rest.trim_start_matches(' ').to_string())
+            Some(strip_one_marker_space(rest).to_string())
         }
         CommentStyle::Hash => {
-            let rest = text
-                .strip_prefix("#!")
-                .map(|_| None) // shebang
-                .unwrap_or_else(|| text.strip_prefix('#').map(str::to_string));
-            rest.map(|s| s.trim_start_matches(' ').to_string())
+            // Skip shebang lines — those are interpreter directives,
+            // not comments at all.
+            if text.starts_with("#!") {
+                return None;
+            }
+            let rest = text.strip_prefix('#')?;
+            Some(strip_one_marker_space(rest).to_string())
         }
     }
+}
+
+/// If every non-empty line after the first in a block-comment body
+/// starts with whitespace then `*`, strip that prefix. This handles
+/// the common " * foo" continuation style without affecting block
+/// comments whose body is already plain indented code.
+fn strip_leading_stars(inner: &str) -> String {
+    let lines: Vec<&str> = inner.lines().collect();
+    if lines.len() < 2 {
+        return inner.to_string();
+    }
+    // First line may be empty (typical `/*\n * …\n */`); decide based
+    // on the remaining lines.
+    let non_empty_tail: Vec<&str> = lines
+        .iter()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .copied()
+        .collect();
+    if non_empty_tail.is_empty() {
+        return inner.to_string();
+    }
+    let all_starred = non_empty_tail
+        .iter()
+        .all(|l| l.trim_start().starts_with('*'));
+    if !all_starred {
+        return inner.to_string();
+    }
+    lines
+        .iter()
+        .map(|l| {
+            let t = l.trim_start();
+            if let Some(rest) = t.strip_prefix('*') {
+                strip_one_marker_space(rest).to_string()
+            } else {
+                (*l).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a comment group originated from a single-line comment or a
+/// block comment. Used to prevent cross-style merges (a block comment
+/// must never be glued onto a run of `//` lines).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentKind {
+    Line,
+    Block,
 }
 
 /// A grouping of consecutive same-style comment nodes. Rows are 0-based
@@ -2887,11 +2969,12 @@ struct CommentGroup {
     start_row: usize,
     end_row: usize,
     content: String,
+    kind: CommentKind,
 }
 
 /// Collect comment nodes from the tree, grouping contiguous line
 /// comments (no blank line between them). Block comments are each
-/// their own group.
+/// their own group and are never merged with neighboring line comments.
 fn collect_comment_groups(
     tree: &tree_sitter::Tree,
     source: &[u8],
@@ -2905,10 +2988,10 @@ fn collect_comment_groups(
                 stack.push(c);
             }
         }
-        let kind = node.kind();
+        let kind_str = node.kind();
         // Comment node kinds: "comment", "line_comment", "block_comment"
         // are the common ones across tree-sitter grammars.
-        let is_comment = matches!(kind, "comment" | "line_comment" | "block_comment");
+        let is_comment = matches!(kind_str, "comment" | "line_comment" | "block_comment");
         if !is_comment {
             continue;
         }
@@ -2922,22 +3005,33 @@ fn collect_comment_groups(
         let start_row = node.start_position().row;
         let end_row = node.end_position().row;
 
-        // Block comment or multi-line single-line comment → standalone.
-        let is_block = matches!(kind, "block_comment") || start_row != end_row;
-        if is_block {
+        // Distinguish block vs. line. Generic "comment" kind + a multi-
+        // line span also counts as block (`/* … */` on multiple lines
+        // in grammars that don't split the two kinds).
+        let kind = if matches!(kind_str, "block_comment")
+            || (kind_str == "comment" && start_row != end_row)
+        {
+            CommentKind::Block
+        } else {
+            CommentKind::Line
+        };
+
+        if kind == CommentKind::Block {
             out.push(CommentGroup {
                 start_row,
                 end_row,
                 content: stripped,
+                kind,
             });
             continue;
         }
 
-        // Single-line: merge with previous group if contiguous (no blank
-        // line gap). We don't own the text between comments, but tree-
-        // sitter positions tell us row numbers directly.
+        // Single-line: merge with the previous group only if it is ALSO
+        // a line-comment run AND contiguous (no blank-line gap). Never
+        // merge into a block-comment group — those are standalone by
+        // definition.
         if let Some(last) = out.last_mut() {
-            if last.end_row + 1 == start_row {
+            if last.kind == CommentKind::Line && last.end_row + 1 == start_row {
                 last.end_row = end_row;
                 last.content.push('\n');
                 last.content.push_str(&stripped);
@@ -2948,6 +3042,7 @@ fn collect_comment_groups(
             start_row,
             end_row,
             content: stripped,
+            kind,
         });
     }
     // Keep result order deterministic.
@@ -4499,6 +4594,78 @@ pub fn ok() {}
                 .iter()
                 .any(|f| f.category == SlopCategory::CommentedOutCode),
             "TODO marker should suppress; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_todo_marker_on_later_line_of_group() {
+        // TODO markers should suppress even when they appear on the
+        // second or third line of a merged comment group (before the
+        // fix, only the first 40 chars of the concatenated group were
+        // checked; a multi-line "cleanup" header could shadow a TODO).
+        let src = "\
+pub fn ok() {}
+// Keeping this around for the next migration.
+// TODO: delete once v3 ships
+// fn old_impl(x: u32) -> u32 {
+//     let y = x + 1;
+//     y * 2
+// }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "TODO on line 2 should still suppress; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn detects_python_indented_commented_out_block() {
+        // Python requires the commented-out code to re-parse with its
+        // indentation preserved. Before the fix, `trim_start_matches`
+        // destroyed leading whitespace, and `def foo():\nbody()` is
+        // a syntax error.
+        let src = "\
+def real():
+    return 1
+
+# def removed(x):
+#     y = x + 1
+#     return y
+";
+        let dir = make_repo(&[("mod.py", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "indented Python should flag; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn detects_leading_star_block_comment() {
+        // The classic Java/Rust leading-star block layout must strip
+        // the ` * ` continuation before re-parsing.
+        let src = "\
+pub fn ok() {}
+/*
+ * fn removed(x: u32) -> u32 {
+ *     let y = x + 1;
+ *     y * 2
+ * }
+ */
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "leading-star block should flag; got {fixes:?}"
         );
     }
 }
