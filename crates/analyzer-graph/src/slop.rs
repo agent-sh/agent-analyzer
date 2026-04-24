@@ -69,6 +69,12 @@ pub enum SlopCategory {
     /// `if false`, `if 1 == 1`, `if x != null && x == null`. Either
     /// the branch is dead code or the surrounding logic is wrong.
     AlwaysTrueCondition,
+    /// A comment block whose content is valid code in the surrounding
+    /// language. Three or more lines that re-parse cleanly with no
+    /// ERROR nodes and contain at least one substantive statement
+    /// (function, class, assignment, control flow) — a strong signal
+    /// the code was commented out rather than explained in prose.
+    CommentedOutCode,
 }
 
 /// Confidence in a fix, on a 0.0-1.0 scale.
@@ -104,6 +110,7 @@ pub fn default_confidence(category: SlopCategory) -> Confidence {
         SlopCategory::StaleCiConfig => 0.90,
         SlopCategory::DuplicateTooling => 0.85,
         SlopCategory::PassthroughWrapper => 0.85,
+        SlopCategory::CommentedOutCode => 0.85,
         // Sensitive to import-graph completeness; recommend review
         SlopCategory::OrphanExport => 0.75,
     }
@@ -385,6 +392,7 @@ fn category_kebab(c: SlopCategory) -> &'static str {
         SlopCategory::TautologicalTest => "tautological-test",
         SlopCategory::PassthroughWrapper => "passthrough-wrapper",
         SlopCategory::AlwaysTrueCondition => "always-true-condition",
+        SlopCategory::CommentedOutCode => "commented-out-code",
     }
 }
 
@@ -847,6 +855,12 @@ fn ast_findings(repo_root: &Path) -> Vec<SlopFix> {
                 out.extend(tautological_tests_ts_js(&content, &rel, &lang));
                 out.extend(always_true_conditions_ts_js(&content, &rel, &lang));
                 out.extend(passthrough_wrappers_ts_js(&content, &rel, &lang));
+                out.extend(commented_out_code(
+                    &content,
+                    &rel,
+                    &lang,
+                    CommentStyle::CStyle,
+                ));
             }
             "js" | "jsx" | "mjs" | "cjs" => {
                 let lang = tree_sitter_javascript::LANGUAGE.into();
@@ -855,12 +869,25 @@ fn ast_findings(repo_root: &Path) -> Vec<SlopFix> {
                 out.extend(tautological_tests_ts_js(&content, &rel, &lang));
                 out.extend(always_true_conditions_ts_js(&content, &rel, &lang));
                 out.extend(passthrough_wrappers_ts_js(&content, &rel, &lang));
+                out.extend(commented_out_code(
+                    &content,
+                    &rel,
+                    &lang,
+                    CommentStyle::CStyle,
+                ));
             }
             "py" => {
                 out.extend(empty_excepts_python(&content, &rel));
                 out.extend(tautological_tests_python(&content, &rel));
                 out.extend(always_true_conditions_python(&content, &rel));
                 out.extend(passthrough_wrappers_python(&content, &rel));
+                let lang = tree_sitter_python::LANGUAGE.into();
+                out.extend(commented_out_code(
+                    &content,
+                    &rel,
+                    &lang,
+                    CommentStyle::Hash,
+                ));
             }
             "rs" => {
                 if !is_rust_test_file(&rel) {
@@ -869,18 +896,39 @@ fn ast_findings(repo_root: &Path) -> Vec<SlopFix> {
                 }
                 out.extend(tautological_tests_rust(&content, &rel));
                 out.extend(always_true_conditions_rust(&content, &rel));
+                let lang = tree_sitter_rust::LANGUAGE.into();
+                out.extend(commented_out_code(
+                    &content,
+                    &rel,
+                    &lang,
+                    CommentStyle::CStyle,
+                ));
             }
             "go" => {
                 out.extend(error_swallowing_go(&content, &rel));
                 out.extend(tautological_tests_go(&content, &rel));
                 out.extend(always_true_conditions_go(&content, &rel));
                 out.extend(passthrough_wrappers_go(&content, &rel));
+                let lang = tree_sitter_go::LANGUAGE.into();
+                out.extend(commented_out_code(
+                    &content,
+                    &rel,
+                    &lang,
+                    CommentStyle::CStyle,
+                ));
             }
             "java" => {
                 out.extend(empty_catches_java(&content, &rel));
                 out.extend(tautological_tests_java(&content, &rel));
                 out.extend(always_true_conditions_java(&content, &rel));
                 out.extend(passthrough_wrappers_java(&content, &rel));
+                let lang = tree_sitter_java::LANGUAGE.into();
+                out.extend(commented_out_code(
+                    &content,
+                    &rel,
+                    &lang,
+                    CommentStyle::CStyle,
+                ));
             }
             _ => {}
         }
@@ -2743,6 +2791,416 @@ fn relative(path: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
+// ── Commented-out code detection ─────────────────────────────────
+//
+// Find comment blocks whose content re-parses as valid code in the
+// surrounding language. Three shapes trigger:
+//
+//   - contiguous single-line comments (`// a\n// b\n// c`)
+//   - a single block comment (`/* a\n b\n c */`)
+//   - Python triple-quoted string used as a comment (`""" … """` at
+//     module top level, not as a docstring)
+//
+// Guards against false positives:
+//
+//   - require 3+ lines of stripped content
+//   - skip documentation comments (`///`, `//!`, `/**`, `"""..."""`
+//     attached to a declaration)
+//   - skip short marker-only comments (`// TODO:`, `// FIXME:`, etc.)
+//   - require the re-parse to have zero ERROR nodes AND contain at
+//     least one substantive node (function, class, assignment, if,
+//     loop, return, ...) — literal/identifier-only snippets are
+//     usually ambient prose that happens to parse
+//
+// Confidence 0.85 (medium-high): substantive re-parse is a strong
+// signal but language-specific prose (`// x = 1 via env var`) can
+// occasionally trip it.
+
+#[derive(Debug, Clone, Copy)]
+enum CommentStyle {
+    /// `//` single-line, `/* … */` block (Rust, TS/JS, Go, Java, C)
+    CStyle,
+    /// `#` single-line (Python, Shell, TOML)
+    Hash,
+}
+
+/// Substrings that, when they appear early in a comment, mark it as a
+/// note rather than commented-out code. Skipped even if the re-parse
+/// would succeed.
+const COMMENT_NOTE_MARKERS: &[&str] = &[
+    "TODO",
+    "FIXME",
+    "NOTE",
+    "HACK",
+    "XXX",
+    "WARNING",
+    "SAFETY",
+    "agentsys-ignore",
+    "allow(",
+    "SPDX-License",
+];
+
+/// A note comment is any comment group where ANY line starts with a
+/// well-known marker. Checking per-line matters because
+/// `// cleanup\n// TODO: re-enable\n// fn pending() {}` should be
+/// suppressed even though the TODO is on line 2.
+fn is_note_comment(stripped: &str) -> bool {
+    stripped.lines().any(|l| {
+        let trimmed = l.trim_start();
+        let head: &str = trimmed.get(..trimmed.len().min(40)).unwrap_or("");
+        COMMENT_NOTE_MARKERS.iter().any(|m| head.contains(m))
+    })
+}
+
+/// Strip leading whitespace-one-space after a comment marker, preserving
+/// any additional indentation past that. Commented-out Python or any
+/// indented block needs its relative indent kept so it re-parses:
+///
+///   `// body()`           → `body()`
+///   `//     do_work()`    → `    do_work()` (keeps 4 spaces)
+///   `//body()`            → `body()`
+fn strip_one_marker_space(s: &str) -> &str {
+    s.strip_prefix(' ').unwrap_or(s)
+}
+
+/// Strip the comment markers off a single comment node's text, returning
+/// the inner content. For block comments the leading `/*` and trailing
+/// `*/` are removed; for line comments the leading `//` / `#` is
+/// stripped per line. Documentation comment prefixes (`///`, `//!`,
+/// `/**`) return `None` — those are attached to a declaration
+/// and should not be flagged.
+///
+/// Block comments frequently use the "leading star" layout:
+///
+/// ```ignore
+/// /*
+///  * first line
+///  * second line
+///  */
+/// ```
+///
+/// Without normalization the content would be `"\n * first line\n *
+/// second line\n"` which won't re-parse. We detect the case by
+/// requiring every non-empty line after the first to start with
+/// optional whitespace then `*`, and strip that prefix.
+fn strip_comment(text: &str, style: CommentStyle) -> Option<String> {
+    match style {
+        CommentStyle::CStyle => {
+            // Block comment
+            if let Some(inner) = text.strip_prefix("/*").and_then(|s| s.strip_suffix("*/")) {
+                // Outer doc comment `/** … */` (Rust/Java) and inner
+                // doc comment `/*! … */` (Rust) are both attached to
+                // declarations and must never be flagged. Plain block
+                // comments (`/* … */`) pass through.
+                if inner.starts_with('*') && !inner.starts_with("**") {
+                    return None;
+                }
+                if inner.starts_with('!') {
+                    return None;
+                }
+                return Some(strip_leading_stars(inner));
+            }
+            // Line comment: reject doc variants, strip `//`
+            let rest = text.strip_prefix("//")?;
+            if rest.starts_with('/') || rest.starts_with('!') {
+                // `///` or `//!` — doc comment
+                return None;
+            }
+            Some(strip_one_marker_space(rest).to_string())
+        }
+        CommentStyle::Hash => {
+            // Skip shebang lines — those are interpreter directives,
+            // not comments at all.
+            if text.starts_with("#!") {
+                return None;
+            }
+            let rest = text.strip_prefix('#')?;
+            Some(strip_one_marker_space(rest).to_string())
+        }
+    }
+}
+
+/// If every non-empty line after the first in a block-comment body
+/// starts with whitespace then `*`, strip that prefix. This handles
+/// the common " * foo" continuation style without affecting block
+/// comments whose body is already plain indented code.
+fn strip_leading_stars(inner: &str) -> String {
+    let lines: Vec<&str> = inner.lines().collect();
+    if lines.len() < 2 {
+        return inner.to_string();
+    }
+    // First line may be empty (typical `/*\n * …\n */`); decide based
+    // on the remaining lines.
+    let non_empty_tail: Vec<&str> = lines
+        .iter()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .copied()
+        .collect();
+    if non_empty_tail.is_empty() {
+        return inner.to_string();
+    }
+    let all_starred = non_empty_tail
+        .iter()
+        .all(|l| l.trim_start().starts_with('*'));
+    if !all_starred {
+        return inner.to_string();
+    }
+    lines
+        .iter()
+        .map(|l| {
+            let t = l.trim_start();
+            if let Some(rest) = t.strip_prefix('*') {
+                strip_one_marker_space(rest).to_string()
+            } else {
+                (*l).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a comment group originated from a single-line comment or a
+/// block comment. Used to prevent cross-style merges (a block comment
+/// must never be glued onto a run of `//` lines).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentKind {
+    Line,
+    Block,
+}
+
+/// A grouping of consecutive same-style comment nodes. Rows are 0-based
+/// tree-sitter positions.
+struct CommentGroup {
+    start_row: usize,
+    end_row: usize,
+    content: String,
+    kind: CommentKind,
+}
+
+/// Collect comment nodes from the tree, grouping contiguous line
+/// comments (no blank line between them). Block comments are each
+/// their own group and are never merged with neighboring line comments.
+fn collect_comment_groups(
+    tree: &tree_sitter::Tree,
+    source: &[u8],
+    style: CommentStyle,
+) -> Vec<CommentGroup> {
+    let mut out: Vec<CommentGroup> = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        for i in (0..node.child_count()).rev() {
+            if let Some(c) = node.child(i) {
+                stack.push(c);
+            }
+        }
+        let kind_str = node.kind();
+        // Comment node kinds: "comment", "line_comment", "block_comment"
+        // are the common ones across tree-sitter grammars.
+        let is_comment = matches!(kind_str, "comment" | "line_comment" | "block_comment");
+        if !is_comment {
+            continue;
+        }
+        let text = match node.utf8_text(source) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let Some(stripped) = strip_comment(text, style) else {
+            continue;
+        };
+        let start_row = node.start_position().row;
+        let end_row = node.end_position().row;
+
+        // Distinguish block vs. line. Generic "comment" kind + a multi-
+        // line span also counts as block (`/* … */` on multiple lines
+        // in grammars that don't split the two kinds).
+        let kind = if matches!(kind_str, "block_comment")
+            || (kind_str == "comment" && start_row != end_row)
+        {
+            CommentKind::Block
+        } else {
+            CommentKind::Line
+        };
+
+        if kind == CommentKind::Block {
+            out.push(CommentGroup {
+                start_row,
+                end_row,
+                content: stripped,
+                kind,
+            });
+            continue;
+        }
+
+        // Single-line: merge with the previous group only if it is ALSO
+        // a line-comment run AND contiguous (no blank-line gap). Never
+        // merge into a block-comment group — those are standalone by
+        // definition.
+        if let Some(last) = out.last_mut() {
+            if last.kind == CommentKind::Line && last.end_row + 1 == start_row {
+                last.end_row = end_row;
+                last.content.push('\n');
+                last.content.push_str(&stripped);
+                continue;
+            }
+        }
+        out.push(CommentGroup {
+            start_row,
+            end_row,
+            content: stripped,
+            kind,
+        });
+    }
+    // Keep result order deterministic.
+    out.sort_by_key(|g| g.start_row);
+    out
+}
+
+/// Check whether a re-parsed tree has at least one substantive node.
+/// Literals, identifiers, expression wrappers alone aren't enough —
+/// many prose comments happen to parse as a bare identifier.
+fn reparse_has_substantive_node(tree: &tree_sitter::Tree) -> bool {
+    const SUBSTANTIVE_KINDS: &[&str] = &[
+        // Universal statement shapes
+        "function_declaration",
+        "function_item",
+        "function_definition",
+        "method_declaration",
+        "method_definition",
+        "class_declaration",
+        "class_definition",
+        "class_specifier",
+        "struct_item",
+        "enum_item",
+        "trait_item",
+        "impl_item",
+        "mod_item",
+        "use_declaration",
+        "import_statement",
+        "import_from_statement",
+        "import_declaration",
+        "if_statement",
+        "if_expression",
+        "for_statement",
+        "for_expression",
+        "for_in_statement",
+        "for_of_statement",
+        "while_statement",
+        "while_expression",
+        "do_statement",
+        "return_statement",
+        "return_expression",
+        "try_statement",
+        "try_expression",
+        "assignment",
+        "assignment_expression",
+        "let_declaration",
+        "variable_declaration",
+        "lexical_declaration",
+        "const_declaration",
+        "expression_statement", // narrow: still requires the outer to be a real stmt
+        "call_expression",
+        "await_expression",
+        "match_expression",
+        "switch_statement",
+        "throw_statement",
+    ];
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.is_error() {
+            return false;
+        }
+        if SUBSTANTIVE_KINDS.contains(&node.kind()) {
+            return true;
+        }
+        for i in 0..node.child_count() {
+            if let Some(c) = node.child(i) {
+                stack.push(c);
+            }
+        }
+    }
+    false
+}
+
+/// Returns true if the tree contains any ERROR node anywhere. A clean
+/// parse is required to avoid false positives on prose comments that
+/// happen to contain a code-like fragment.
+fn tree_has_parse_errors(tree: &tree_sitter::Tree) -> bool {
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            return true;
+        }
+        for i in 0..node.child_count() {
+            if let Some(c) = node.child(i) {
+                stack.push(c);
+            }
+        }
+    }
+    false
+}
+
+fn commented_out_code(
+    content: &str,
+    rel: &str,
+    language: &tree_sitter::Language,
+    style: CommentStyle,
+) -> Vec<SlopFix> {
+    let mut out = Vec::new();
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(language).is_err() {
+        return out;
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return out;
+    };
+    let groups = collect_comment_groups(&tree, content.as_bytes(), style);
+    for group in groups {
+        // Skip short groups — 3+ content lines required.
+        let line_count = group
+            .content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        if line_count < 3 {
+            continue;
+        }
+        // Skip note-style comments early.
+        if is_note_comment(&group.content) {
+            continue;
+        }
+        // Re-parse with the same language. Clean + substantive required.
+        let mut reparser = tree_sitter::Parser::new();
+        if reparser.set_language(language).is_err() {
+            continue;
+        }
+        let Some(reparsed) = reparser.parse(&group.content, None) else {
+            continue;
+        };
+        if tree_has_parse_errors(&reparsed) {
+            continue;
+        }
+        if !reparse_has_substantive_node(&reparsed) {
+            continue;
+        }
+        let start = (group.start_row as u32) + 1;
+        let end = (group.end_row as u32) + 1;
+        let category = SlopCategory::CommentedOutCode;
+        out.push(SlopFix {
+            action: SlopAction::DeleteLines {
+                path: rel.to_string(),
+                lines: [start, end],
+            },
+            category,
+            reason: format!(
+                "{line_count}-line comment block re-parses as valid code — likely commented-out code, not prose"
+            ),
+            confidence: default_confidence(category),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4005,6 +4463,237 @@ mod tests {
                 .any(|f| f.category == SlopCategory::TrackedArtifact),
             "header directive should suppress file-deletion; got {:?}",
             result.fixes
+        );
+    }
+
+    // ── Commented-out code detector ───────────────
+
+    #[test]
+    fn detects_rust_commented_out_function() {
+        let src = "\
+pub fn real() {}
+// fn removed_fn(x: u32) -> u32 {
+//     let y = x + 1;
+//     y * 2
+// }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "expected a commented-out-code fix; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn detects_typescript_commented_out_block() {
+        let src = "\
+export const ok = 1;
+/*
+function removed(x) {
+  return x + 1;
+}
+*/
+";
+        let dir = make_repo(&[("src/lib.ts", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "expected a commented-out-code fix; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn detects_python_commented_out_block() {
+        let src = "\
+def real():
+    return 1
+# def removed(x):
+#     y = x + 1
+#     return y
+";
+        let dir = make_repo(&[("mod.py", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "expected a commented-out-code fix; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_short_comment_block() {
+        // 2 lines isn't enough — could be a genuine note.
+        let src = "\
+pub fn ok() {}
+// fn removed() {}
+// // nothing here really
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "short comment shouldn't flag; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_doc_comment_on_rust_item() {
+        // Triple-slash doc comments are attached to items and should
+        // never be flagged, even when their content parses as code.
+        let src = "\
+/// fn example(x: u32) -> u32 {
+///     x + 1
+/// }
+pub fn real() {}
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "doc comments shouldn't flag; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_prose_comment_block() {
+        // 3+ lines of prose — shouldn't re-parse as substantive code.
+        let src = "\
+pub fn ok() {}
+// This function computes the next step in the pipeline.
+// It is intentionally decoupled from the I/O layer so callers
+// can plug in their own transport implementation.
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "prose shouldn't flag; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_todo_marker_comment() {
+        // TODO markers are explicitly exempt even when content parses.
+        let src = "\
+pub fn ok() {}
+// TODO: re-enable this once the refactor lands
+// fn pending() {
+//     do_work();
+// }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "TODO marker should suppress; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_todo_marker_on_later_line_of_group() {
+        // TODO markers should suppress even when they appear on the
+        // second or third line of a merged comment group (before the
+        // fix, only the first 40 chars of the concatenated group were
+        // checked; a multi-line "cleanup" header could shadow a TODO).
+        let src = "\
+pub fn ok() {}
+// Keeping this around for the next migration.
+// TODO: delete once v3 ships
+// fn old_impl(x: u32) -> u32 {
+//     let y = x + 1;
+//     y * 2
+// }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "TODO on line 2 should still suppress; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn detects_python_indented_commented_out_block() {
+        // Python requires the commented-out code to re-parse with its
+        // indentation preserved. Before the fix, `trim_start_matches`
+        // destroyed leading whitespace, and `def foo():\nbody()` is
+        // a syntax error.
+        let src = "\
+def real():
+    return 1
+
+# def removed(x):
+#     y = x + 1
+#     return y
+";
+        let dir = make_repo(&[("mod.py", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "indented Python should flag; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_rust_inner_doc_block_comment() {
+        // `/*! … */` is a Rust inner-doc block attached to the
+        // enclosing item/module. Even if its content parses, we
+        // shouldn't flag it.
+        let src = "\
+/*! fn example(x: u32) -> u32 {
+ *      x + 1
+ *  }
+ */
+pub fn real() {}
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "inner-doc block shouldn't flag; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn detects_leading_star_block_comment() {
+        // The classic Java/Rust leading-star block layout must strip
+        // the ` * ` continuation before re-parsing.
+        let src = "\
+pub fn ok() {}
+/*
+ * fn removed(x: u32) -> u32 {
+ *     let y = x + 1;
+ *     y * 2
+ * }
+ */
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "leading-star block should flag; got {fixes:?}"
         );
     }
 }
