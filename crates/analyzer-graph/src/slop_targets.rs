@@ -382,6 +382,11 @@ fn identifier_has_cliche_word(name: &str, cliche: &[&str]) -> bool {
 fn tokenize_identifier(name: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
+    // Track previous char in a local instead of calling
+    // `current.chars().last()` on every iteration — that turns the
+    // tokenizer from O(N²) (worst case on long single-token names)
+    // to O(N).
+    let mut prev_char: Option<char> = None;
 
     let chars: Vec<char> = name.chars().collect();
     for (i, c) in chars.iter().enumerate() {
@@ -389,11 +394,11 @@ fn tokenize_identifier(name: &str) -> Vec<String> {
             if !current.is_empty() {
                 tokens.push(std::mem::take(&mut current));
             }
+            prev_char = None;
             continue;
         }
 
-        if !current.is_empty() {
-            let prev = current.chars().last().unwrap();
+        if let Some(prev) = prev_char {
             // Boundary: lower→upper (camelCase), digit↔letter, letter↔digit.
             let is_boundary = (prev.is_ascii_lowercase() && c.is_ascii_uppercase())
                 || (prev.is_ascii_alphabetic() && c.is_ascii_digit())
@@ -409,6 +414,7 @@ fn tokenize_identifier(name: &str) -> Vec<String> {
             }
         }
         current.push(*c);
+        prev_char = Some(*c);
     }
     if !current.is_empty() {
         tokens.push(current);

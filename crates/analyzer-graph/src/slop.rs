@@ -130,10 +130,12 @@ fn apply_suppressions(repo_root: &Path, fixes: Vec<SlopFix>) -> Vec<SlopFix> {
                 return true;
             }
             let path = path.unwrap();
-            let suppressions = cache
-                .entry(path.to_string())
-                .or_insert_with(|| FileSuppressions::load(repo_root, path));
-            let Some(supp) = suppressions else {
+            // Avoid the per-call String allocation that `entry()` would
+            // force on every cache hit; only allocate when inserting.
+            if !cache.contains_key(path) {
+                cache.insert(path.to_string(), FileSuppressions::load(repo_root, path));
+            }
+            let Some(supp) = cache.get(path).and_then(|o| o.as_ref()) else {
                 return true;
             };
             !supp.suppresses(fix)
@@ -176,23 +178,21 @@ impl FileSuppressions {
         for (idx, line) in content.lines().enumerate() {
             let line_no = (idx as u32) + 1;
             let in_header = line_no <= 5;
-            let trimmed = line.trim_start();
 
-            // Strip a single leading comment marker (//, #, --) so we
-            // can detect the directive uniformly across languages.
-            let after_marker = trimmed
-                .strip_prefix("// ")
-                .or_else(|| trimmed.strip_prefix("//"))
-                .or_else(|| trimmed.strip_prefix("# "))
-                .or_else(|| trimmed.strip_prefix("#"))
-                .or_else(|| trimmed.strip_prefix("-- "))
-                .or_else(|| trimmed.strip_prefix("--"));
-            let Some(directive) = after_marker else {
+            // Find any agentsys-ignore directive on this line, whether
+            // the line is a comment-only line OR a code line with a
+            // trailing comment (`catch {} // agentsys-ignore: …`).
+            // We scan for the directive substring directly, then walk
+            // back to confirm it's preceded by a recognized comment
+            // marker (`//`, `#`, `--`). This avoids the trim_start +
+            // strip_prefix path which only handled comment-only lines.
+            let Some(directive) = find_agentsys_directive(line) else {
                 continue;
             };
-            let directive = directive.trim();
 
-            if directive == "agentsys-ignore-all" || directive.starts_with("agentsys-ignore-all ") {
+            if directive == "agentsys-ignore-all"
+                || directive.starts_with("agentsys-ignore-all ")
+            {
                 if in_header {
                     s.header_all = true;
                 }
@@ -200,9 +200,14 @@ impl FileSuppressions {
                 continue;
             }
             if let Some(rest) = directive.strip_prefix("agentsys-ignore:") {
+                // Strip trailing comments / whitespace per category so
+                // `// agentsys-ignore: empty-catch trailing notes` works.
                 let cats = rest
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
                     .split(',')
-                    .map(|c| c.trim().to_string())
+                    .filter_map(|c| c.split_whitespace().next().map(str::to_string))
                     .filter(|c| !c.is_empty());
                 let entry = s.line_categories.entry(line_no).or_default();
                 for cat in cats {
@@ -217,13 +222,10 @@ impl FileSuppressions {
     }
 
     fn suppresses(&self, fix: &SlopFix) -> bool {
-        let cat_str = serde_json::to_value(fix.category)
-            .ok()
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_default();
+        let cat_str = category_kebab(fix.category);
         match &fix.action {
             SlopAction::DeleteFile { .. } => {
-                self.header_all || self.header_categories.contains(&cat_str)
+                self.header_all || self.header_categories.contains(cat_str)
             }
             SlopAction::DeleteLines { lines, .. } | SlopAction::ReplaceLines { lines, .. } => {
                 let target_line = lines[0];
@@ -244,7 +246,7 @@ impl FileSuppressions {
                     if self
                         .line_categories
                         .get(&candidate)
-                        .map(|set| set.contains(&cat_str))
+                        .map(|set| set.contains(cat_str))
                         .unwrap_or(false)
                     {
                         return true;
@@ -253,6 +255,38 @@ impl FileSuppressions {
                 false
             }
         }
+    }
+}
+
+/// Locate an `agentsys-ignore...` directive on a single source line.
+/// Handles both comment-only lines (`// agentsys-ignore: …`) and
+/// inline trailing comments (`catch {} // agentsys-ignore: …`) by
+/// scanning for the directive substring and confirming a recognized
+/// comment marker (`//`, `#`, `--`) appears before it.
+fn find_agentsys_directive(line: &str) -> Option<&str> {
+    let pos = line.find("agentsys-ignore")?;
+    // Walk back through whitespace to the comment marker.
+    let prefix = line[..pos].trim_end();
+    let valid_marker = prefix.ends_with("//")
+        || prefix.ends_with('#')
+        || prefix.ends_with("--");
+    if !valid_marker {
+        return None;
+    }
+    Some(line[pos..].trim_end())
+}
+
+/// Map a [`SlopCategory`] to its kebab-case string. Avoids the
+/// per-call `serde_json::to_value` allocation flagged by reviewers —
+/// this is hit on every fix during suppression filtering.
+fn category_kebab(c: SlopCategory) -> &'static str {
+    match c {
+        SlopCategory::TrackedArtifact => "tracked-artifact",
+        SlopCategory::StaleCiConfig => "stale-ci-config",
+        SlopCategory::DuplicateTooling => "duplicate-tooling",
+        SlopCategory::OrphanExport => "orphan-export",
+        SlopCategory::EmptyCatch => "empty-catch",
+        SlopCategory::TautologicalTest => "tautological-test",
     }
 }
 
