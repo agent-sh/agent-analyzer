@@ -1037,12 +1037,9 @@ fn run_query(query: QueryAction) -> Result<()> {
             let mut result = analyzer_graph::slop::slop_fixes(&path, &map);
             if !files.is_empty() {
                 let allowed = file_filter_set(&files);
-                result.fixes.retain(|f| {
-                    f.action
-                        .path()
-                        .map(|p| allowed.contains(&normalize_rel_path(p)))
-                        .unwrap_or(false)
-                });
+                result
+                    .fixes
+                    .retain(|f| allowed.contains(&normalize_rel_path(f.action.path())));
                 // by_file is derived from fixes; regenerate to stay in sync.
                 result.by_file = analyzer_graph::slop::group_by_file(&result.fixes);
             }

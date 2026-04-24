@@ -49,13 +49,14 @@ pub enum SlopAction {
 }
 
 impl SlopAction {
-    /// Target file for this action. Every variant has a path; this
-    /// helper is used by the CLI `--files` filter and consumers.
-    pub fn path(&self) -> Option<&str> {
+    /// Target file for this action. Every variant has a path, so
+    /// this is total. Used by the CLI `--files` filter and consumers
+    /// that group / dedupe by target path.
+    pub fn path(&self) -> &str {
         match self {
             SlopAction::DeleteFile { path }
             | SlopAction::DeleteLines { path, .. }
-            | SlopAction::ReplaceLines { path, .. } => Some(path.as_str()),
+            | SlopAction::ReplaceLines { path, .. } => path.as_str(),
         }
     }
 }
@@ -3263,22 +3264,85 @@ const ALLOW_SUPPRESSION_LINTS: &[&str] = &[
     "unused_must_use",
 ];
 
-/// Collect every name referenced by an `imports[].names` entry across
-/// the map. The return value is a `HashSet<String>` keyed on the
-/// exact name string — conservative matching, not case-folded, since
-/// Rust identifiers are case-sensitive.
-fn collect_used_names(map: &RepoIntelData) -> HashSet<String> {
-    let mut used = HashSet::new();
+/// Collected usage information from the symbol graph.
+///
+/// The detector needs both "name is imported somewhere" (fast
+/// membership test) and "which module paths reference this name"
+/// (used to bias toward same-crate matches and away from
+/// cross-module name collisions). Keeping both in one struct so the
+/// build walk happens once.
+struct UsedSymbols {
+    /// Every imported name seen across the map. Rust identifiers are
+    /// case-sensitive so no case-folding.
+    all_names: HashSet<String>,
+    /// Per-name: the set of `imports[].from` module-path strings that
+    /// imported it. Lets the caller check `name "helper" is imported
+    /// from a path that could plausibly resolve to our file` rather
+    /// than blindly trusting a bare-name collision.
+    modules_per_name: HashMap<String, HashSet<String>>,
+}
+
+fn collect_used_symbols(map: &RepoIntelData) -> UsedSymbols {
+    let mut all_names = HashSet::new();
+    let mut modules_per_name: HashMap<String, HashSet<String>> = HashMap::new();
     if let Some(syms) = map.symbols.as_ref() {
         for (_path, file_syms) in syms.iter() {
             for imp in &file_syms.imports {
                 for name in &imp.names {
-                    used.insert(name.clone());
+                    all_names.insert(name.clone());
+                    modules_per_name
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(imp.from.clone());
                 }
             }
         }
     }
-    used
+    UsedSymbols {
+        all_names,
+        modules_per_name,
+    }
+}
+
+/// Return true if any `imports[].from` value looks like it could path
+/// to the given file. A bare `crate::foo::bar` import gets matched
+/// against the file path by taking each path segment and checking
+/// whether the file's relative path contains that segment. It's
+/// permissive by design — a hit is strong evidence, a miss would
+/// wrongly spare a real stale suppression.
+///
+/// For a file `crates/foo/src/helpers.rs` and an import `from =
+/// "crate::helpers"`, the segments [`crate`, `helpers`] both appear
+/// in the path, so we return true.
+///
+/// When no cross-file import data is available for a name (which can
+/// happen for inherent methods or crate-private usage the import
+/// collector didn't capture) we conservatively return true so the
+/// detector falls back to the all-names membership check it had
+/// before.
+fn import_paths_could_resolve_to_file(modules: &HashSet<String>, rel_file: &str) -> bool {
+    if modules.is_empty() {
+        return true;
+    }
+    let file_norm = rel_file.replace('\\', "/");
+    for module in modules {
+        let segments: Vec<&str> = module
+            .split("::")
+            .filter(|s| !s.is_empty() && *s != "crate" && *s != "self" && *s != "super")
+            .collect();
+        if segments.is_empty() {
+            // `crate` or `self` alone — any file in the same crate is
+            // a valid target. Treat as a match.
+            return true;
+        }
+        if segments
+            .iter()
+            .any(|seg| file_norm.contains(&format!("/{seg}")) || file_norm.starts_with(seg))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse an `#[allow(...)]` attribute via AST structure, not text
@@ -3364,42 +3428,65 @@ fn extract_allow_lints(attribute_node: &tree_sitter::Node, source: &[u8]) -> Vec
 /// Find the identifier of the item an attribute is attached to. Rust
 /// tree-sitter puts attribute_item as a sibling before the decorated
 /// item inside the same enclosing scope. We walk forward siblings
-/// skipping whitespace/other attributes until we hit one of the
-/// target item kinds.
+/// skipping whitespace/other attributes/macros until we hit an item
+/// with a named identifier, or run out.
+///
+/// Returning `None` for unrecognized kinds rather than aborting means
+/// stacked attributes work: `#[allow(dead_code)] #[derive(Debug)] struct
+/// Foo` walks attr → attr → struct_item and finds `Foo`.
 fn next_item_identifier<'a>(
     attr: &tree_sitter::Node<'a>,
     source: &[u8],
 ) -> Option<(String, tree_sitter::Node<'a>)> {
+    const NAMED_ITEM_KINDS: &[&str] = &[
+        "function_item",
+        "function_signature_item",
+        "struct_item",
+        "enum_item",
+        "mod_item",
+        "const_item",
+        "static_item",
+        "trait_item",
+        "type_item",
+        "union_item",
+        "extern_crate_declaration",
+    ];
+    const SKIP_KINDS: &[&str] = &[
+        "attribute_item",
+        "line_comment",
+        "block_comment",
+        "macro_invocation",
+        "inner_doc_comment_marker",
+        "outer_doc_comment_marker",
+    ];
     let mut cur = attr.next_named_sibling();
     while let Some(node) = cur {
-        match node.kind() {
-            "attribute_item" | "line_comment" | "block_comment" => {
-                cur = node.next_named_sibling();
-                continue;
-            }
-            "function_item"
-            | "function_signature_item"
-            | "struct_item"
-            | "enum_item"
-            | "mod_item"
-            | "const_item"
-            | "static_item"
-            | "trait_item"
-            | "type_item"
-            | "union_item" => {
-                let name_node = node.child_by_field_name("name")?;
-                let name = name_node.utf8_text(source).ok()?.to_string();
-                return Some((name, node));
-            }
-            _ => return None,
+        let kind = node.kind();
+        if SKIP_KINDS.contains(&kind) {
+            cur = node.next_named_sibling();
+            continue;
         }
+        if NAMED_ITEM_KINDS.contains(&kind) {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Ok(name) = name_node.utf8_text(source)
+            {
+                return Some((name.to_string(), node));
+            }
+            return None;
+        }
+        // impl_item / use_declaration / foreign_mod_item / etc. are
+        // legitimately decorated but don't carry a single name field
+        // we can check against the usage graph. Treat as "can't
+        // determine" and move on — underreporting is safer than
+        // false positives on an impl block.
+        return None;
     }
     None
 }
 
 fn stale_suppressions_rust(repo_root: &Path, map: &RepoIntelData) -> Vec<SlopFix> {
-    let used = collect_used_names(map);
-    if used.is_empty() {
+    let used = collect_used_symbols(map);
+    if used.all_names.is_empty() {
         // No symbol graph → we can't tell used from unused; skip
         // rather than emit false positives.
         return Vec::new();
@@ -3446,16 +3533,40 @@ fn stale_suppressions_rust(repo_root: &Path, map: &RepoIntelData) -> Vec<SlopFix
             };
             let attr = cap.node;
             let lints = extract_allow_lints(&attr, source);
-            let is_suppression = lints
+            if lints.is_empty() {
+                continue;
+            }
+            // Only emit when EVERY lint in the attribute is a stale
+            // suppression candidate. Mixed-lint attributes like
+            // `#[allow(non_snake_case, dead_code)]` get left alone —
+            // deleting the whole line would silently drop the
+            // non-suppression lint (`non_snake_case` here). A future
+            // enhancement could emit a ReplaceLines that keeps the
+            // non-suppression lints, but for now we prefer under-
+            // reporting to a fix that breaks other lints.
+            let all_suppression = lints
                 .iter()
-                .any(|l| ALLOW_SUPPRESSION_LINTS.contains(&l.as_str()));
-            if !is_suppression {
+                .all(|l| ALLOW_SUPPRESSION_LINTS.contains(&l.as_str()));
+            if !all_suppression {
                 continue;
             }
             let Some((name, _item_node)) = next_item_identifier(&attr, source) else {
                 continue;
             };
-            if !used.contains(&name) {
+            if !used.all_names.contains(&name) {
+                continue;
+            }
+            // Name-collision guard: a `#[allow(dead_code)]` on a
+            // private `helper` in src/a.rs shouldn't be flagged just
+            // because an unrelated file imports a different `helper`
+            // from a different module. Require that at least one of
+            // the `imports[].from` paths for this name could plausibly
+            // resolve to the current file (segment match). When no
+            // import path info is available we fall through
+            // permissively — see `import_paths_could_resolve_to_file`.
+            if let Some(modules) = used.modules_per_name.get(&name)
+                && !import_paths_could_resolve_to_file(modules, &rel)
+            {
                 continue;
             }
             let start = (attr.start_position().row as u32) + 1;
@@ -4976,6 +5087,10 @@ pub fn ok() {}
 
     // ── Stale suppression annotations ─────────────────────
 
+    /// Build a map where `file` imports `imported` from `crate::lib`.
+    /// The "lib" segment is chosen so the default src/lib.rs target
+    /// file in the stale-suppression tests matches the import-path
+    /// resolution check (segment match against "lib").
     fn map_with_import(file: &str, imported: &[&str]) -> RepoIntelData {
         let mut m = empty_map();
         let mut syms = std::collections::HashMap::new();
@@ -4984,7 +5099,7 @@ pub fn ok() {}
             analyzer_core::types::FileSymbols {
                 exports: Vec::new(),
                 imports: vec![analyzer_core::types::ImportEntry {
-                    from: "crate::other".to_string(),
+                    from: "crate::lib".to_string(),
                     names: imported.iter().map(|s| s.to_string()).collect(),
                 }],
                 definitions: Vec::new(),
@@ -5092,6 +5207,66 @@ pub fn helper(x: u32) -> u32 { x + 1 }
                 .iter()
                 .any(|f| f.category == SlopCategory::StaleSuppression),
             "should skip test files; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn ignores_mixed_lint_allow_with_non_suppression() {
+        // `#[allow(non_snake_case, dead_code)]` on a used symbol
+        // must NOT be flagged — deleting the line would silently
+        // drop the `non_snake_case` lint suppression. Mixed-lint
+        // attributes are left alone until we can rewrite them
+        // surgically.
+        let src = "\
+#[allow(non_snake_case, dead_code)]
+pub fn Helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let map = map_with_import("src/consumer.rs", &["Helper"]);
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should not flag mixed-lint attribute; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_name_collision() {
+        // `helper` in src/module_a.rs has #[allow(dead_code)].
+        // Another file imports `helper` from `crate::module_b`. Name
+        // collision does NOT imply module_a's helper is used.
+        let src_a = "\
+#[allow(dead_code)]
+pub fn helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/module_a.rs", src_a)]);
+        let mut m = empty_map();
+        let mut syms = std::collections::HashMap::new();
+        syms.insert(
+            "src/consumer.rs".to_string(),
+            analyzer_core::types::FileSymbols {
+                exports: Vec::new(),
+                imports: vec![analyzer_core::types::ImportEntry {
+                    // Path clearly targets module_b, NOT module_a.
+                    from: "crate::module_b".to_string(),
+                    names: vec!["helper".to_string()],
+                }],
+                definitions: Vec::new(),
+            },
+        );
+        m.symbols = Some(syms);
+        let result = slop_fixes(dir.path(), &m);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should not flag helper in module_a when import targets module_b; got {:?}",
             result.fixes
         );
     }
