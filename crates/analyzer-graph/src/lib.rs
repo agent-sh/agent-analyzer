@@ -19,6 +19,7 @@ pub mod cochange;
 pub mod louvain;
 pub mod queries;
 pub mod slop;
+pub mod slop_nlp;
 pub mod slop_targets;
 
 use analyzer_core::types::RepoIntelData;

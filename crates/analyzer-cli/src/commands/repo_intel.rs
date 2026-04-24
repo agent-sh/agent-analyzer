@@ -993,7 +993,16 @@ fn run_query(query: QueryAction) -> Result<()> {
             top,
         } => {
             let map = load_map(&map_file)?;
-            let result = analyzer_graph::slop_targets::slop_targets(&map, top);
+            let sidecar_path = derive_sidecar_path(&map_file);
+            let sidecar = if sidecar_path.exists() {
+                let bytes = std::fs::read(&sidecar_path)
+                    .with_context(|| format!("read sidecar: {}", sidecar_path.display()))?;
+                Some(analyzer_embed::sidecar::Sidecar::read(&bytes[..])?)
+            } else {
+                None
+            };
+            let result =
+                analyzer_graph::slop_targets::slop_targets(&map, sidecar.as_ref(), top);
             println!("{}", output::to_json(&result));
         }
         QueryAction::Summary {

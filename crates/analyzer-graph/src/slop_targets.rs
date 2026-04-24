@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use analyzer_core::types::{FileActivity, RepoIntelData, SymbolKind};
+use analyzer_embed::sidecar::Sidecar;
 
 /// Which model tier should pick this target up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,12 +95,25 @@ pub struct SlopTargetsResult {
 }
 
 /// Run all detectors and return the unified ranked list.
-pub fn slop_targets(map: &RepoIntelData, top_per_tier: usize) -> SlopTargetsResult {
+///
+/// `sidecar` is optional: when present, NLP-derived rows (stylistic
+/// outliers, semantic duplicates) are layered onto the AST/graph rows.
+/// When absent, the function returns only the cheap signals — same
+/// shape, fewer rows.
+pub fn slop_targets(
+    map: &RepoIntelData,
+    sidecar: Option<&Sidecar>,
+    top_per_tier: usize,
+) -> SlopTargetsResult {
     let mut sonnet = sonnet_file_targets(map, top_per_tier);
     let mut opus = opus_area_targets(map, top_per_tier);
-    let mut all = Vec::with_capacity(sonnet.len() + opus.len());
+    let mut nlp = sidecar
+        .map(|s| crate::slop_nlp::nlp_targets(s, top_per_tier))
+        .unwrap_or_default();
+    let mut all = Vec::with_capacity(sonnet.len() + opus.len() + nlp.len());
     all.append(&mut sonnet);
     all.append(&mut opus);
+    all.append(&mut nlp);
     SlopTargetsResult { targets: all }
 }
 
@@ -576,7 +590,7 @@ mod tests {
     #[test]
     fn empty_map_yields_no_targets() {
         let map = empty_map();
-        let res = slop_targets(&map, 10);
+        let res = slop_targets(&map, None, 10);
         assert!(res.targets.is_empty());
     }
 
@@ -589,7 +603,7 @@ mod tests {
         map.file_activity
             .insert("src/calm.rs".into(), activity(2, 0, vec!["alice"]));
 
-        let res = slop_targets(&map, 10);
+        let res = slop_targets(&map, None, 10);
         let target = res.targets.iter().find(|t| matches!(
             t,
             SlopTarget::File { path, .. } if path == "src/hot.rs"
@@ -633,7 +647,7 @@ mod tests {
             activity(20, 0, vec!["dependabot[bot]"]),
         );
 
-        let res = slop_targets(&map, 10);
+        let res = slop_targets(&map, None, 10);
         let bot_target = res.targets.iter().find(|t| matches!(
             t,
             SlopTarget::File { path, suspect, .. }
@@ -673,7 +687,7 @@ mod tests {
         );
         map.symbols = Some(symbols);
 
-        let res = slop_targets(&map, 10);
+        let res = slop_targets(&map, None, 10);
         let area = res.targets.iter().find(|t| matches!(
             t,
             SlopTarget::Area { tier, suspect, .. }
@@ -696,7 +710,7 @@ mod tests {
         g.insert("d.rs".into(), vec!["leaf.rs".into()]);
         map.import_graph = Some(g);
 
-        let res = slop_targets(&map, 10);
+        let res = slop_targets(&map, None, 10);
         let chain = res.targets.iter().find(|t| matches!(
             t,
             SlopTarget::Area { suspect, .. } if *suspect == SlopSuspect::WrapperTower
@@ -725,7 +739,7 @@ mod tests {
         g.insert("src/main.rs".into(), vec!["src/store.rs".into()]);
         map.import_graph = Some(g);
 
-        let res = slop_targets(&map, 10);
+        let res = slop_targets(&map, None, 10);
         let single = res.targets.iter().find(|t| matches!(
             t,
             SlopTarget::Area { suspect, .. } if *suspect == SlopSuspect::SingleImpl
