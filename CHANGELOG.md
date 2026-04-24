@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-24
+
+### Changed (BREAKING)
+
+- **Drop all AI attribution detection** (#17) - `aiAttribution`, `aiRatio`, and `recentAi` query and CLI subcommands removed. The surface conflated bot commits with human AI authorship and produced misleading ratios. Bot detection is now isolated in its own `bot_detect` module so the human/bot contributor split still works. The diff-risk formula has been adjusted to drop the removed AI-ratio term.
+
+### Added
+
+- **`bug_fix_detect` module** (#18) - broadened bug-fix classification beyond Conventional Commit `fix:` prefix. Now recognises plain-English fix subjects ("Fix race condition", "Resolves #42", "hotfix for prod"), keyword variants, and issue-closure phrases. Whole-word matching guards against `prefix`/`suffix`/`unfixable` false positives.
+- **`generated_detect` module** (#19) - suppresses bug-fix attribution for auto-generated files. `fix(schema)` commits no longer pollute bugspots scores through their generated `.pb.go`/`.d.ts` bindings. New `FileActivity.generated` field with `#[serde(default)]` for backward compatibility.
+- **`entry-points` query** (#23) - lists every place execution can start: binaries, `main` functions, npm scripts. Workspace-aware Cargo handling included.
+- **`find <concept>` query** (#24) - deterministic concept-to-file search. Collapses `grep -r` into ranked output with a one-line "why" per result.
+- **`set-descriptors` and `set-summary` subcommands** (#25) - accept JSON via stdin to store LLM-produced file descriptors and repo summaries in the artifact. New `summary` query reads the stored summary. `find` becomes descriptor-aware, using stored semantic descriptors to surface results beyond lexical matches. The Rust crate remains offline-only; descriptors and summaries are populated by external Haiku agents via the repo-intel JS plugin.
+
 ## [0.4.0] - 2026-04-23
 
 ### Added

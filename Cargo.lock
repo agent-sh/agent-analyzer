@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "analyzer-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "analyzer-collectors",
  "analyzer-core",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "analyzer-collectors"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "analyzer-core",
  "anyhow",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "analyzer-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "analyzer-git-map"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "analyzer-core",
  "anyhow",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "analyzer-graph"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "analyzer-core",
  "anyhow",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "analyzer-repo-map"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "analyzer-core",
  "anyhow",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "analyzer-sync-check"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "analyzer-core",
  "anyhow",
