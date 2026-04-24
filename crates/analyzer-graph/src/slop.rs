@@ -59,6 +59,12 @@ pub enum SlopCategory {
     OrphanExport,
     EmptyCatch,
     TautologicalTest,
+    /// A function whose entire body is a single call to another
+    /// function with the same arguments — a wrapper that adds no
+    /// transformation, validation, or composition. Common AI-slop
+    /// pattern (`fn get_user(id) { fetch_user(id) }`) and a clear
+    /// candidate for inlining at the call site.
+    PassthroughWrapper,
     /// A condition that always evaluates to the same value: `if true`,
     /// `if false`, `if 1 == 1`, `if x != null && x == null`. Either
     /// the branch is dead code or the surrounding logic is wrong.
@@ -97,6 +103,7 @@ pub fn default_confidence(category: SlopCategory) -> Confidence {
         // Pre-located but pattern-suggested rather than dead-certain
         SlopCategory::StaleCiConfig => 0.90,
         SlopCategory::DuplicateTooling => 0.85,
+        SlopCategory::PassthroughWrapper => 0.85,
         // Sensitive to import-graph completeness; recommend review
         SlopCategory::OrphanExport => 0.75,
     }
@@ -174,6 +181,10 @@ pub fn group_by_file(fixes: &[SlopFix]) -> Vec<FileFixes> {
 /// `repo_root` is the working tree (used by path-based detectors).
 /// `map` is the loaded repo-intel artifact (provides import graph,
 /// project metadata, etc).
+///
+/// Findings are filtered against per-line suppression comments
+/// (`// agentsys-ignore: <category>` or `# agentsys-ignore: <category>`)
+/// before being returned — see [`apply_suppressions`].
 pub fn slop_fixes(repo_root: &Path, map: &RepoIntelData) -> SlopFixesResult {
     let mut fixes = Vec::new();
 
@@ -183,8 +194,198 @@ pub fn slop_fixes(repo_root: &Path, map: &RepoIntelData) -> SlopFixesResult {
     fixes.extend(orphan_exports(map));
     fixes.extend(ast_findings(repo_root));
 
+    let fixes = apply_suppressions(repo_root, fixes);
     let by_file = group_by_file(&fixes);
     SlopFixesResult { fixes, by_file }
+}
+
+/// Drop fixes whose target line is annotated with an
+/// `agentsys-ignore: <category>` comment on the same line or the line
+/// immediately above. Comment forms recognized:
+///
+///   - `// agentsys-ignore: orphan-export`           (Rust / TS / JS / Java / Go / C)
+///   - `# agentsys-ignore: empty-catch`              (Python / Shell / TOML)
+///   - `// agentsys-ignore: tracked-artifact, orphan-export`  (comma-separated list)
+///   - `// agentsys-ignore-all`                      (suppresses every category)
+///
+/// File-deletion fixes (`tracked-artifact`, `stale-ci-config`,
+/// `duplicate-tooling`) are suppressible by an `agentsys-ignore` comment
+/// in the file's first 5 lines (file-header convention).
+///
+/// Per-line fixes (`orphan-export`, `empty-catch`, `tautological-test`)
+/// are suppressible by a comment on the fix line OR the line above —
+/// matching how `eslint-disable-next-line` and `// noqa` work in
+/// other linters.
+fn apply_suppressions(repo_root: &Path, fixes: Vec<SlopFix>) -> Vec<SlopFix> {
+    use std::collections::HashMap;
+    // Cache file → suppression map across fixes from the same file
+    // so we don't re-read+re-parse the source for each finding.
+    let mut cache: HashMap<String, Option<FileSuppressions>> = HashMap::new();
+
+    fixes
+        .into_iter()
+        .filter(|fix| {
+            let path = fix_target_path(fix);
+            if path.is_none() {
+                return true;
+            }
+            let path = path.unwrap();
+            // Avoid the per-call String allocation that `entry()` would
+            // force on every cache hit; only allocate when inserting.
+            if !cache.contains_key(path) {
+                cache.insert(path.to_string(), FileSuppressions::load(repo_root, path));
+            }
+            let Some(supp) = cache.get(path).and_then(|o| o.as_ref()) else {
+                return true;
+            };
+            !supp.suppresses(fix)
+        })
+        .collect()
+}
+
+fn fix_target_path(fix: &SlopFix) -> Option<&str> {
+    match &fix.action {
+        SlopAction::DeleteFile { path } => Some(path.as_str()),
+        SlopAction::DeleteLines { path, .. } => Some(path.as_str()),
+        SlopAction::ReplaceLines { path, .. } => Some(path.as_str()),
+    }
+}
+
+/// Per-file suppression index: `agentsys-ignore` comments parsed once
+/// per file and reused across every fix targeting that file.
+struct FileSuppressions {
+    /// Header suppressions (lines 1-5) apply to file-level actions.
+    header_categories: std::collections::HashSet<String>,
+    /// Per-line suppressions: line N suppresses fixes on N or N+1.
+    line_categories: std::collections::HashMap<u32, std::collections::HashSet<String>>,
+    /// `agentsys-ignore-all` line numbers — suppress every category.
+    line_all: std::collections::HashSet<u32>,
+    /// Header-scope `agentsys-ignore-all` flag — suppresses every category
+    /// for any fix targeting this file.
+    header_all: bool,
+}
+
+impl FileSuppressions {
+    fn load(repo_root: &Path, rel_path: &str) -> Option<Self> {
+        let abs = repo_root.join(rel_path);
+        let content = std::fs::read_to_string(&abs).ok()?;
+        let mut s = FileSuppressions {
+            header_categories: Default::default(),
+            line_categories: Default::default(),
+            line_all: Default::default(),
+            header_all: false,
+        };
+        for (idx, line) in content.lines().enumerate() {
+            let line_no = (idx as u32) + 1;
+            let in_header = line_no <= 5;
+
+            // Find any agentsys-ignore directive on this line, whether
+            // the line is a comment-only line OR a code line with a
+            // trailing comment (`catch {} // agentsys-ignore: …`).
+            // We scan for the directive substring directly, then walk
+            // back to confirm it's preceded by a recognized comment
+            // marker (`//`, `#`, `--`). This avoids the trim_start +
+            // strip_prefix path which only handled comment-only lines.
+            let Some(directive) = find_agentsys_directive(line) else {
+                continue;
+            };
+
+            if directive == "agentsys-ignore-all" || directive.starts_with("agentsys-ignore-all ") {
+                if in_header {
+                    s.header_all = true;
+                }
+                s.line_all.insert(line_no);
+                continue;
+            }
+            if let Some(rest) = directive.strip_prefix("agentsys-ignore:") {
+                // Strip trailing comments / whitespace per category so
+                // `// agentsys-ignore: empty-catch trailing notes` works.
+                let cats = rest
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter_map(|c| c.split_whitespace().next().map(str::to_string))
+                    .filter(|c| !c.is_empty());
+                let entry = s.line_categories.entry(line_no).or_default();
+                for cat in cats {
+                    if in_header {
+                        s.header_categories.insert(cat.clone());
+                    }
+                    entry.insert(cat);
+                }
+            }
+        }
+        Some(s)
+    }
+
+    fn suppresses(&self, fix: &SlopFix) -> bool {
+        let cat_str = category_kebab(fix.category);
+        match &fix.action {
+            SlopAction::DeleteFile { .. } => {
+                self.header_all || self.header_categories.contains(cat_str)
+            }
+            SlopAction::DeleteLines { lines, .. } | SlopAction::ReplaceLines { lines, .. } => {
+                let target_line = lines[0];
+                // Lookback window matches the `eslint-disable-next-line`
+                // convention but extends 3 lines to handle Python's
+                // try/except where the directive sits above `try:` and
+                // the offending body line is two below — and Rust's
+                // multi-line attribute prefixes (`#[cfg(test)]` then
+                // `#[allow(...)]` then the function).
+                for n in 0..=3u32 {
+                    let candidate = target_line.saturating_sub(n);
+                    if candidate == 0 {
+                        break;
+                    }
+                    if self.line_all.contains(&candidate) {
+                        return true;
+                    }
+                    if self
+                        .line_categories
+                        .get(&candidate)
+                        .map(|set| set.contains(cat_str))
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Locate an `agentsys-ignore...` directive on a single source line.
+/// Handles both comment-only lines (`// agentsys-ignore: …`) and
+/// inline trailing comments (`catch {} // agentsys-ignore: …`) by
+/// scanning for the directive substring and confirming a recognized
+/// comment marker (`//`, `#`, `--`) appears before it.
+fn find_agentsys_directive(line: &str) -> Option<&str> {
+    let pos = line.find("agentsys-ignore")?;
+    // Walk back through whitespace to the comment marker.
+    let prefix = line[..pos].trim_end();
+    let valid_marker = prefix.ends_with("//") || prefix.ends_with('#') || prefix.ends_with("--");
+    if !valid_marker {
+        return None;
+    }
+    Some(line[pos..].trim_end())
+}
+
+/// Map a [`SlopCategory`] to its kebab-case string. Avoids the
+/// per-call `serde_json::to_value` allocation flagged by reviewers —
+/// this is hit on every fix during suppression filtering.
+fn category_kebab(c: SlopCategory) -> &'static str {
+    match c {
+        SlopCategory::TrackedArtifact => "tracked-artifact",
+        SlopCategory::StaleCiConfig => "stale-ci-config",
+        SlopCategory::DuplicateTooling => "duplicate-tooling",
+        SlopCategory::OrphanExport => "orphan-export",
+        SlopCategory::EmptyCatch => "empty-catch",
+        SlopCategory::TautologicalTest => "tautological-test",
+        SlopCategory::PassthroughWrapper => "passthrough-wrapper",
+        SlopCategory::AlwaysTrueCondition => "always-true-condition",
+    }
 }
 
 // ── Path-based detectors ─────────────────────────────────────────
@@ -388,6 +589,18 @@ fn orphan_exports(map: &RepoIntelData) -> Vec<SlopFix> {
         }
     }
 
+    // External entry points: Cargo bins/tests/benches/examples,
+    // npm bin/scripts, framework configs (Docusaurus, Next.js, …),
+    // Python __main__.py. Files referenced this way look orphan to
+    // the import graph but are absolutely used. The artifact carries
+    // a precomputed list (Phase 3.5 of init); old artifacts that
+    // pre-date this field fall back to the per-path heuristic below.
+    let entry_point_paths: HashSet<&str> = map
+        .entry_points
+        .as_deref()
+        .map(|eps| eps.iter().map(|e| e.path.as_str()).collect())
+        .unwrap_or_default();
+
     let mut out = Vec::new();
     for (file_path, file_symbols) in symbols {
         // A file with zero importers and at least one export is a
@@ -411,9 +624,11 @@ fn orphan_exports(map: &RepoIntelData) -> Vec<SlopFix> {
         if file_symbols.exports.is_empty() {
             continue;
         }
-        // Skip entry-point-ish files heuristically: paths matching
-        // `main.rs`, `index.{ts,js}`, `__main__.py`, `cmd/.../main.go`.
-        if looks_like_entry_point(file_path) {
+        // Skip files registered as entry points by Cargo manifests,
+        // package.json bin/scripts, pyproject scripts, framework
+        // configs, or AST-detected `main` functions. Falls back to a
+        // path heuristic when the artifact pre-dates the cached list.
+        if entry_point_paths.contains(file_path.as_str()) || looks_like_entry_point(file_path) {
             continue;
         }
 
@@ -631,6 +846,7 @@ fn ast_findings(repo_root: &Path) -> Vec<SlopFix> {
                 out.extend(promise_empty_catches_ts_js(&content, &rel, &lang));
                 out.extend(tautological_tests_ts_js(&content, &rel, &lang));
                 out.extend(always_true_conditions_ts_js(&content, &rel, &lang));
+                out.extend(passthrough_wrappers_ts_js(&content, &rel, &lang));
             }
             "js" | "jsx" | "mjs" | "cjs" => {
                 let lang = tree_sitter_javascript::LANGUAGE.into();
@@ -638,15 +854,18 @@ fn ast_findings(repo_root: &Path) -> Vec<SlopFix> {
                 out.extend(promise_empty_catches_ts_js(&content, &rel, &lang));
                 out.extend(tautological_tests_ts_js(&content, &rel, &lang));
                 out.extend(always_true_conditions_ts_js(&content, &rel, &lang));
+                out.extend(passthrough_wrappers_ts_js(&content, &rel, &lang));
             }
             "py" => {
                 out.extend(empty_excepts_python(&content, &rel));
                 out.extend(tautological_tests_python(&content, &rel));
                 out.extend(always_true_conditions_python(&content, &rel));
+                out.extend(passthrough_wrappers_python(&content, &rel));
             }
             "rs" => {
                 if !is_rust_test_file(&rel) {
                     out.extend(error_swallowing_rust(&content, &rel));
+                    out.extend(passthrough_wrappers_rust(&content, &rel));
                 }
                 out.extend(tautological_tests_rust(&content, &rel));
                 out.extend(always_true_conditions_rust(&content, &rel));
@@ -655,11 +874,13 @@ fn ast_findings(repo_root: &Path) -> Vec<SlopFix> {
                 out.extend(error_swallowing_go(&content, &rel));
                 out.extend(tautological_tests_go(&content, &rel));
                 out.extend(always_true_conditions_go(&content, &rel));
+                out.extend(passthrough_wrappers_go(&content, &rel));
             }
             "java" => {
                 out.extend(empty_catches_java(&content, &rel));
                 out.extend(tautological_tests_java(&content, &rel));
                 out.extend(always_true_conditions_java(&content, &rel));
+                out.extend(passthrough_wrappers_java(&content, &rel));
             }
             _ => {}
         }
@@ -1781,6 +2002,720 @@ fn compare_op(text: &str) -> Option<&'static str> {
         .find(|op| text.contains(op))
 }
 
+// ── Passthrough wrapper detection ─────────────────────────────
+//
+// Match functions whose entire body is a single call to ANOTHER
+// function with the SAME arguments — pure delegation that adds no
+// transformation, validation, logging, or composition. Common AI-
+// slop pattern (`function getUser(id) { return fetchUser(id); }`).
+//
+// Skip patterns that are legitimately not slop:
+//
+//   - Single-arg single-call methods that delegate to a member
+//     (`this.x()`, `self.x`) — proper encapsulation
+//   - Wrappers that DO transform (`f(x.trim())`) — already different
+//   - Wrappers with even one extra statement (logging, etc.)
+//   - Generic / type-parameterized wrappers (mostly Rust) where the
+//     wrapper's signature provides a concrete type for an otherwise
+//     generic API — pragmatic skip by checking for `<` in the
+//     declaration line; skipping the whole class is acceptable since
+//     these are intentional even if the body looks like passthrough
+//   - Trait-impl methods (Rust) — the trait contract requires the
+//     method to exist with that signature
+
+fn passthrough_wrappers_rust(content: &str, rel: &str) -> Vec<SlopFix> {
+    let language = tree_sitter_rust::LANGUAGE.into();
+    // Match any function_item; we filter the body shape in the
+    // closure since tree-sitter can't easily express "exactly one
+    // statement" without missing edge cases.
+    run_ast_query(
+        content,
+        &language,
+        r#"(function_item parameters: (parameters) body: (block) @body) @decl"#,
+        |body_node| {
+            let func_node = body_node.parent()?;
+            let params_node = func_node.child_by_field_name("parameters")?;
+            let param_names = rust_param_names(&params_node, content.as_bytes());
+            if param_names.is_empty() {
+                // Zero-arg passthroughs `fn f() { g() }` are also
+                // valid candidates — proceed.
+            }
+            // Generic functions are often pragmatic wrappers
+            // providing concrete types over a more general API. Use
+            // tree-sitter's `type_parameters` field rather than text
+            // scanning for `<` so that ordinary return types like
+            // `Vec<Item>` or `Result<T, E>` don't trigger the skip.
+            if func_node.child_by_field_name("type_parameters").is_some() {
+                return None;
+            }
+            // Trait method impls — skip if the enclosing impl is a
+            // trait impl. Uses the AST `trait` field (set on
+            // `impl Trait for Type`, absent on bare `impl Type`)
+            // rather than substring-matching " for " in the header.
+            if rust_function_is_trait_impl(&func_node, content.as_bytes()) {
+                return None;
+            }
+            let call = rust_body_single_call(body_node)?;
+            let call_args_text = call
+                .child_by_field_name("arguments")?
+                .utf8_text(content.as_bytes())
+                .ok()?;
+            // Expect `(arg, arg, …)` — strip parens, split on top-
+            // level commas.
+            let inner = call_args_text
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')');
+            let arg_names: Vec<String> = split_top_commas(inner)
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if arg_names != param_names {
+                return None;
+            }
+            let callee = call
+                .child_by_field_name("function")?
+                .utf8_text(content.as_bytes())
+                .ok()?;
+            // Don't flag delegation to `self.x` / `Self::x` — those
+            // are intentional encapsulation patterns, not slop.
+            if callee.starts_with("self.") || callee.starts_with("Self::") {
+                return None;
+            }
+            let func_name = func_node
+                .child_by_field_name("name")?
+                .utf8_text(content.as_bytes())
+                .ok()?;
+            let start = (func_node.start_position().row as u32) + 1;
+            let end = (func_node.end_position().row as u32) + 1;
+            Some(SlopFix {
+                action: SlopAction::DeleteLines {
+                    path: rel.to_string(),
+                    lines: [start, end],
+                },
+                category: SlopCategory::PassthroughWrapper,
+                confidence: default_confidence(SlopCategory::PassthroughWrapper),
+                reason: format!(
+                    "Rust `fn {func_name}(…)` is a single-call passthrough to `{callee}` with identical args"
+                ),
+            })
+        },
+    )
+}
+
+fn rust_param_names(params: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        // Skip `self` / `&self` / `&mut self` parameters; they're
+        // implicit in the body and never appear as arg-names.
+        if child.kind() == "self_parameter" {
+            continue;
+        }
+        // Parameter pattern: `name: Type` → grab the leftmost
+        // identifier-shaped child as the name.
+        if let Some(pat) = child.child_by_field_name("pattern") {
+            if let Ok(text) = pat.utf8_text(source) {
+                out.push(text.trim().to_string());
+            }
+        } else if let Ok(text) = child.utf8_text(source) {
+            // Fallback: take the whole parameter text up to the colon.
+            let name = text.split(':').next().unwrap_or("").trim().to_string();
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+fn rust_function_is_trait_impl(func: &tree_sitter::Node, _source: &[u8]) -> bool {
+    let mut cursor = func.parent();
+    while let Some(node) = cursor {
+        if node.kind() == "impl_item" {
+            // tree-sitter-rust sets the `trait` field only on trait
+            // impls (`impl Trait for Type`); inherent impls
+            // (`impl Type`) have no such field. Using the AST field
+            // is more robust than substring-matching " for " in the
+            // header (e.g. generic bounds like `for<'a>` would
+            // false-positive that approach).
+            return node.child_by_field_name("trait").is_some();
+        }
+        cursor = node.parent();
+    }
+    false
+}
+
+fn rust_body_single_call(body: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    // Body must be a block with exactly one effective child. Three
+    // shapes count:
+    //
+    //   tail expression: `{ inner(x) }`     → call_expression
+    //   expression-stmt: `{ inner(x); }`    → expr_stmt → call
+    //   bare return:     `{ return inner(x) }` → return_expression → call
+    //   return + semi:   `{ return inner(x); }` → expr_stmt → return_expression → call
+    if body.named_child_count() != 1 {
+        return None;
+    }
+    let child = body.named_child(0)?;
+    fn unwrap_return_or_call<'a>(n: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+        match n.kind() {
+            "call_expression" => Some(n),
+            "return_expression" => {
+                let inner = n.named_child(0)?;
+                (inner.kind() == "call_expression").then_some(inner)
+            }
+            _ => None,
+        }
+    }
+    let target = if child.kind() == "expression_statement" {
+        child.named_child(0)?
+    } else {
+        child
+    };
+    unwrap_return_or_call(target)
+}
+
+fn passthrough_wrappers_ts_js(
+    content: &str,
+    rel: &str,
+    language: &tree_sitter::Language,
+) -> Vec<SlopFix> {
+    // Three function shapes to cover:
+    //   - function declaration:   function f(x) { return g(x); }
+    //   - function expression:    const f = function(x) { return g(x); };
+    //   - arrow function (block): const f = (x) => { return g(x); };
+    //   - arrow function (expr):  const f = (x) => g(x);
+    //
+    // We match `function_declaration` and `arrow_function` nodes and
+    // inspect the body shape inline.
+    let mut out = Vec::new();
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(language).is_err() {
+        return out;
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return out;
+    };
+    let query_src = r#"
+    [
+      (function_declaration
+        parameters: (formal_parameters) @params
+        body: (statement_block) @body) @decl
+      (arrow_function
+        parameters: (formal_parameters) @params
+        body: (_) @body) @decl
+    ]
+    "#;
+    let Ok(query) = tree_sitter::Query::new(language, query_src) else {
+        return out;
+    };
+    use streaming_iterator::StreamingIterator;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+
+    let decl_idx = query.capture_index_for_name("decl");
+    let params_idx = query.capture_index_for_name("params");
+    let body_idx = query.capture_index_for_name("body");
+
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+    while let Some(m) = matches.next() {
+        let mut decl: Option<tree_sitter::Node> = None;
+        let mut params: Option<tree_sitter::Node> = None;
+        let mut body: Option<tree_sitter::Node> = None;
+        for cap in m.captures {
+            if Some(cap.index) == decl_idx {
+                decl = Some(cap.node);
+            } else if Some(cap.index) == params_idx {
+                params = Some(cap.node);
+            } else if Some(cap.index) == body_idx {
+                body = Some(cap.node);
+            }
+        }
+        let (Some(decl), Some(params), Some(body)) = (decl, params, body) else {
+            continue;
+        };
+        // Skip TS generics like `function f<T>(x: T) { … }` —
+        // pragmatic wrappers providing a concrete type. Use the AST
+        // `type_parameters` field rather than text scanning so we
+        // don't false-positive on return types like `Array<string>`
+        // or arrow function bodies that contain `<` (the previous
+        // header-text approach was broken for arrow expression
+        // bodies because `split('{')` returned the entire decl
+        // including the body for those).
+        if decl.child_by_field_name("type_parameters").is_some() {
+            continue;
+        }
+
+        let param_names = ts_js_param_names(&params, content.as_bytes());
+        let call: tree_sitter::Node = match ts_js_body_single_call(&body) {
+            Some(c) => c,
+            None => continue,
+        };
+        let args_node: tree_sitter::Node = match call.child_by_field_name("arguments") {
+            Some(a) => a,
+            None => continue,
+        };
+        let args_text = args_node.utf8_text(content.as_bytes()).unwrap_or("");
+        let inner = args_text
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        let arg_names: Vec<String> = split_top_commas(inner)
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if arg_names != param_names {
+            continue;
+        }
+        let callee: &str = match call.child_by_field_name("function") {
+            Some(f) => f.utf8_text(content.as_bytes()).unwrap_or(""),
+            None => continue,
+        };
+        // Skip method delegation (this.foo / self.foo) — encapsulation,
+        // not slop.
+        if callee.starts_with("this.") {
+            continue;
+        }
+        let start = (decl.start_position().row as u32) + 1;
+        let end = (decl.end_position().row as u32) + 1;
+        if !seen.insert((start, end)) {
+            continue;
+        }
+        // Try to derive the function name (declaration vs arrow's
+        // parent variable_declarator). Falls back to `<anonymous>`
+        // for arrow functions assigned to non-variable contexts.
+        let name = decl
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+            .unwrap_or_else(|| {
+                decl.parent()
+                    .and_then(|p| p.child_by_field_name("name"))
+                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+                    .unwrap_or("<anonymous>")
+            });
+        out.push(SlopFix {
+            action: SlopAction::DeleteLines {
+                path: rel.to_string(),
+                lines: [start, end],
+            },
+            category: SlopCategory::PassthroughWrapper,
+            confidence: default_confidence(SlopCategory::PassthroughWrapper),
+            reason: format!(
+                "TS/JS `function {name}(…)` is a single-call passthrough to `{callee}` with identical args"
+            ),
+        });
+    }
+    out
+}
+
+fn ts_js_param_names(params: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        let text = child.utf8_text(source).unwrap_or("").trim();
+        // Strip TypeScript type annotation: `x: string` → `x`
+        let name = text.split(':').next().unwrap_or("").trim();
+        // Strip default value: `x = 5` → `x`
+        let name = name.split('=').next().unwrap_or("").trim();
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+fn ts_js_body_single_call<'a>(body: &tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+    // Block body: `{ return f(x); }` → body has 1 named child that's
+    // a return_statement wrapping a call_expression. OR `{ f(x); }`
+    // → 1 named child that's an expression_statement wrapping a call.
+    //
+    // Arrow expression body: body IS the call_expression directly.
+    if body.kind() == "call_expression" {
+        return Some(*body);
+    }
+    if body.kind() == "statement_block" {
+        if body.named_child_count() != 1 {
+            return None;
+        }
+        let child = body.named_child(0)?;
+        match child.kind() {
+            "return_statement" => {
+                let inner = child.named_child(0)?;
+                if inner.kind() == "call_expression" {
+                    return Some(inner);
+                }
+            }
+            "expression_statement" => {
+                let inner = child.named_child(0)?;
+                if inner.kind() == "call_expression" {
+                    return Some(inner);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn passthrough_wrappers_python(content: &str, rel: &str) -> Vec<SlopFix> {
+    let language = tree_sitter_python::LANGUAGE.into();
+    run_ast_query(
+        content,
+        &language,
+        r#"(function_definition
+            parameters: (parameters) @params
+            body: (block) @body) @decl"#,
+        |body_node| {
+            let func_node = body_node.parent()?;
+            let params_node = func_node.child_by_field_name("parameters")?;
+            let mut param_names = python_param_names(&params_node, content.as_bytes());
+            // Drop leading `self` / `cls` — same encapsulation
+            // exception we apply for Rust.
+            if matches!(
+                param_names.first().map(|s| s.as_str()),
+                Some("self" | "cls")
+            ) {
+                param_names.remove(0);
+            }
+
+            // Single statement body that's `return <call>(…)`.
+            if body_node.named_child_count() != 1 {
+                return None;
+            }
+            let stmt = body_node.named_child(0)?;
+            let inner = match stmt.kind() {
+                "return_statement" | "expression_statement" => stmt.named_child(0)?,
+                _ => return None,
+            };
+            let call = inner;
+            if call.kind() != "call" {
+                return None;
+            }
+            let args_node = call.child_by_field_name("arguments")?;
+            let args_text = args_node.utf8_text(content.as_bytes()).ok()?;
+            let inner = args_text
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')');
+            let arg_names: Vec<String> = split_top_commas(inner)
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if arg_names != param_names {
+                return None;
+            }
+            let callee = call
+                .child_by_field_name("function")?
+                .utf8_text(content.as_bytes())
+                .ok()?;
+            if callee.starts_with("self.") {
+                return None;
+            }
+            let func_name = func_node
+                .child_by_field_name("name")?
+                .utf8_text(content.as_bytes())
+                .ok()?;
+            let start = (func_node.start_position().row as u32) + 1;
+            let end = (func_node.end_position().row as u32) + 1;
+            Some(SlopFix {
+                action: SlopAction::DeleteLines {
+                    path: rel.to_string(),
+                    lines: [start, end],
+                },
+                category: SlopCategory::PassthroughWrapper,
+                confidence: default_confidence(SlopCategory::PassthroughWrapper),
+                reason: format!(
+                    "Python `def {func_name}(…)` is a single-call passthrough to `{callee}` with identical args"
+                ),
+            })
+        },
+    )
+}
+
+fn python_param_names(params: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        let text = child.utf8_text(source).unwrap_or("").trim();
+        // Type annotation `x: int` → `x`; default `x=5` → `x`.
+        let name = text.split(':').next().unwrap_or("").trim();
+        let name = name.split('=').next().unwrap_or("").trim();
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+fn passthrough_wrappers_go(content: &str, rel: &str) -> Vec<SlopFix> {
+    let language = tree_sitter_go::LANGUAGE.into();
+    let mut out = Vec::new();
+    out.extend(go_passthrough(
+        content,
+        rel,
+        &language,
+        r#"(function_declaration
+            name: (identifier) @name
+            parameters: (parameter_list) @params
+            body: (block) @body) @decl"#,
+    ));
+    // Method declaration: also capture the receiver so we can
+    // distinguish "method delegating to self" (encapsulation, skip)
+    // from "method delegating to argument or another package"
+    // (passthrough, flag).
+    out.extend(go_passthrough(
+        content,
+        rel,
+        &language,
+        r#"(method_declaration
+            receiver: (parameter_list (parameter_declaration name: (identifier) @receiver))
+            name: (field_identifier) @name
+            parameters: (parameter_list) @params
+            body: (block) @body) @decl"#,
+    ));
+    out
+}
+
+fn go_passthrough(
+    content: &str,
+    rel: &str,
+    language: &tree_sitter::Language,
+    query_src: &str,
+) -> Vec<SlopFix> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let Ok(query) = tree_sitter::Query::new(language, query_src) else {
+        return Vec::new();
+    };
+    use streaming_iterator::StreamingIterator;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+
+    let decl_idx = query.capture_index_for_name("decl");
+    let name_idx = query.capture_index_for_name("name");
+    let params_idx = query.capture_index_for_name("params");
+    let body_idx = query.capture_index_for_name("body");
+    let receiver_idx = query.capture_index_for_name("receiver");
+
+    let mut out = Vec::new();
+    while let Some(m) = matches.next() {
+        let mut decl = None;
+        let mut name_node = None;
+        let mut params = None;
+        let mut body = None;
+        let mut receiver_text: Option<String> = None;
+        for cap in m.captures {
+            if Some(cap.index) == decl_idx {
+                decl = Some(cap.node);
+            } else if Some(cap.index) == name_idx {
+                name_node = Some(cap.node);
+            } else if Some(cap.index) == params_idx {
+                params = Some(cap.node);
+            } else if Some(cap.index) == body_idx {
+                body = Some(cap.node);
+            } else if Some(cap.index) == receiver_idx {
+                receiver_text = cap
+                    .node
+                    .utf8_text(content.as_bytes())
+                    .ok()
+                    .map(str::to_string);
+            }
+        }
+        let (Some(decl), Some(name_node), Some(params), Some(body)) =
+            (decl, name_node, params, body)
+        else {
+            continue;
+        };
+        let param_names = go_param_names(&params, content.as_bytes());
+        if body.named_child_count() != 1 {
+            continue;
+        }
+        let stmt = body.named_child(0).unwrap();
+        let call = if stmt.kind() == "return_statement" {
+            stmt.named_child(0).and_then(|n| {
+                if n.kind() == "expression_list" {
+                    n.named_child(0)
+                } else {
+                    Some(n)
+                }
+            })
+        } else if stmt.kind() == "expression_statement" {
+            stmt.named_child(0)
+        } else {
+            None
+        };
+        let Some(call) = call else { continue };
+        if call.kind() != "call_expression" {
+            continue;
+        }
+        let Some(args_node) = call.child_by_field_name("arguments") else {
+            continue;
+        };
+        let args_text = args_node.utf8_text(content.as_bytes()).unwrap_or("");
+        let inner = args_text
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        let arg_names: Vec<String> = split_top_commas(inner)
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if arg_names != param_names {
+            continue;
+        }
+        let callee = call
+            .child_by_field_name("function")
+            .and_then(|f| f.utf8_text(content.as_bytes()).ok())
+            .unwrap_or("");
+        // Method delegation `(r *Receiver) Foo() { return r.Foo() }`
+        // is intentional encapsulation, not slop. We capture the
+        // receiver name from the AST and only skip when the call's
+        // object exactly matches it. This correctly flags genuine
+        // passthroughs to argument methods (`func P(c *Client) {
+        // c.Process() }`) and stdlib calls (`os.Open`, `fmt.Println`).
+        if let Some(recv) = receiver_text.as_deref() {
+            let object = callee.split('.').next().unwrap_or("");
+            if object == recv {
+                continue;
+            }
+        }
+        let func_name = name_node.utf8_text(content.as_bytes()).unwrap_or("");
+        let start = (decl.start_position().row as u32) + 1;
+        let end = (decl.end_position().row as u32) + 1;
+        out.push(SlopFix {
+            action: SlopAction::DeleteLines {
+                path: rel.to_string(),
+                lines: [start, end],
+            },
+            category: SlopCategory::PassthroughWrapper,
+            confidence: default_confidence(SlopCategory::PassthroughWrapper),
+            reason: format!(
+                "Go `func {func_name}(…)` is a single-call passthrough to `{callee}` with identical args"
+            ),
+        });
+    }
+    out
+}
+
+fn go_param_names(params: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        if child.kind() != "parameter_declaration" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for sub in child.named_children(&mut inner) {
+            if sub.kind() == "identifier"
+                && let Ok(text) = sub.utf8_text(source)
+            {
+                out.push(text.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn passthrough_wrappers_java(content: &str, rel: &str) -> Vec<SlopFix> {
+    let language = tree_sitter_java::LANGUAGE.into();
+    run_ast_query(
+        content,
+        &language,
+        r#"(method_declaration
+            name: (identifier) @name
+            parameters: (formal_parameters) @params
+            body: (block) @body) @decl"#,
+        |body_node| {
+            let func_node = body_node.parent()?;
+            let params_node = func_node.child_by_field_name("parameters")?;
+            let param_names = java_param_names(&params_node, content.as_bytes());
+            if body_node.named_child_count() != 1 {
+                return None;
+            }
+            let stmt = body_node.named_child(0)?;
+            let call = match stmt.kind() {
+                "return_statement" | "expression_statement" => stmt.named_child(0)?,
+                _ => return None,
+            };
+            if call.kind() != "method_invocation" {
+                return None;
+            }
+            let args_node = call.child_by_field_name("arguments")?;
+            let args_text = args_node.utf8_text(content.as_bytes()).ok()?;
+            let inner = args_text
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')');
+            let arg_names: Vec<String> = split_top_commas(inner)
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if arg_names != param_names {
+                return None;
+            }
+            // `this.foo(x)` / `super.foo(x)` — encapsulation, skip.
+            let callee_name = call
+                .child_by_field_name("name")?
+                .utf8_text(content.as_bytes())
+                .ok()?;
+            let object = call
+                .child_by_field_name("object")
+                .and_then(|o| o.utf8_text(content.as_bytes()).ok());
+            if object == Some("this") || object == Some("super") {
+                return None;
+            }
+            let callee_repr = match object {
+                Some(o) => format!("{o}.{callee_name}"),
+                None => callee_name.to_string(),
+            };
+            let func_name = func_node
+                .child_by_field_name("name")?
+                .utf8_text(content.as_bytes())
+                .ok()?;
+            let start = (func_node.start_position().row as u32) + 1;
+            let end = (func_node.end_position().row as u32) + 1;
+            Some(SlopFix {
+                action: SlopAction::DeleteLines {
+                    path: rel.to_string(),
+                    lines: [start, end],
+                },
+                category: SlopCategory::PassthroughWrapper,
+                confidence: default_confidence(SlopCategory::PassthroughWrapper),
+                reason: format!(
+                    "Java `{func_name}(…)` is a single-call passthrough to `{callee_repr}` with identical args"
+                ),
+            })
+        },
+    )
+}
+
+fn java_param_names(params: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        if child.kind() != "formal_parameter" {
+            continue;
+        }
+        if let Some(name) = child.child_by_field_name("name")
+            && let Ok(text) = name.utf8_text(source)
+        {
+            out.push(text.to_string());
+        }
+    }
+    out
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn walk_repo_files(root: &Path) -> Vec<PathBuf> {
@@ -2413,6 +3348,7 @@ mod tests {
             file_descriptors: None,
             summary: None,
             embeddings_meta: None,
+            entry_points: None,
         };
         // Need a non-empty import_graph so the orphan check actually
         // runs (otherwise the function returns early).
@@ -2620,6 +3556,245 @@ mod tests {
         assert_eq!(grouped[1].fixes.len(), 1);
     }
 
+    // ── Passthrough wrapper detector ─────────
+
+    #[test]
+    fn detects_rust_single_call_passthrough() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "pub fn get_user(id: u32) -> User {\n    fetch_user(id)\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper
+                    && f.reason.contains("get_user")
+                    && f.reason.contains("fetch_user")),
+            "should flag get_user as passthrough; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn detects_rust_passthrough_with_explicit_return() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "pub fn wrap(x: i32, y: i32) -> i32 {\n    return inner(x, y);\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should flag explicit-return passthrough; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn ignores_rust_wrapper_that_transforms_args() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "pub fn wrap(x: i32) -> i32 {\n    inner(x + 1)\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should not flag wrapper that transforms args; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn ignores_rust_wrapper_with_extra_logging() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "pub fn wrap(x: i32) -> i32 {\n    log::info!(\"wrap\");\n    inner(x)\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should not flag wrapper with extra statement; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn ignores_rust_self_method_delegation() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "struct S;\nimpl S {\n    pub fn name(&self) -> String { self.name_impl() }\n    fn name_impl(&self) -> String { let mut s = String::new(); s.push('x'); s }\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should not flag self.x() encapsulation; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn ignores_rust_generic_wrapper() {
+        // Generic wrappers often provide concrete types over a more
+        // general API — pragmatic, not slop.
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "pub fn typed_get<T: Default>(id: u32) -> T {\n    generic_get(id)\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should not flag generic wrapper; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn ignores_rust_trait_impl_method() {
+        let dir = make_repo(&[(
+            "src/lib.rs",
+            "trait T { fn name(&self) -> String; }\nstruct S;\nimpl T for S {\n    fn name(&self) -> String { compute_name() }\n}\nfn compute_name() -> String { let mut s = String::new(); s.push('x'); s }\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should not flag trait impl method (contract requires it); got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn detects_typescript_arrow_passthrough() {
+        let dir = make_repo(&[("a.ts", "const wrap = (x) => inner(x);\n")]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should flag arrow passthrough; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn detects_typescript_function_declaration_passthrough() {
+        let dir = make_repo(&[("a.ts", "function getUser(id) { return fetchUser(id); }\n")]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should flag function-decl passthrough; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn ignores_typescript_this_method_delegation() {
+        let dir = make_repo(&[(
+            "a.ts",
+            "class A { name() { return this.compute(); } compute() { return 1; } }\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        // `class.method()` is parsed as method_definition not function_declaration
+        // so this test really just ensures we don't flag the few things we do match.
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should not flag `this.x()` delegation; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn detects_python_passthrough() {
+        let dir = make_repo(&[("a.py", "def get_user(id):\n    return fetch_user(id)\n")]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should flag Python passthrough; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn ignores_python_self_method_delegation() {
+        let dir = make_repo(&[(
+            "a.py",
+            "class A:\n    def name(self, x):\n        return self.compute(x)\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should not flag self.x() delegation; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn detects_go_passthrough() {
+        let dir = make_repo(&[(
+            "x.go",
+            "package x\nfunc GetUser(id int) User {\n    return FetchUser(id)\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should flag Go passthrough; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn detects_java_passthrough() {
+        let dir = make_repo(&[(
+            "A.java",
+            "class A {\n    public int wrap(int x) { return inner(x); }\n    int inner(int x) { return x; }\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should flag Java passthrough; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn ignores_java_super_delegation() {
+        let dir = make_repo(&[(
+            "A.java",
+            "class A extends B {\n    public int wrap(int x) { return super.wrap(x); }\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::PassthroughWrapper),
+            "should not flag super.x() delegation; got {:?}",
+            fixes
+        );
+    }
+
     #[test]
     fn detects_go_testify_equal_with_identical_args() {
         let dir = make_repo(&[(
@@ -2633,6 +3808,203 @@ mod tests {
                 .any(|f| f.category == SlopCategory::TautologicalTest),
             "expected testify Equal(t,1,1) flag; got {:?}",
             fixes
+        );
+    }
+
+    // ── agentsys-ignore suppression directives ─────
+
+    fn empty_map() -> RepoIntelData {
+        use chrono::Utc;
+        use std::collections::HashMap as StdMap;
+        RepoIntelData {
+            version: "test".into(),
+            generated: Utc::now(),
+            updated: Utc::now(),
+            partial: false,
+            git: analyzer_core::types::GitInfo {
+                analyzed_up_to: "HEAD".into(),
+                total_commits_analyzed: 0,
+                first_commit_date: "".into(),
+                last_commit_date: "".into(),
+                scope: None,
+                shallow: false,
+            },
+            contributors: analyzer_core::types::Contributors {
+                humans: StdMap::new(),
+                bots: StdMap::new(),
+            },
+            file_activity: StdMap::new(),
+            coupling: StdMap::new(),
+            conventions: analyzer_core::types::ConventionInfo {
+                prefixes: StdMap::new(),
+                style: "".into(),
+                uses_scopes: false,
+                naming_patterns: None,
+                test_patterns: None,
+            },
+            releases: analyzer_core::types::Releases {
+                tags: vec![],
+                cadence: "".into(),
+            },
+            renames: vec![],
+            deletions: vec![],
+            symbols: None,
+            import_graph: None,
+            project: None,
+            doc_refs: None,
+            graph: None,
+            file_descriptors: None,
+            summary: None,
+            embeddings_meta: None,
+            entry_points: None,
+        }
+    }
+
+    #[test]
+    fn suppression_on_same_line_skips_fix() {
+        let dir = make_repo(&[(
+            "a.ts",
+            "function f() {\n    try { call() } catch {} // agentsys-ignore: empty-catch\n}\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "annotation on same line should suppress; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_on_line_above_skips_fix() {
+        let dir = make_repo(&[(
+            "a.ts",
+            "function f() {\n    // agentsys-ignore: empty-catch\n    try { call() } catch {}\n}\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "annotation on line above should suppress; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_python_uses_hash_marker() {
+        let dir = make_repo(&[(
+            "a.py",
+            "def f():\n    # agentsys-ignore: empty-catch\n    try:\n        x = 1\n    except:\n        pass\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        // The except is at line 5; the directive on line 2 is too far
+        // (we only check ±1). This should NOT suppress.
+        assert!(
+            result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "directive too far away should NOT suppress; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_python_directly_above_works() {
+        let dir = make_repo(&[(
+            "a.py",
+            "def f():\n    try:\n        x = 1\n    # agentsys-ignore: empty-catch\n    except:\n        pass\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "directive directly above except should suppress; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_wrong_category_does_not_skip() {
+        // Directive names a different category — fix must still fire.
+        let dir = make_repo(&[(
+            "a.ts",
+            "// agentsys-ignore: orphan-export\nfunction f() { try {} catch {} }\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "different-category directive should NOT suppress empty-catch; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_comma_list_covers_multiple_categories() {
+        let dir = make_repo(&[(
+            "a.ts",
+            "function f() {\n    // agentsys-ignore: empty-catch, tautological-test\n    try {} catch {}\n}\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "comma-list should cover empty-catch; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_ignore_all_directive_skips_any_category() {
+        let dir = make_repo(&[(
+            "a.ts",
+            "function f() {\n    // agentsys-ignore-all\n    try {} catch {}\n}\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "agentsys-ignore-all should suppress empty-catch; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_header_directive_skips_file_deletion() {
+        // File-deletion fixes (tracked-artifact) are suppressible by an
+        // agentsys-ignore directive in the file's first 5 lines.
+        let dir = make_repo(&[(
+            "debug.log",
+            "// agentsys-ignore: tracked-artifact\nthese are intentional log fixtures\n",
+        )]);
+        let result = slop_fixes(dir.path(), &empty_map());
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::TrackedArtifact),
+            "header directive should suppress file-deletion; got {:?}",
+            result.fixes
         );
     }
 }

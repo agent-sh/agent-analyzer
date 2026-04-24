@@ -61,6 +61,16 @@ pub struct RepoIntelData {
     /// not opted into the embedder.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub embeddings_meta: Option<EmbeddingsMeta>,
+
+    /// Externally-referenced entry points: Cargo bins/tests/benches/
+    /// examples, npm `bin`/`scripts`, pyproject scripts, framework
+    /// configs (Docusaurus, Next.js, Vite, etc.), and AST-detected
+    /// `main` functions. Cached here so consumers (especially the
+    /// orphan-export slop detector) don't have to re-walk the
+    /// filesystem on every query. Populated during init/update;
+    /// absent on artifacts produced by older binaries.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub entry_points: Option<Vec<EntryPoint>>,
 }
 
 /// Metadata for the on-disk embedding sidecar.
@@ -332,12 +342,24 @@ pub struct EntryPoint {
 #[serde(rename_all = "kebab-case")]
 pub enum EntryPointKind {
     /// A compiled binary declared in a manifest (`Cargo.toml [[bin]]`,
-    /// `package.json bin`, `pyproject.toml [project.scripts]`, etc.).
+    /// `package.json bin`, `pyproject.toml [project.scripts]`, etc.)
+    /// OR a Cargo auto-discovered target (`tests/*.rs`, `benches/*.rs`,
+    /// `examples/*.rs`, `src/bin/*.rs`) — all of which compile to
+    /// separate executables and are not imported via `use` from other
+    /// repo files.
     Binary,
-    /// A `main` function or `__main__` block detected via AST.
+    /// A `main` function or `__main__` block detected via AST, or a
+    /// `__main__.py` file (Python package execution entry point).
     Main,
     /// An npm/yarn/pnpm script entry from `package.json scripts`.
     NpmScript,
+    /// A file that a framework loads by convention rather than via an
+    /// import statement — Docusaurus `docusaurus.config.{js,ts}` and
+    /// `sidebars.{js,ts}`, Next.js `next.config.js`, Vite/Astro
+    /// `*.config.{js,ts}`, etc. These look orphan to a static
+    /// import-graph but are absolutely required for the framework to
+    /// run.
+    FrameworkConfig,
 }
 
 // ─── Phase 4: Doc-Code Cross-Reference Types ────────────────────
@@ -660,6 +682,7 @@ mod tests {
             file_descriptors: None,
             summary: None,
             embeddings_meta: None,
+            entry_points: None,
         };
 
         let json = serde_json::to_string(&data).unwrap();

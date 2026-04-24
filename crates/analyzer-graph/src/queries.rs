@@ -244,6 +244,7 @@ mod tests {
             file_descriptors: None,
             summary: None,
             embeddings_meta: None,
+            entry_points: None,
         };
 
         for (path, changes) in files {
