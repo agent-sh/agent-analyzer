@@ -321,14 +321,12 @@ fn cliche_name_clusters(map: &RepoIntelData) -> Vec<SlopTarget> {
             if matches!(
                 export.kind,
                 SymbolKind::Function | SymbolKind::Class | SymbolKind::Struct
-            ) {
-                let lower = export.name.to_ascii_lowercase();
-                if CLICHE.iter().any(|c| lower.contains(c)) {
-                    by_dir
-                        .entry(dir.clone())
-                        .or_default()
-                        .push(format!("{file_path}::{}", export.name));
-                }
+            ) && identifier_has_cliche_word(&export.name, CLICHE)
+            {
+                by_dir
+                    .entry(dir.clone())
+                    .or_default()
+                    .push(format!("{file_path}::{}", export.name));
             }
         }
     }
@@ -357,6 +355,65 @@ fn cliche_name_clusters(map: &RepoIntelData) -> Vec<SlopTarget> {
         });
     }
     out
+}
+
+/// Match cliché words against the EXACT word tokens of an identifier
+/// rather than as case-insensitive substrings. Splits on:
+///
+///   - underscores (snake_case → `data_loader` → ["data", "loader"])
+///   - camel/Pascal-case boundaries (`DataLoader` → ["Data", "Loader"])
+///   - hyphens (kebab-case)
+///   - digit↔letter boundaries (`Foo2Bar` → ["Foo", "2", "Bar"])
+///
+/// Without this, `databasePool` would match "data" as a substring even
+/// though `database` is a separate word from `data`. Same problem for
+/// `BaseTraitImpl`-style names matching "base", "trait", "impl"
+/// individually as substrings of unrelated longer words.
+fn identifier_has_cliche_word(name: &str, cliche: &[&str]) -> bool {
+    for token in tokenize_identifier(name) {
+        let lower = token.to_ascii_lowercase();
+        if cliche.contains(&lower.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn tokenize_identifier(name: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    let chars: Vec<char> = name.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '_' || *c == '-' {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        if !current.is_empty() {
+            let prev = current.chars().last().unwrap();
+            // Boundary: lower→upper (camelCase), digit↔letter, letter↔digit.
+            let is_boundary = (prev.is_ascii_lowercase() && c.is_ascii_uppercase())
+                || (prev.is_ascii_alphabetic() && c.is_ascii_digit())
+                || (prev.is_ascii_digit() && c.is_ascii_alphabetic())
+                // Boundary: upper→upper followed by lower (HTTPSConnection
+                // splits as ["HTTPS", "Connection"], not ["HTTPSCo", "..."]).
+                || (prev.is_ascii_uppercase()
+                    && c.is_ascii_uppercase()
+                    && i + 1 < chars.len()
+                    && chars[i + 1].is_ascii_lowercase());
+            if is_boundary {
+                tokens.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(*c);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 fn parent_dir(path: &str) -> String {
@@ -848,5 +905,79 @@ mod tests {
         assert!(json.contains("\"kind\":\"file\""));
         assert!(json.contains("\"tier\":\"sonnet\""));
         assert!(json.contains("\"suspect\":\"could-be-shorter\""));
+    }
+
+    // ── Word-boundary cliché tokenization ─────────
+
+    #[test]
+    fn tokenize_camel_case() {
+        assert_eq!(tokenize_identifier("DataLoader"), vec!["Data", "Loader"]);
+        assert_eq!(tokenize_identifier("dataLoader"), vec!["data", "Loader"]);
+    }
+
+    #[test]
+    fn tokenize_snake_case() {
+        assert_eq!(tokenize_identifier("data_loader"), vec!["data", "loader"]);
+        assert_eq!(
+            tokenize_identifier("__double__under"),
+            vec!["double", "under"]
+        );
+    }
+
+    #[test]
+    fn tokenize_kebab_case() {
+        assert_eq!(tokenize_identifier("data-loader"), vec!["data", "loader"]);
+    }
+
+    #[test]
+    fn tokenize_acronym_then_word() {
+        // HTTPSConnection should split at the upper→upper-then-lower
+        // boundary so "HTTPS" stays together and "Connection" is its
+        // own token.
+        assert_eq!(
+            tokenize_identifier("HTTPSConnection"),
+            vec!["HTTPS", "Connection"]
+        );
+    }
+
+    #[test]
+    fn tokenize_with_digits() {
+        assert_eq!(tokenize_identifier("Foo2Bar"), vec!["Foo", "2", "Bar"]);
+    }
+
+    #[test]
+    fn cliche_match_uses_word_boundaries_not_substrings() {
+        let cliche = &["data", "base", "common"];
+        // Real cliché names — should match.
+        assert!(identifier_has_cliche_word("DataLoader", cliche));
+        assert!(identifier_has_cliche_word("data_helper", cliche));
+        assert!(identifier_has_cliche_word("BaseModel", cliche));
+        assert!(identifier_has_cliche_word("CommonUtils", cliche));
+        // Substring noise — `database` is NOT `data`; `commonjs` is
+        // NOT `common`. These must NOT match.
+        assert!(!identifier_has_cliche_word("databasePool", cliche));
+        assert!(!identifier_has_cliche_word("DatabaseConnection", cliche));
+        assert!(!identifier_has_cliche_word("commonjs", cliche));
+        assert!(!identifier_has_cliche_word("Cornerstone", cliche)); // contains "stone"-ish noise
+    }
+
+    #[test]
+    fn cliche_match_is_case_insensitive() {
+        let cliche = &["impl"];
+        assert!(identifier_has_cliche_word("MyImpl", cliche));
+        assert!(identifier_has_cliche_word("my_impl", cliche));
+        assert!(identifier_has_cliche_word("MY_IMPL", cliche));
+    }
+
+    #[test]
+    fn cliche_match_handles_dao_dto_pattern_suffixes() {
+        let cliche = &["dao", "dto"];
+        assert!(identifier_has_cliche_word("UserDao", cliche));
+        assert!(identifier_has_cliche_word("CreateUserDto", cliche));
+        // "fado" / "ado" do NOT contain "dao" as a word — these are
+        // unrelated names that the old substring match would have
+        // false-positived.
+        assert!(!identifier_has_cliche_word("Fado", cliche));
+        assert!(!identifier_has_cliche_word("Bravado", cliche));
     }
 }

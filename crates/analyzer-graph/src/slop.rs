@@ -82,6 +82,10 @@ pub struct SlopFixesResult {
 /// `repo_root` is the working tree (used by path-based detectors).
 /// `map` is the loaded repo-intel artifact (provides import graph,
 /// project metadata, etc).
+///
+/// Findings are filtered against per-line suppression comments
+/// (`// agnix-ignore: <category>` or `# agnix-ignore: <category>`)
+/// before being returned — see [`apply_suppressions`].
 pub fn slop_fixes(repo_root: &Path, map: &RepoIntelData) -> SlopFixesResult {
     let mut fixes = Vec::new();
 
@@ -91,7 +95,165 @@ pub fn slop_fixes(repo_root: &Path, map: &RepoIntelData) -> SlopFixesResult {
     fixes.extend(orphan_exports(map));
     fixes.extend(ast_findings(repo_root));
 
+    let fixes = apply_suppressions(repo_root, fixes);
     SlopFixesResult { fixes }
+}
+
+/// Drop fixes whose target line is annotated with an
+/// `agnix-ignore: <category>` comment on the same line or the line
+/// immediately above. Comment forms recognized:
+///
+///   - `// agnix-ignore: orphan-export`           (Rust / TS / JS / Java / Go / C)
+///   - `# agnix-ignore: empty-catch`              (Python / Shell / TOML)
+///   - `// agnix-ignore: tracked-artifact, orphan-export`  (comma-separated list)
+///   - `// agnix-ignore-all`                      (suppresses every category)
+///
+/// File-deletion fixes (`tracked-artifact`, `stale-ci-config`,
+/// `duplicate-tooling`) are suppressible by an `agnix-ignore` comment
+/// in the file's first 5 lines (file-header convention).
+///
+/// Per-line fixes (`orphan-export`, `empty-catch`, `tautological-test`)
+/// are suppressible by a comment on the fix line OR the line above —
+/// matching how `eslint-disable-next-line` and `// noqa` work in
+/// other linters.
+fn apply_suppressions(repo_root: &Path, fixes: Vec<SlopFix>) -> Vec<SlopFix> {
+    use std::collections::HashMap;
+    // Cache file → suppression map across fixes from the same file
+    // so we don't re-read+re-parse the source for each finding.
+    let mut cache: HashMap<String, Option<FileSuppressions>> = HashMap::new();
+
+    fixes
+        .into_iter()
+        .filter(|fix| {
+            let path = fix_target_path(fix);
+            if path.is_none() {
+                return true;
+            }
+            let path = path.unwrap();
+            let suppressions = cache
+                .entry(path.to_string())
+                .or_insert_with(|| FileSuppressions::load(repo_root, path));
+            let Some(supp) = suppressions else {
+                return true;
+            };
+            !supp.suppresses(fix)
+        })
+        .collect()
+}
+
+fn fix_target_path(fix: &SlopFix) -> Option<&str> {
+    match &fix.action {
+        SlopAction::DeleteFile { path } => Some(path.as_str()),
+        SlopAction::DeleteLines { path, .. } => Some(path.as_str()),
+        SlopAction::ReplaceLines { path, .. } => Some(path.as_str()),
+    }
+}
+
+/// Per-file suppression index: `agnix-ignore` comments parsed once
+/// per file and reused across every fix targeting that file.
+struct FileSuppressions {
+    /// Header suppressions (lines 1-5) apply to file-level actions.
+    header_categories: std::collections::HashSet<String>,
+    /// Per-line suppressions: line N suppresses fixes on N or N+1.
+    line_categories: std::collections::HashMap<u32, std::collections::HashSet<String>>,
+    /// `agnix-ignore-all` line numbers — suppress every category.
+    line_all: std::collections::HashSet<u32>,
+    /// Header-scope `agnix-ignore-all` flag — suppresses every category
+    /// for any fix targeting this file.
+    header_all: bool,
+}
+
+impl FileSuppressions {
+    fn load(repo_root: &Path, rel_path: &str) -> Option<Self> {
+        let abs = repo_root.join(rel_path);
+        let content = std::fs::read_to_string(&abs).ok()?;
+        let mut s = FileSuppressions {
+            header_categories: Default::default(),
+            line_categories: Default::default(),
+            line_all: Default::default(),
+            header_all: false,
+        };
+        for (idx, line) in content.lines().enumerate() {
+            let line_no = (idx as u32) + 1;
+            let in_header = line_no <= 5;
+            let trimmed = line.trim_start();
+
+            // Strip a single leading comment marker (//, #, --) so we
+            // can detect the directive uniformly across languages.
+            let after_marker = trimmed
+                .strip_prefix("// ")
+                .or_else(|| trimmed.strip_prefix("//"))
+                .or_else(|| trimmed.strip_prefix("# "))
+                .or_else(|| trimmed.strip_prefix("#"))
+                .or_else(|| trimmed.strip_prefix("-- "))
+                .or_else(|| trimmed.strip_prefix("--"));
+            let Some(directive) = after_marker else {
+                continue;
+            };
+            let directive = directive.trim();
+
+            if directive == "agnix-ignore-all" || directive.starts_with("agnix-ignore-all ") {
+                if in_header {
+                    s.header_all = true;
+                }
+                s.line_all.insert(line_no);
+                continue;
+            }
+            if let Some(rest) = directive.strip_prefix("agnix-ignore:") {
+                let cats = rest
+                    .split(',')
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty());
+                let entry = s.line_categories.entry(line_no).or_default();
+                for cat in cats {
+                    if in_header {
+                        s.header_categories.insert(cat.clone());
+                    }
+                    entry.insert(cat);
+                }
+            }
+        }
+        Some(s)
+    }
+
+    fn suppresses(&self, fix: &SlopFix) -> bool {
+        let cat_str = serde_json::to_value(fix.category)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        match &fix.action {
+            SlopAction::DeleteFile { .. } => {
+                self.header_all || self.header_categories.contains(&cat_str)
+            }
+            SlopAction::DeleteLines { lines, .. } | SlopAction::ReplaceLines { lines, .. } => {
+                let target_line = lines[0];
+                // Lookback window matches the `eslint-disable-next-line`
+                // convention but extends 3 lines to handle Python's
+                // try/except where the directive sits above `try:` and
+                // the offending body line is two below — and Rust's
+                // multi-line attribute prefixes (`#[cfg(test)]` then
+                // `#[allow(...)]` then the function).
+                for n in 0..=3u32 {
+                    let candidate = target_line.saturating_sub(n);
+                    if candidate == 0 {
+                        break;
+                    }
+                    if self.line_all.contains(&candidate) {
+                        return true;
+                    }
+                    if self
+                        .line_categories
+                        .get(&candidate)
+                        .map(|set| set.contains(&cat_str))
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
 }
 
 // ── Path-based detectors ─────────────────────────────────────────
@@ -2064,6 +2226,202 @@ mod tests {
                 .any(|f| f.category == SlopCategory::TautologicalTest),
             "expected testify Equal(t,1,1) flag; got {:?}",
             fixes
+        );
+    }
+
+    // ── agnix-ignore suppression directives ─────
+
+    fn empty_map() -> RepoIntelData {
+        use chrono::Utc;
+        use std::collections::HashMap as StdMap;
+        RepoIntelData {
+            version: "test".into(),
+            generated: Utc::now(),
+            updated: Utc::now(),
+            partial: false,
+            git: analyzer_core::types::GitInfo {
+                analyzed_up_to: "HEAD".into(),
+                total_commits_analyzed: 0,
+                first_commit_date: "".into(),
+                last_commit_date: "".into(),
+                scope: None,
+                shallow: false,
+            },
+            contributors: analyzer_core::types::Contributors {
+                humans: StdMap::new(),
+                bots: StdMap::new(),
+            },
+            file_activity: StdMap::new(),
+            coupling: StdMap::new(),
+            conventions: analyzer_core::types::ConventionInfo {
+                prefixes: StdMap::new(),
+                style: "".into(),
+                uses_scopes: false,
+                naming_patterns: None,
+                test_patterns: None,
+            },
+            releases: analyzer_core::types::Releases {
+                tags: vec![],
+                cadence: "".into(),
+            },
+            renames: vec![],
+            deletions: vec![],
+            symbols: None,
+            import_graph: None,
+            project: None,
+            doc_refs: None,
+            graph: None,
+            file_descriptors: None,
+            summary: None,
+            embeddings_meta: None,
+        }
+    }
+
+    #[test]
+    fn suppression_on_same_line_skips_fix() {
+        let dir = make_repo(&[(
+            "a.ts",
+            "function f() {\n    try { call() } catch {} // agnix-ignore: empty-catch\n}\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "annotation on same line should suppress; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_on_line_above_skips_fix() {
+        let dir = make_repo(&[(
+            "a.ts",
+            "function f() {\n    // agnix-ignore: empty-catch\n    try { call() } catch {}\n}\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "annotation on line above should suppress; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_python_uses_hash_marker() {
+        let dir = make_repo(&[(
+            "a.py",
+            "def f():\n    # agnix-ignore: empty-catch\n    try:\n        x = 1\n    except:\n        pass\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        // The except is at line 5; the directive on line 2 is too far
+        // (we only check ±1). This should NOT suppress.
+        assert!(
+            result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "directive too far away should NOT suppress; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_python_directly_above_works() {
+        let dir = make_repo(&[(
+            "a.py",
+            "def f():\n    try:\n        x = 1\n    # agnix-ignore: empty-catch\n    except:\n        pass\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "directive directly above except should suppress; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_wrong_category_does_not_skip() {
+        // Directive names a different category — fix must still fire.
+        let dir = make_repo(&[(
+            "a.ts",
+            "// agnix-ignore: orphan-export\nfunction f() { try {} catch {} }\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "different-category directive should NOT suppress empty-catch; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_comma_list_covers_multiple_categories() {
+        let dir = make_repo(&[(
+            "a.ts",
+            "function f() {\n    // agnix-ignore: empty-catch, tautological-test\n    try {} catch {}\n}\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "comma-list should cover empty-catch; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_ignore_all_directive_skips_any_category() {
+        let dir = make_repo(&[(
+            "a.ts",
+            "function f() {\n    // agnix-ignore-all\n    try {} catch {}\n}\n",
+        )]);
+        let map = empty_map();
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch),
+            "agnix-ignore-all should suppress empty-catch; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn suppression_header_directive_skips_file_deletion() {
+        // File-deletion fixes (tracked-artifact) are suppressible by an
+        // agnix-ignore directive in the file's first 5 lines.
+        let dir = make_repo(&[(
+            "debug.log",
+            "// agnix-ignore: tracked-artifact\nthese are intentional log fixtures\n",
+        )]);
+        let result = slop_fixes(dir.path(), &empty_map());
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::TrackedArtifact),
+            "header directive should suppress file-deletion; got {:?}",
+            result.fixes
         );
     }
 }
