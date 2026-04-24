@@ -499,15 +499,7 @@ fn detect_python_main_files(repo_path: &Path, out: &mut Vec<EntryPoint>) {
             // Skip common noise dirs to keep the walk cheap.
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.')
-                || name_str == "node_modules"
-                || name_str == "target"
-                || name_str == "dist"
-                || name_str == "build"
-                || name_str == "venv"
-                || name_str == ".venv"
-                || name_str == "__pycache__"
-            {
+            if is_noise_dir(&name_str) {
                 continue;
             }
             if path.is_dir() {
@@ -537,6 +529,14 @@ fn detect_python_main_files(repo_path: &Path, out: &mut Vec<EntryPoint>) {
 /// sidebars/companion files in the same dir are also surfaced.
 /// Standalone framework configs (`next.config.js`, `vite.config.ts`,
 /// `astro.config.mjs`, etc.) are surfaced wherever found.
+fn is_noise_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "node_modules" | "target" | "dist" | "build" | "venv" | ".venv" | "__pycache__"
+        )
+}
+
 fn detect_framework_configs(repo_path: &Path, out: &mut Vec<EntryPoint>) {
     fn walk(dir: &Path, repo_root: &Path, out: &mut Vec<EntryPoint>, depth: usize) {
         if depth > 8 {
@@ -549,13 +549,7 @@ fn detect_framework_configs(repo_path: &Path, out: &mut Vec<EntryPoint>) {
         for entry in rd.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.')
-                || name_str == "node_modules"
-                || name_str == "target"
-                || name_str == "dist"
-                || name_str == "build"
-                || name_str == "__pycache__"
-            {
+            if is_noise_dir(&name_str) {
                 continue;
             }
             entries.push(entry.path());
@@ -623,39 +617,66 @@ fn is_standalone_framework_config(name: &str) -> bool {
         "next.config.js"
             | "next.config.ts"
             | "next.config.mjs"
+            | "next.config.cjs"
             | "vite.config.js"
             | "vite.config.ts"
             | "vite.config.mjs"
+            | "vite.config.cjs"
             | "astro.config.js"
             | "astro.config.ts"
             | "astro.config.mjs"
+            | "astro.config.cjs"
             | "nuxt.config.js"
             | "nuxt.config.ts"
+            | "nuxt.config.mjs"
             | "svelte.config.js"
             | "svelte.config.ts"
+            | "svelte.config.mjs"
+            | "svelte.config.cjs"
             | "remix.config.js"
+            | "remix.config.cjs"
+            | "remix.config.mjs"
             | "tailwind.config.js"
             | "tailwind.config.ts"
+            | "tailwind.config.cjs"
+            | "tailwind.config.mjs"
             | "postcss.config.js"
             | "postcss.config.cjs"
+            | "postcss.config.mjs"
             | "rollup.config.js"
             | "rollup.config.mjs"
+            | "rollup.config.cjs"
+            | "rollup.config.ts"
             | "webpack.config.js"
+            | "webpack.config.cjs"
+            | "webpack.config.mjs"
+            | "webpack.config.ts"
             | "babel.config.js"
+            | "babel.config.cjs"
+            | "babel.config.mjs"
             | "babel.config.json"
             | "jest.config.js"
             | "jest.config.ts"
+            | "jest.config.cjs"
+            | "jest.config.mjs"
             | "vitest.config.js"
             | "vitest.config.ts"
+            | "vitest.config.cjs"
+            | "vitest.config.mjs"
             | "playwright.config.js"
             | "playwright.config.ts"
+            | "playwright.config.cjs"
+            | "playwright.config.mjs"
     )
 }
 
 fn is_docusaurus_anchor(name: &str) -> bool {
     matches!(
         name,
-        "docusaurus.config.js" | "docusaurus.config.ts" | "docusaurus.config.mjs"
+        "docusaurus.config.js"
+            | "docusaurus.config.ts"
+            | "docusaurus.config.mjs"
+            | "docusaurus.config.cjs"
     )
 }
 
@@ -665,10 +686,15 @@ fn is_docusaurus_companion(name: &str) -> bool {
         "sidebars.js"
             | "sidebars.ts"
             | "sidebars.mjs"
+            | "sidebars.cjs"
             | "footer.js"
             | "footer.ts"
+            | "footer.mjs"
+            | "footer.cjs"
             | "navbar.js"
             | "navbar.ts"
+            | "navbar.mjs"
+            | "navbar.cjs"
     )
 }
 
