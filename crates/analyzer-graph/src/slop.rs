@@ -3236,13 +3236,13 @@ fn commented_out_code(
 // Algorithm:
 //
 // 1. Build a `used_names` set from the map: every entry in every
-//    file's `imports[].names`. Also mirror into a lowercased set for
-//    case-insensitive probes (JS/TS cross-language edges).
-// 2. For each `.rs` file, run a tree-sitter query for attribute items
-//    whose content starts with `allow(...)`. Accept the attribute
-//    only when its argument list contains one of: `dead_code`,
-//    `unused`, `unused_imports`, `unused_variables`,
-//    `unused_assignments`, `unused_must_use`.
+//    file's `imports[].names` (exact-match; Rust identifiers are
+//    case-sensitive).
+// 2. For each `.rs` file, run a tree-sitter query for `attribute_item`
+//    nodes. Accept attributes whose top-level identifier is `allow`
+//    (not nested inside e.g. `cfg_attr(...)`) and whose argument list
+//    contains one of: `dead_code`, `unused`, `unused_imports`,
+//    `unused_variables`, `unused_assignments`, `unused_must_use`.
 // 3. For each matched attribute, find the following sibling item
 //    node (fn / struct / enum / mod / const / static / trait / impl)
 //    and its identifier.
@@ -3281,35 +3281,84 @@ fn collect_used_names(map: &RepoIntelData) -> HashSet<String> {
     used
 }
 
-/// Parse the argument list of an `allow(...)` attribute. Returns the
-/// set of lint names mentioned. The tree-sitter node for the
-/// attribute is `attribute_item` with child `attribute` which in
-/// turn contains a `token_tree` of identifier tokens separated by
-/// commas. We walk the tree and collect every identifier.
+/// Parse an `#[allow(...)]` attribute via AST structure, not text
+/// scanning. Returns the list of lint names only when the attribute's
+/// top-level identifier is literally `allow` (not `cfg_attr`, not
+/// `deny`, not `warn`). This correctly skips cases like
+/// `#[cfg_attr(feature = "x", allow(dead_code))]` where `allow`
+/// appears only as a nested identifier.
+///
+/// Shape in tree-sitter-rust:
+///
+///   (attribute_item
+///     (attribute
+///       (identifier)       ; "allow" at top level
+///       arguments: (token_tree "(" (identifier)+ ")")))
+///
+/// Returns `Vec::new()` for inner attributes (`#![allow(...)]`) —
+/// those are module-scoped; removing them would change the silence
+/// shape file-wide and that's not a safe mechanical edit.
 fn extract_allow_lints(attribute_node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
-    let text = match attribute_node.utf8_text(source) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
-    };
-    // Tolerate `#[allow(...)]` and `#![allow(...)]`. We only act on
-    // outer (#[...]) attributes; inner (#![...]) are module-scoped
-    // and removing them would change the module-wide silence shape.
-    if text.starts_with("#![") {
+    // Inner attributes (#![...]) carry an `inner` marker child or
+    // start their text with "#!["; either check works.
+    if attribute_node
+        .utf8_text(source)
+        .map(|t| t.starts_with("#!["))
+        .unwrap_or(false)
+    {
         return Vec::new();
     }
-    let Some(open) = text.find("allow(") else {
+    // Find the child `attribute` node.
+    let mut attr_inner = None;
+    let mut c = attribute_node.walk();
+    for child in attribute_node.named_children(&mut c) {
+        if child.kind() == "attribute" {
+            attr_inner = Some(child);
+            break;
+        }
+    }
+    let Some(attr_inner) = attr_inner else {
         return Vec::new();
     };
-    let rest = &text[open + "allow(".len()..];
-    let Some(close) = rest.find(')') else {
+    // The attribute's first named child is the top-level identifier
+    // (e.g. `allow`, `cfg_attr`, `derive`). Must be exactly `allow`.
+    let Some(ident) = attr_inner.named_child(0) else {
         return Vec::new();
     };
-    rest[..close]
-        .split(',')
-        .map(|s| s.trim().trim_start_matches("clippy::"))
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
+    if ident.kind() != "identifier" {
+        return Vec::new();
+    }
+    let top_name = ident.utf8_text(source).unwrap_or("");
+    if top_name != "allow" {
+        return Vec::new();
+    }
+    // Collect identifiers from the `token_tree` / `arguments`. The
+    // argument list holds identifier tokens (dead_code, unused, ...),
+    // possibly scoped like `clippy::needless_return`.
+    let mut out: Vec<String> = Vec::new();
+    let mut walker = attr_inner.walk();
+    for child in attr_inner.named_children(&mut walker) {
+        if child.kind() != "token_tree" {
+            continue;
+        }
+        // Walk raw characters of the token-tree text: tree-sitter
+        // tokenises the inside as a flat sequence so simple
+        // comma-split is fine here, but we strip clippy:: scope
+        // prefixes so `clippy::needless_return` becomes `needless_return`.
+        let tt_text = child.utf8_text(source).unwrap_or("");
+        // Remove the outer parentheses.
+        let inner = tt_text
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(tt_text);
+        for raw in inner.split(',') {
+            let name = raw.trim().trim_start_matches("clippy::");
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Find the identifier of the item an attribute is attached to. Rust
@@ -3361,6 +3410,13 @@ fn stale_suppressions_rust(repo_root: &Path, map: &RepoIntelData) -> Vec<SlopFix
     let Ok(query) = tree_sitter::Query::new(&language, query_src) else {
         return out;
     };
+    // Parser and query are both reusable across files; only the tree
+    // changes per file. Instantiating them once saves tree-sitter
+    // setup cost on large repos.
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return out;
+    }
 
     for path in walk_repo_files(repo_root) {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
@@ -3378,10 +3434,6 @@ fn stale_suppressions_rust(repo_root: &Path, map: &RepoIntelData) -> Vec<SlopFix
             Ok(c) => c,
             Err(_) => continue,
         };
-        let mut parser = tree_sitter::Parser::new();
-        if parser.set_language(&language).is_err() {
-            continue;
-        }
         let Some(tree) = parser.parse(&content, None) else {
             continue;
         };
@@ -5040,6 +5092,29 @@ pub fn helper(x: u32) -> u32 { x + 1 }
                 .iter()
                 .any(|f| f.category == SlopCategory::StaleSuppression),
             "should skip test files; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn ignores_cfg_attr_nested_allow() {
+        // `#[cfg_attr(feature = "x", allow(dead_code))]` mentions
+        // `allow` only nested inside cfg_attr. It is NOT a top-level
+        // `#[allow(...)]` and must not be flagged even when the
+        // decorated symbol is imported.
+        let src = "\
+#[cfg_attr(feature = \"x\", allow(dead_code))]
+pub fn helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let map = map_with_import("src/consumer.rs", &["helper"]);
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should not flag nested allow inside cfg_attr; got {:?}",
             result.fixes
         );
     }
