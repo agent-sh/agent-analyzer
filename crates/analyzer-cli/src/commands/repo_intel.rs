@@ -416,9 +416,7 @@ pub fn run(action: RepoIntelAction) -> Result<()> {
             run_set_descriptors(&map_file, &input)
         }
         RepoIntelAction::SetSummary { map_file, input } => run_set_summary(&map_file, &input),
-        RepoIntelAction::SetEmbeddings { map_file, input } => {
-            run_set_embeddings(&map_file, &input)
-        }
+        RepoIntelAction::SetEmbeddings { map_file, input } => run_set_embeddings(&map_file, &input),
     }
 }
 
@@ -515,13 +513,7 @@ fn run_set_embeddings(map_file: &Path, input: &str) -> Result<()> {
             .vectors
             .iter()
             .map(|v| {
-                StoredVector::from_f32(
-                    v.kind,
-                    v.name.clone(),
-                    v.start_line,
-                    v.end_line,
-                    &v.values,
-                )
+                StoredVector::from_f32(v.kind, v.name.clone(), v.start_line, v.end_line, &v.values)
             })
             .collect();
         sidecar.insert(path.clone(), stored);
@@ -544,9 +536,11 @@ fn run_set_embeddings(map_file: &Path, input: &str) -> Result<()> {
     let file_hashes: std::collections::HashMap<String, String> = doc
         .files
         .iter()
-        .map(|(p, f): (&String, &analyzer_embed::schema::FileEmbeddings)| {
-            (p.clone(), f.content_hash.clone())
-        })
+        .map(
+            |(p, f): (&String, &analyzer_embed::schema::FileEmbeddings)| {
+                (p.clone(), f.content_hash.clone())
+            },
+        )
         .collect();
 
     map.embeddings_meta = Some(analyzer_core::types::EmbeddingsMeta {
@@ -1001,8 +995,7 @@ fn run_query(query: QueryAction) -> Result<()> {
             } else {
                 None
             };
-            let result =
-                analyzer_graph::slop_targets::slop_targets(&map, sidecar.as_ref(), top);
+            let result = analyzer_graph::slop_targets::slop_targets(&map, sidecar.as_ref(), top);
             println!("{}", output::to_json(&result));
         }
         QueryAction::Summary {

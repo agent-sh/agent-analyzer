@@ -298,7 +298,12 @@ mod tests {
                 .enumerate()
                 .map(|(i, t)| {
                     (0..dim)
-                        .map(|j| self.seed + (i as f32) * 0.01 + (j as f32) * 0.001 + (t.len() as f32) * 0.0001)
+                        .map(|j| {
+                            self.seed
+                                + (i as f32) * 0.01
+                                + (j as f32) * 0.001
+                                + (t.len() as f32) * 0.0001
+                        })
                         .collect()
                 })
                 .collect())

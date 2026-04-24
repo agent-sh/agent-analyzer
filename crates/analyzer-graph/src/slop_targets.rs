@@ -150,12 +150,7 @@ fn sonnet_file_targets(map: &RepoIntelData, top: usize) -> Vec<SlopTarget> {
     // match the bot list. We don't have per-file bot/human commit
     // counts in the schema (only at the contributors level), so the
     // proxy is: among distinct authors of the file, how many are bots.
-    let bot_names: HashSet<&str> = map
-        .contributors
-        .bots
-        .keys()
-        .map(|s| s.as_str())
-        .collect();
+    let bot_names: HashSet<&str> = map.contributors.bots.keys().map(|s| s.as_str()).collect();
 
     let mut scored: Vec<(f32, SlopSuspect, String, String)> = Vec::new();
     for (path, activity) in &activities {
@@ -188,10 +183,7 @@ fn sonnet_file_targets(map: &RepoIntelData, top: usize) -> Vec<SlopTarget> {
             bot_count as f32 / activity.authors.len() as f32
         };
 
-        let composite = hot_score * 1.0
-            + bug_score * 1.5
-            + size_score * 0.7
-            + bot_ratio * 0.8;
+        let composite = hot_score * 1.0 + bug_score * 1.5 + size_score * 0.7 + bot_ratio * 0.8;
         if composite < 1.5 {
             continue;
         }
@@ -274,8 +266,18 @@ fn cliche_name_clusters(map: &RepoIntelData) -> Vec<SlopTarget> {
         None => return Vec::new(),
     };
     const CLICHE: &[&str] = &[
-        "helper", "helpers", "utility", "utilities", "util", "utils",
-        "manager", "handler", "processor", "data", "info", "wrapper",
+        "helper",
+        "helpers",
+        "utility",
+        "utilities",
+        "util",
+        "utils",
+        "manager",
+        "handler",
+        "processor",
+        "data",
+        "info",
+        "wrapper",
     ];
 
     let mut by_dir: HashMap<String, Vec<String>> = HashMap::new();
@@ -311,7 +313,11 @@ fn cliche_name_clusters(map: &RepoIntelData) -> Vec<SlopTarget> {
             why: format!(
                 "{} cliché-named exports in {}: {}",
                 hits.len(),
-                if dir.is_empty() { "(root)" } else { dir.as_str() },
+                if dir.is_empty() {
+                    "(root)"
+                } else {
+                    dir.as_str()
+                },
                 hits.join(", ")
             ),
         });
@@ -522,7 +528,7 @@ fn high_bug_communities(map: &RepoIntelData) -> Vec<SlopTarget> {
 mod tests {
     use super::*;
     use analyzer_core::types::{
-        BotContributor, ConventionInfo, Contributors, FileActivity, FileSymbols, GitInfo,
+        BotContributor, Contributors, ConventionInfo, FileActivity, FileSymbols, GitInfo,
         HumanContributor, Releases, RepoIntelData, SymbolEntry,
     };
     use chrono::Utc;
@@ -604,10 +610,12 @@ mod tests {
             .insert("src/calm.rs".into(), activity(2, 0, vec!["alice"]));
 
         let res = slop_targets(&map, None, 10);
-        let target = res.targets.iter().find(|t| matches!(
-            t,
-            SlopTarget::File { path, .. } if path == "src/hot.rs"
-        ));
+        let target = res.targets.iter().find(|t| {
+            matches!(
+                t,
+                SlopTarget::File { path, .. } if path == "src/hot.rs"
+            )
+        });
         assert!(target.is_some(), "expected hot.rs to surface");
         if let Some(SlopTarget::File { suspect, tier, .. }) = target {
             assert_eq!(*tier, SlopTier::Sonnet);
@@ -618,28 +626,28 @@ mod tests {
     #[test]
     fn bot_authored_file_gets_bot_suspect() {
         let mut map = empty_map();
-        map.contributors
-            .bots
-            .insert("dependabot[bot]".into(), BotContributor {
+        map.contributors.bots.insert(
+            "dependabot[bot]".into(),
+            BotContributor {
                 commits: 100,
                 recent_commits: 50,
                 first_seen: "".into(),
                 last_seen: "".into(),
-            });
-        map.contributors
-            .humans
-            .insert("alice".into(), HumanContributor {
+            },
+        );
+        map.contributors.humans.insert(
+            "alice".into(),
+            HumanContributor {
                 commits: 1,
                 recent_commits: 1,
                 first_seen: "".into(),
                 last_seen: "".into(),
-            });
+            },
+        );
         // Pad with calm files so percentile calc is meaningful.
         for i in 0..10 {
-            map.file_activity.insert(
-                format!("calm-{i}.rs"),
-                activity(1, 0, vec!["alice"]),
-            );
+            map.file_activity
+                .insert(format!("calm-{i}.rs"), activity(1, 0, vec!["alice"]));
         }
         // Hot file authored only by the bot.
         map.file_activity.insert(
@@ -648,13 +656,19 @@ mod tests {
         );
 
         let res = slop_targets(&map, None, 10);
-        let bot_target = res.targets.iter().find(|t| matches!(
-            t,
-            SlopTarget::File { path, suspect, .. }
-                if path == "deps/lockfile.json"
-                    && *suspect == SlopSuspect::BotAuthored
-        ));
-        assert!(bot_target.is_some(), "expected bot suspect; targets = {:?}", res.targets);
+        let bot_target = res.targets.iter().find(|t| {
+            matches!(
+                t,
+                SlopTarget::File { path, suspect, .. }
+                    if path == "deps/lockfile.json"
+                        && *suspect == SlopSuspect::BotAuthored
+            )
+        });
+        assert!(
+            bot_target.is_some(),
+            "expected bot suspect; targets = {:?}",
+            res.targets
+        );
     }
 
     #[test]
@@ -688,12 +702,18 @@ mod tests {
         map.symbols = Some(symbols);
 
         let res = slop_targets(&map, None, 10);
-        let area = res.targets.iter().find(|t| matches!(
-            t,
-            SlopTarget::Area { tier, suspect, .. }
-                if *tier == SlopTier::Opus && *suspect == SlopSuspect::ClicheNames
-        ));
-        assert!(area.is_some(), "expected cliché cluster; got {:?}", res.targets);
+        let area = res.targets.iter().find(|t| {
+            matches!(
+                t,
+                SlopTarget::Area { tier, suspect, .. }
+                    if *tier == SlopTier::Opus && *suspect == SlopSuspect::ClicheNames
+            )
+        });
+        assert!(
+            area.is_some(),
+            "expected cliché cluster; got {:?}",
+            res.targets
+        );
     }
 
     #[test]
@@ -711,11 +731,17 @@ mod tests {
         map.import_graph = Some(g);
 
         let res = slop_targets(&map, None, 10);
-        let chain = res.targets.iter().find(|t| matches!(
-            t,
-            SlopTarget::Area { suspect, .. } if *suspect == SlopSuspect::WrapperTower
-        ));
-        assert!(chain.is_some(), "expected wrapper tower; got {:?}", res.targets);
+        let chain = res.targets.iter().find(|t| {
+            matches!(
+                t,
+                SlopTarget::Area { suspect, .. } if *suspect == SlopSuspect::WrapperTower
+            )
+        });
+        assert!(
+            chain.is_some(),
+            "expected wrapper tower; got {:?}",
+            res.targets
+        );
     }
 
     #[test]
@@ -740,11 +766,17 @@ mod tests {
         map.import_graph = Some(g);
 
         let res = slop_targets(&map, None, 10);
-        let single = res.targets.iter().find(|t| matches!(
-            t,
-            SlopTarget::Area { suspect, .. } if *suspect == SlopSuspect::SingleImpl
-        ));
-        assert!(single.is_some(), "expected SingleImpl; got {:?}", res.targets);
+        let single = res.targets.iter().find(|t| {
+            matches!(
+                t,
+                SlopTarget::Area { suspect, .. } if *suspect == SlopSuspect::SingleImpl
+            )
+        });
+        assert!(
+            single.is_some(),
+            "expected SingleImpl; got {:?}",
+            res.targets
+        );
     }
 
     #[test]
@@ -755,7 +787,10 @@ mod tests {
 
     #[test]
     fn percentile_picks_top_value_for_p95() {
-        let p = percentile(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], 0.95);
+        let p = percentile(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            0.95,
+        );
         assert!(p >= 9.0, "expected p95 in upper range, got {p}");
     }
 

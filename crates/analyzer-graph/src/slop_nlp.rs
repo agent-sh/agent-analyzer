@@ -27,8 +27,6 @@
 //! * **doc-drift v2** — needs embedded markdown sections plus per-
 //!   function code embeddings, then cross-modal comparison.
 
-use std::collections::HashMap;
-
 use analyzer_embed::sidecar::{Sidecar, StoredVector};
 
 use crate::slop_targets::{SlopSuspect, SlopTarget, SlopTier};
@@ -326,10 +324,9 @@ mod tests {
             )],
         );
         let out = semantic_duplicates(&sidecar, 5);
-        assert!(
-            out.iter()
-                .any(|t| matches!(t, SlopTarget::Area { suspect, .. } if *suspect == SlopSuspect::SingleImpl))
-        );
+        assert!(out.iter().any(
+            |t| matches!(t, SlopTarget::Area { suspect, .. } if *suspect == SlopSuspect::SingleImpl)
+        ));
     }
 
     #[test]
@@ -338,13 +335,7 @@ mod tests {
         sidecar.insert(
             "a.rs".into(),
             vec![
-                StoredVector::from_f32(
-                    ChunkKind::Function,
-                    Some("first".into()),
-                    1,
-                    5,
-                    &[0.5; 8],
-                ),
+                StoredVector::from_f32(ChunkKind::Function, Some("first".into()), 1, 5, &[0.5; 8]),
                 StoredVector::from_f32(
                     ChunkKind::Function,
                     Some("second".into()),

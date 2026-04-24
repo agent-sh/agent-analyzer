@@ -206,8 +206,8 @@ fn duplicate_tooling(repo_root: &Path) -> Vec<SlopFix> {
         || repo_root.join(".eslintrc.js").is_file()
         || repo_root.join("eslint.config.js").is_file()
         || repo_root.join("eslint.config.mjs").is_file();
-    let has_biome = repo_root.join("biome.json").is_file()
-        || repo_root.join(".biome.json").is_file();
+    let has_biome =
+        repo_root.join("biome.json").is_file() || repo_root.join(".biome.json").is_file();
     if has_eslint && has_biome {
         out.push(SlopFix {
             action: SlopAction::DeleteFile {
@@ -233,11 +233,16 @@ fn duplicate_tooling(repo_root: &Path) -> Vec<SlopFix> {
     }
 
     // Multiple JS lockfiles (unambiguous slop)
-    let lockfiles: Vec<&str> = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb"]
-        .iter()
-        .filter(|f| repo_root.join(f).is_file())
-        .copied()
-        .collect();
+    let lockfiles: Vec<&str> = [
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lockb",
+    ]
+    .iter()
+    .filter(|f| repo_root.join(f).is_file())
+    .copied()
+    .collect();
     if lockfiles.len() > 1 {
         // Keep one; flag the rest as slop. We don't know which one is
         // canonical, so we flag all but the first alphabetically and
@@ -399,11 +404,7 @@ fn ast_findings(repo_root: &Path) -> Vec<SlopFix> {
     out
 }
 
-fn empty_catches_ts_js(
-    content: &str,
-    rel: &str,
-    language: &tree_sitter::Language,
-) -> Vec<SlopFix> {
+fn empty_catches_ts_js(content: &str, rel: &str, language: &tree_sitter::Language) -> Vec<SlopFix> {
     let query_src = r#"(catch_clause body: (statement_block) @body)"#;
     run_ast_query(content, language, query_src, |node| {
         // Empty if body has no children (i.e. just `{}`).
@@ -532,7 +533,10 @@ fn tautological_tests_ts_js(
                 lines: [start, end],
             },
             category: SlopCategory::TautologicalTest,
-            reason: format!("tautological assertion: `expect({left}).{}` always passes", "toBe(...)"),
+            reason: format!(
+                "tautological assertion: `expect({left}).{}` always passes",
+                "toBe(...)"
+            ),
         });
     }
     out
@@ -548,7 +552,11 @@ fn is_literal_or_identifier(s: &str) -> bool {
     if s.starts_with('"') || s.starts_with('\'') || s.starts_with('`') {
         return true;
     }
-    if s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if s.chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         return true;
     }
     s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -649,7 +657,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write(&dir, "tests/fixtures/sample/output.log", "");
         let fixes = tracked_artifacts(dir.path());
-        assert!(!fixes.iter().any(|f| matches!(&f.action, SlopAction::DeleteFile { path } if path.ends_with("output.log"))));
+        assert!(!fixes.iter().any(
+            |f| matches!(&f.action, SlopAction::DeleteFile { path } if path.ends_with("output.log"))
+        ));
     }
 
     #[test]
@@ -683,7 +693,11 @@ mod tests {
         write(&dir, ".travis.yml", "");
         write(&dir, ".github/workflows/ci.yml", "");
         let fixes = stale_ci_configs(dir.path());
-        assert!(fixes.iter().any(|f| f.category == SlopCategory::StaleCiConfig));
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleCiConfig)
+        );
     }
 
     #[test]
@@ -700,7 +714,11 @@ mod tests {
         write(&dir, ".eslintrc.json", "{}");
         write(&dir, "biome.json", "{}");
         let fixes = duplicate_tooling(dir.path());
-        assert!(fixes.iter().any(|f| f.category == SlopCategory::DuplicateTooling));
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::DuplicateTooling)
+        );
     }
 
     #[test]
@@ -710,7 +728,11 @@ mod tests {
         write(&dir, "yarn.lock", "");
         let fixes = duplicate_tooling(dir.path());
         // One of the two flagged (we keep one).
-        assert!(fixes.iter().any(|f| f.category == SlopCategory::DuplicateTooling));
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::DuplicateTooling)
+        );
     }
 
     #[test]
@@ -718,7 +740,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write(&dir, "package-lock.json", "");
         let fixes = duplicate_tooling(dir.path());
-        assert!(!fixes.iter().any(|f| f.category == SlopCategory::DuplicateTooling));
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::DuplicateTooling)
+        );
     }
 
     #[test]
@@ -760,7 +786,11 @@ mod tests {
     #[test]
     fn detects_tautological_tobe_in_typescript() {
         let dir = TempDir::new().unwrap();
-        write(&dir, "a.test.ts", "test('x', () => { expect(true).toBe(true); });\n");
+        write(
+            &dir,
+            "a.test.ts",
+            "test('x', () => { expect(true).toBe(true); });\n",
+        );
         let fixes = ast_findings(dir.path());
         assert!(
             fixes

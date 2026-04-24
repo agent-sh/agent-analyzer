@@ -221,6 +221,9 @@ mod tests {
     fn sidecar_path_substitutes_extension() {
         let p = std::path::PathBuf::from("/x/y/repo-intel.json");
         let sc = derive_sidecar_path(&p);
-        assert_eq!(sc, std::path::PathBuf::from("/x/y/repo-intel.embeddings.bin"));
+        assert_eq!(
+            sc,
+            std::path::PathBuf::from("/x/y/repo-intel.embeddings.bin")
+        );
     }
 }

@@ -107,24 +107,24 @@ pub fn chunk_file(path: &Path, content: &str, granularity: Granularity) -> Vec<C
     };
 
     let chunks = match lang {
-        Language::Rust => extract_with_query(content, &tree_sitter_rust::LANGUAGE.into(), RUST_QUERY),
+        Language::Rust => {
+            extract_with_query(content, &tree_sitter_rust::LANGUAGE.into(), RUST_QUERY)
+        }
         Language::TypeScript => extract_with_query(
             content,
             &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             TS_QUERY,
         ),
-        Language::JavaScript => extract_with_query(
-            content,
-            &tree_sitter_javascript::LANGUAGE.into(),
-            JS_QUERY,
-        ),
-        Language::Python => extract_with_query(
-            content,
-            &tree_sitter_python::LANGUAGE.into(),
-            PYTHON_QUERY,
-        ),
+        Language::JavaScript => {
+            extract_with_query(content, &tree_sitter_javascript::LANGUAGE.into(), JS_QUERY)
+        }
+        Language::Python => {
+            extract_with_query(content, &tree_sitter_python::LANGUAGE.into(), PYTHON_QUERY)
+        }
         Language::Go => extract_with_query(content, &tree_sitter_go::LANGUAGE.into(), GO_QUERY),
-        Language::Java => extract_with_query(content, &tree_sitter_java::LANGUAGE.into(), JAVA_QUERY),
+        Language::Java => {
+            extract_with_query(content, &tree_sitter_java::LANGUAGE.into(), JAVA_QUERY)
+        }
         Language::Markdown => extract_markdown_sections(content),
     };
 
@@ -389,11 +389,7 @@ mod tests {
     #[test]
     fn unsupported_extension_falls_back_to_file_chunk() {
         let src = "this is some text\nwith multiple lines\n";
-        let chunks = chunk_file(
-            &PathBuf::from("notes.txt"),
-            src,
-            Granularity::PerFunction,
-        );
+        let chunks = chunk_file(&PathBuf::from("notes.txt"), src, Granularity::PerFunction);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].kind, ChunkKind::File);
     }
