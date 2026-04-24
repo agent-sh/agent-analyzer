@@ -2888,8 +2888,14 @@ fn strip_comment(text: &str, style: CommentStyle) -> Option<String> {
         CommentStyle::CStyle => {
             // Block comment
             if let Some(inner) = text.strip_prefix("/*").and_then(|s| s.strip_suffix("*/")) {
-                // Doc comment `/** … */`
+                // Outer doc comment `/** … */` (Rust/Java) and inner
+                // doc comment `/*! … */` (Rust) are both attached to
+                // declarations and must never be flagged. Plain block
+                // comments (`/* … */`) pass through.
                 if inner.starts_with('*') && !inner.starts_with("**") {
+                    return None;
+                }
+                if inner.starts_with('!') {
                     return None;
                 }
                 return Some(strip_leading_stars(inner));
@@ -4643,6 +4649,28 @@ def real():
                 .iter()
                 .any(|f| f.category == SlopCategory::CommentedOutCode),
             "indented Python should flag; got {fixes:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_rust_inner_doc_block_comment() {
+        // `/*! … */` is a Rust inner-doc block attached to the
+        // enclosing item/module. Even if its content parses, we
+        // shouldn't flag it.
+        let src = "\
+/*! fn example(x: u32) -> u32 {
+ *      x + 1
+ *  }
+ */
+pub fn real() {}
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::CommentedOutCode),
+            "inner-doc block shouldn't flag; got {fixes:?}"
         );
     }
 
