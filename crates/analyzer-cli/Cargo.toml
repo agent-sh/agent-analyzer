@@ -22,6 +22,7 @@ analyzer-repo-map.workspace = true
 analyzer-collectors.workspace = true
 analyzer-sync-check.workspace = true
 analyzer-graph.workspace = true
+analyzer-embed.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

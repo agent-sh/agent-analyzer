@@ -25,10 +25,14 @@
 
 pub mod chunk;
 pub mod embedder;
+pub mod model;
+pub mod scan;
 pub mod schema;
 pub mod sidecar;
 
 pub use chunk::{Chunk, ChunkKind, Granularity, chunk_file};
 pub use embedder::{Embedder, ModelVariant};
+pub use model::FastEmbedder;
+pub use scan::{ScanOptions, run_scan, run_update};
 pub use schema::{EmbeddingsDocument, FileEmbeddings, ScanMeta};
 pub use sidecar::{Sidecar, SidecarHeader};

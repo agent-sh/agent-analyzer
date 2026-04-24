@@ -190,6 +190,7 @@ mod tests {
             graph: None,
             file_descriptors: None,
             summary: None,
+            embeddings_meta: None,
         };
 
         for (path, changes) in file_changes {

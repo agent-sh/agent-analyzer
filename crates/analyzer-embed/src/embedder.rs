@@ -45,16 +45,18 @@ impl ModelVariant {
     }
 }
 
-/// Stateless embedder. Takes a batch of texts, returns a vector per text
-/// at the model's native dimensionality.
+/// Embedder over a loaded model. Takes a batch of texts, returns a vector
+/// per text at the model's native dimensionality.
 ///
-/// Implementations are expected to handle their own batching, tokenization,
-/// and model state. Callers pass slices of any reasonable size.
-pub trait Embedder: Send + Sync {
+/// `embed` takes `&mut self` because ONNX inference sessions hold mutable
+/// internal state (KV caches, scratch buffers). Implementations handle
+/// their own batching, tokenization, and model state. Callers pass slices
+/// of any reasonable size.
+pub trait Embedder {
     /// The model variant this embedder was constructed with.
     fn variant(&self) -> ModelVariant;
 
     /// Embed a batch of texts. Returns one vector per input text, each of
     /// length `self.variant().native_dim()`.
-    fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
+    fn embed(&mut self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
 }

@@ -60,6 +60,20 @@ pub enum RepoIntelAction {
         #[arg(long, default_value = "-")]
         input: String,
     },
+    /// Merge an embeddings document (from the `agent-analyzer-embed`
+    /// binary) into the artifact + sidecar. Reads the JSON document
+    /// produced by `agent-analyzer-embed scan`/`update` from --input.
+    /// Writes the binary sidecar to `<map_file_stem>.embeddings.bin`
+    /// and updates the artifact's `embeddingsMeta` with content hashes
+    /// for delta detection on subsequent updates.
+    SetEmbeddings {
+        /// Path to the repo-intel JSON to update
+        #[arg(long)]
+        map_file: PathBuf,
+        /// Embeddings JSON file path, or `-` for stdin
+        #[arg(long, default_value = "-")]
+        input: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -375,6 +389,9 @@ pub fn run(action: RepoIntelAction) -> Result<()> {
             run_set_descriptors(&map_file, &input)
         }
         RepoIntelAction::SetSummary { map_file, input } => run_set_summary(&map_file, &input),
+        RepoIntelAction::SetEmbeddings { map_file, input } => {
+            run_set_embeddings(&map_file, &input)
+        }
     }
 }
 
@@ -451,6 +468,85 @@ fn run_set_summary(map_file: &Path, input: &str) -> Result<()> {
     write_map(map_file, &map)?;
     eprintln!("[OK] summary updated");
     Ok(())
+}
+
+fn run_set_embeddings(map_file: &Path, input: &str) -> Result<()> {
+    use analyzer_embed::schema::EmbeddingsDocument;
+    use analyzer_embed::sidecar::{Sidecar, StoredVector};
+
+    let mut map = load_map(map_file)?;
+    let input_text = read_input(input)?;
+    let doc: EmbeddingsDocument = serde_json::from_str(&input_text)
+        .context("embeddings input must be a valid EmbeddingsDocument JSON")?;
+
+    // Build the sidecar from the document. The sidecar holds the actual
+    // vectors (packed fp16); the JSON artifact only keeps content
+    // hashes for delta detection.
+    let mut sidecar = Sidecar::new(doc.meta.model_id.clone(), doc.meta.dim);
+    for (path, file) in &doc.files {
+        let stored: Vec<StoredVector> = file
+            .vectors
+            .iter()
+            .map(|v| {
+                StoredVector::from_f32(
+                    v.kind,
+                    v.name.clone(),
+                    v.start_line,
+                    v.end_line,
+                    &v.values,
+                )
+            })
+            .collect();
+        sidecar.insert(path.clone(), stored);
+    }
+
+    let sidecar_path = derive_sidecar_path(map_file);
+    let mut sidecar_bytes: Vec<u8> = Vec::new();
+    sidecar
+        .write(&mut sidecar_bytes)
+        .context("serialize sidecar")?;
+    std::fs::write(&sidecar_path, &sidecar_bytes)
+        .with_context(|| format!("write sidecar to {}", sidecar_path.display()))?;
+
+    // Update artifact metadata: model id, dim, granularity, generated
+    // timestamp, per-file content hashes (for next `update`).
+    let granularity_str = match doc.meta.granularity {
+        analyzer_embed::chunk::Granularity::PerFile => "perFile",
+        analyzer_embed::chunk::Granularity::PerFunction => "perFunction",
+    };
+    let file_hashes: std::collections::HashMap<String, String> = doc
+        .files
+        .iter()
+        .map(|(p, f): (&String, &analyzer_embed::schema::FileEmbeddings)| {
+            (p.clone(), f.content_hash.clone())
+        })
+        .collect();
+
+    map.embeddings_meta = Some(analyzer_core::types::EmbeddingsMeta {
+        model_id: doc.meta.model_id,
+        dim: doc.meta.dim,
+        granularity: granularity_str.to_string(),
+        generated_at: doc.meta.generated_at,
+        file_hashes,
+    });
+    map.updated = chrono::Utc::now();
+    write_map(map_file, &map)?;
+    eprintln!(
+        "[OK] embeddings merged: {} files, sidecar {} bytes at {}",
+        doc.files.len(),
+        sidecar_bytes.len(),
+        sidecar_path.display()
+    );
+    Ok(())
+}
+
+fn derive_sidecar_path(map_file: &Path) -> PathBuf {
+    if let Some(stem) = map_file.file_stem().and_then(|s| s.to_str())
+        && let Some(parent) = map_file.parent()
+    {
+        return parent.join(format!("{stem}.embeddings.bin"));
+    }
+    map_file.with_extension("embeddings.bin")
 }
 
 fn run_init(path: &Path, _max_commits: Option<usize>) -> Result<()> {

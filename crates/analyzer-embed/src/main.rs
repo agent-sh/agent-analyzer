@@ -3,23 +3,20 @@
 //! Two subcommands:
 //!
 //! - `scan` — full re-embed of all eligible files, JSON to stdout.
-//! - `update` — delta-only: read existing sidecar, hash files, re-embed
-//!   only changed/added, drop removed, JSON to stdout.
+//! - `update` — delta-only: re-embed only changed/added files, drop
+//!   removed entries, JSON to stdout.
 //!
 //! The JSON document is intended to be piped to
 //! `agent-analyzer set-embeddings --input -` which merges it into the
 //! sidecar file alongside `repo-intel.json`.
-//!
-//! This entry point currently parses arguments and validates inputs.
-//! Actual embedding inference (loading the ONNX model, running tokenizer,
-//! producing vectors) lands in a follow-up PR — the [`Embedder`] trait in
-//! `analyzer_embed::embedder` is the boundary.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use analyzer_embed::chunk::Granularity;
 use analyzer_embed::embedder::ModelVariant;
+use analyzer_embed::model::FastEmbedder;
+use analyzer_embed::scan::{ScanOptions, run_scan, run_update};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -43,18 +40,22 @@ enum Command {
         repo: PathBuf,
 
         /// Which model variant is installed. Must match the model file
-        /// available next to this binary.
+        /// available next to this binary (or in the fastembed cache).
         #[arg(long, value_enum)]
         variant: VariantArg,
 
-        /// Chunking granularity. Picked at install time by the skill.
+        /// Chunking + dim preset. Picked at install time by the skill.
         #[arg(long, value_enum, default_value = "balanced")]
         detail: DetailArg,
+
+        /// Cap on total files visited.
+        #[arg(long, default_value_t = 500)]
+        max_files: usize,
     },
 
     /// Re-embed only files whose content hash differs from the existing
-    /// sidecar. Drops entries for removed files. The sidecar must already
-    /// exist (created by a prior `scan`).
+    /// sidecar. Drops entries for removed files. Falls back to a full
+    /// scan if no sidecar exists yet.
     Update {
         /// Repository root.
         #[arg(default_value = ".")]
@@ -62,7 +63,7 @@ enum Command {
 
         /// Path to the existing JSON artifact (`repo-intel.json`). The
         /// sidecar is found at the same path with `.embeddings.bin`
-        /// appended.
+        /// substituted.
         #[arg(long)]
         map_file: PathBuf,
 
@@ -71,6 +72,9 @@ enum Command {
 
         #[arg(long, value_enum, default_value = "balanced")]
         detail: DetailArg,
+
+        #[arg(long, default_value_t = 500)]
+        max_files: usize,
     },
 }
 
@@ -100,8 +104,6 @@ enum DetailArg {
 }
 
 impl DetailArg {
-    // Wired into run_scan/run_update once the embedder layer lands.
-    #[allow(dead_code)]
     fn granularity(self) -> Granularity {
         match self {
             DetailArg::Compact => Granularity::PerFile,
@@ -109,7 +111,6 @@ impl DetailArg {
         }
     }
 
-    #[allow(dead_code)]
     fn dim(self) -> usize {
         match self {
             DetailArg::Compact => 128,
@@ -121,42 +122,105 @@ impl DetailArg {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Command::Scan {
             repo,
             variant,
             detail,
-        } => run_scan(repo, variant.into(), detail),
+            max_files,
+        } => execute_scan(repo, variant.into(), detail, max_files),
         Command::Update {
             repo,
             map_file,
             variant,
             detail,
-        } => run_update(repo, map_file, variant.into(), detail),
+            max_files,
+        } => execute_update(repo, map_file, variant.into(), detail, max_files),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("[ERROR] {e:#}");
+            ExitCode::from(1)
+        }
     }
 }
 
-fn run_scan(_repo: PathBuf, _variant: ModelVariant, _detail: DetailArg) -> ExitCode {
-    // The embedder layer lands in the follow-up PR. This binary currently
-    // validates arguments and exits with a clear message rather than
-    // emitting a fake JSON document — better for downstream callers to see
-    // an obvious not-implemented error than partial output that looks real.
-    eprintln!(
-        "[NOT IMPLEMENTED] embed scan: chunking + sidecar plumbing landed; \
-         model loading + ONNX inference ship in the next PR."
-    );
-    ExitCode::from(2)
+fn execute_scan(
+    repo: PathBuf,
+    variant: ModelVariant,
+    detail: DetailArg,
+    max_files: usize,
+) -> anyhow::Result<()> {
+    let mut embedder = FastEmbedder::new(variant)?;
+    let opts = ScanOptions {
+        repo,
+        granularity: detail.granularity(),
+        dim: detail.dim(),
+        max_files,
+    };
+    let doc = run_scan(&mut embedder, &opts)?;
+    serde_json::to_writer(std::io::stdout(), &doc)?;
+    Ok(())
 }
 
-fn run_update(
-    _repo: PathBuf,
-    _map_file: PathBuf,
-    _variant: ModelVariant,
-    _detail: DetailArg,
-) -> ExitCode {
-    eprintln!(
-        "[NOT IMPLEMENTED] embed update: chunking + sidecar plumbing landed; \
-         model loading + ONNX inference ship in the next PR."
-    );
-    ExitCode::from(2)
+fn execute_update(
+    repo: PathBuf,
+    map_file: PathBuf,
+    variant: ModelVariant,
+    detail: DetailArg,
+    max_files: usize,
+) -> anyhow::Result<()> {
+    let sidecar_path = derive_sidecar_path(&map_file);
+    let mut embedder = FastEmbedder::new(variant)?;
+    let opts = ScanOptions {
+        repo,
+        granularity: detail.granularity(),
+        dim: detail.dim(),
+        max_files,
+    };
+    let doc = run_update(&mut embedder, &opts, &sidecar_path)?;
+    serde_json::to_writer(std::io::stdout(), &doc)?;
+    Ok(())
+}
+
+fn derive_sidecar_path(map_file: &std::path::Path) -> PathBuf {
+    // repo-intel.json -> repo-intel.embeddings.bin
+    if let Some(stem) = map_file.file_stem().and_then(|s| s.to_str()) {
+        if let Some(parent) = map_file.parent() {
+            return parent.join(format!("{stem}.embeddings.bin"));
+        }
+    }
+    map_file.with_extension("embeddings.bin")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detail_compact_maps_to_per_file_128() {
+        assert_eq!(DetailArg::Compact.granularity(), Granularity::PerFile);
+        assert_eq!(DetailArg::Compact.dim(), 128);
+    }
+
+    #[test]
+    fn detail_balanced_maps_to_per_function_256() {
+        assert_eq!(DetailArg::Balanced.granularity(), Granularity::PerFunction);
+        assert_eq!(DetailArg::Balanced.dim(), 256);
+    }
+
+    #[test]
+    fn detail_maximum_maps_to_per_function_768() {
+        assert_eq!(DetailArg::Maximum.granularity(), Granularity::PerFunction);
+        assert_eq!(DetailArg::Maximum.dim(), 768);
+    }
+
+    #[test]
+    fn sidecar_path_substitutes_extension() {
+        let p = std::path::PathBuf::from("/x/y/repo-intel.json");
+        let sc = derive_sidecar_path(&p);
+        assert_eq!(sc, std::path::PathBuf::from("/x/y/repo-intel.embeddings.bin"));
+    }
 }
