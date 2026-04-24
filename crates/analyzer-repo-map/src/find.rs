@@ -27,7 +27,7 @@
 //! - Full-body content search - that's what `grep` is for; we only
 //!   look at the doc-comment header
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Serialize;
@@ -113,22 +113,18 @@ fn score_file(
     let mut total_score = 0.0_f64;
     let mut why_fragments: Vec<String> = Vec::new();
 
-    // Read doc-comment header lazily, only if we have a candidate match
-    // anywhere else (so a query that matches nothing in the file skips
-    // the file I/O entirely).
-    let doc_header_cell: std::cell::OnceCell<Option<String>> = std::cell::OnceCell::new();
-    let doc_header = || -> Option<String> {
-        doc_header_cell
-            .get_or_init(|| read_doc_header(repo_path, path))
-            .clone()
-    };
-
-    let mut matched_symbols: Vec<String> = Vec::new();
-    let mut matched_imports: Vec<String> = Vec::new();
+    // HashSets for the rationale-display de-duplication. Membership
+    // checks are O(1) and crucially decoupled from scoring - every
+    // substring match increments score (per term), HashSet only
+    // controls whether the name appears in the `why` preview.
+    let mut matched_symbols: HashSet<String> = HashSet::new();
+    let mut matched_imports: HashSet<String> = HashSet::new();
     let mut path_component_hits = 0;
     let mut basename_hit = false;
-    let mut doc_hits = 0;
 
+    // Pass 1: cheap signals (basename, path, exports, imports). No
+    // file I/O. This drives whether we bother reading the doc header
+    // at all.
     for term in terms {
         // 1. Basename substring match (very strong)
         if basename_lower.contains(term) {
@@ -151,7 +147,8 @@ fn score_file(
             path_component_hits += extra_components;
         }
 
-        // 3. Exported symbol name matches (cap 3 per term)
+        // 3. Exported symbol name matches (cap 3 per term so a file
+        // exporting 50 things named after the term doesn't dominate)
         let mut sym_count = 0;
         for sym in &file_syms.exports {
             if sym_count >= 3 {
@@ -160,38 +157,42 @@ fn score_file(
             if sym.name.to_ascii_lowercase().contains(term) {
                 total_score += 2.0;
                 sym_count += 1;
-                if !matched_symbols.contains(&sym.name) {
-                    matched_symbols.push(sym.name.clone());
-                }
+                matched_symbols.insert(sym.name.clone());
             }
         }
 
-        // 4. Import name matches (low)
+        // 4. Import name matches (low). Score every match, regardless
+        // of whether the name was already added to the display set -
+        // otherwise multi-term queries silently under-count when the
+        // same import string matches several terms.
         for imp in &file_syms.imports {
             for name in &imp.names {
                 if name.to_ascii_lowercase().contains(term) {
                     total_score += 1.0;
-                    if !matched_imports.contains(name) {
-                        matched_imports.push(name.clone());
-                    }
+                    matched_imports.insert(name.clone());
                 }
             }
-            if imp.from.to_ascii_lowercase().contains(term) && !matched_imports.contains(&imp.from)
-            {
+            if imp.from.to_ascii_lowercase().contains(term) {
                 total_score += 1.0;
-                matched_imports.push(imp.from.clone());
+                matched_imports.insert(imp.from.clone());
             }
         }
+    }
 
-        // 5. Doc-comment header match (medium). Only read the file if
-        // we already have a non-zero score for this file - reading
-        // 500 bytes per file in a 2000-file repo is otherwise wasted.
-        if total_score > 0.0
-            && let Some(header) = doc_header()
-            && header.to_ascii_lowercase().contains(term)
-        {
-            total_score += 1.5;
-            doc_hits += 1;
+    // Pass 2: doc-comment header. Read the file once (only if some
+    // cheap signal already fired), then score each term against it
+    // independently. This is order-independent unlike the previous
+    // gate-on-running-total approach.
+    let mut doc_hits = 0;
+    if total_score > 0.0
+        && let Some(header) = read_doc_header(repo_path, path)
+    {
+        let header_lower = header.to_ascii_lowercase();
+        for term in terms {
+            if header_lower.contains(term) {
+                total_score += 1.5;
+                doc_hits += 1;
+            }
         }
     }
 
@@ -207,7 +208,10 @@ fn score_file(
         why_fragments.push("path matches".to_string());
     }
     if !matched_symbols.is_empty() {
-        let preview: Vec<String> = matched_symbols
+        // Sort to keep `why` strings stable across HashSet iteration.
+        let mut symbols_sorted: Vec<&String> = matched_symbols.iter().collect();
+        symbols_sorted.sort();
+        let preview: Vec<String> = symbols_sorted
             .iter()
             .take(3)
             .map(|s| format!("`{s}`"))
@@ -218,7 +222,9 @@ fn score_file(
         why_fragments.push("module doc mentions term".to_string());
     }
     if !matched_imports.is_empty() {
-        let preview: Vec<String> = matched_imports
+        let mut imports_sorted: Vec<&String> = matched_imports.iter().collect();
+        imports_sorted.sort();
+        let preview: Vec<String> = imports_sorted
             .iter()
             .take(2)
             .map(|s| format!("`{}`", short_import_label(s)))
@@ -268,10 +274,34 @@ fn read_doc_header(repo_path: &Path, file_rel: &str) -> Option<String> {
     let text = std::str::from_utf8(truncated).ok()?;
 
     let mut header = String::new();
+    let mut in_block_comment = false;
     for line in text.lines() {
         let trimmed = line.trim_start();
+
+        if in_block_comment {
+            // Inside a /* ... */ block: include every line verbatim
+            // until we hit the closer, even if intermediate lines
+            // don't start with `*`.
+            header.push_str(trimmed);
+            header.push('\n');
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("/*") {
+            header.push_str(trimmed);
+            header.push('\n');
+            // Single-line `/* ... */` closes immediately; multi-line
+            // `/*` without a closer flips us into block mode.
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+
         if trimmed.starts_with("//")
-            || trimmed.starts_with("/*")
             || trimmed.starts_with('*')
             || trimmed.starts_with('#')
             || trimmed.starts_with("\"\"\"")
@@ -461,6 +491,123 @@ mod tests {
         // so a_worker.rs and b_worker.rs come first.
         assert_eq!(results[0].path, "src/a_worker.rs");
         assert_eq!(results[1].path, "src/b_worker.rs");
+    }
+
+    #[test]
+    fn block_comment_intermediate_lines_are_included() {
+        // Reviewer-caught: multi-line /* */ block comments where
+        // intermediate lines don't start with `*` were terminating
+        // the header scan early. Ensure the second line is now
+        // captured for scoring.
+        let dir = TempDir::new().unwrap();
+        let path = "src/blockdoc.rs";
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join(path),
+            "/* A block comment\n   that mentions worker pools without leading-star\n   on every line. */\nfn run() {}\n",
+        )
+        .unwrap();
+
+        let mut syms = HashMap::new();
+        // Need a non-zero base score to trigger the doc read.
+        syms.insert(
+            path.to_string(),
+            make_file_syms(
+                vec![],
+                vec![ImportEntry {
+                    from: "worker".to_string(),
+                    names: vec![],
+                }],
+            ),
+        );
+
+        // Multi-term query: "worker" hits via the import (cheap
+        // signal → seeds the base score → doc gets read), then
+        // "pool" must match in the intermediate block-comment line.
+        let results = find(&syms, dir.path(), "worker pool", 10);
+        let r = results
+            .iter()
+            .find(|r| r.path == path)
+            .expect("file should match at least one term");
+        // Score breakdown: 1.0 (worker import) + 1.5 (worker in doc)
+        // + 1.5 (pool in doc, only possible if intermediate line read).
+        assert!(
+            r.score >= 4.0,
+            "expected pool to match block-comment intermediate line (score >= 4.0); got {} with why={:?}",
+            r.score,
+            r.why
+        );
+    }
+
+    #[test]
+    fn multi_term_import_score_is_order_independent() {
+        // Reviewer-caught: a file with a single `from = "worker_pool"`
+        // import previously only scored that import once even when
+        // the multi-term query matched both halves. Score must add
+        // 1.0 per (term, matching from) - independent of dedup.
+        let dir = TempDir::new().unwrap();
+        let mut syms = HashMap::new();
+        syms.insert(
+            "src/uses.rs".to_string(),
+            make_file_syms(
+                vec![],
+                vec![ImportEntry {
+                    from: "worker_pool".to_string(),
+                    names: vec![],
+                }],
+            ),
+        );
+
+        let r1 = find(&syms, dir.path(), "worker pool", 10);
+        let r2 = find(&syms, dir.path(), "pool worker", 10);
+        let s1 = r1.iter().find(|r| r.path == "src/uses.rs").unwrap().score;
+        let s2 = r2.iter().find(|r| r.path == "src/uses.rs").unwrap().score;
+        assert!(
+            (s1 - s2).abs() < f64::EPSILON,
+            "score must not depend on term order"
+        );
+        // Both terms match the single `from`, so we expect 2.0 (1.0
+        // per term-match), regardless of HashSet dedup.
+        assert!(
+            s1 >= 2.0,
+            "expected at least 2.0 from two term matches; got {s1}"
+        );
+    }
+
+    #[test]
+    fn doc_comment_score_is_order_independent() {
+        // Reviewer-caught: doc-comment scoring previously gated on
+        // running total > 0 inside the per-term loop, making the
+        // signal order-dependent. After the two-pass refactor it
+        // must give identical scores regardless of term order.
+        let dir = TempDir::new().unwrap();
+        let path = "src/elegant.rs";
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join(path),
+            "//! An elegant worker pool implementation.\nfn run() {}\n",
+        )
+        .unwrap();
+
+        let mut syms = HashMap::new();
+        syms.insert(path.to_string(), make_file_syms(vec![], vec![]));
+
+        // basename `elegant.rs` matches "elegant"; doc mentions both
+        // "elegant" and "worker". Order shouldn't matter.
+        let s1 = find(&syms, dir.path(), "elegant worker", 10)
+            .iter()
+            .find(|r| r.path == path)
+            .unwrap()
+            .score;
+        let s2 = find(&syms, dir.path(), "worker elegant", 10)
+            .iter()
+            .find(|r| r.path == path)
+            .unwrap()
+            .score;
+        assert!(
+            (s1 - s2).abs() < f64::EPSILON,
+            "doc-comment scoring must not depend on term order ({s1} vs {s2})"
+        );
     }
 
     #[test]
