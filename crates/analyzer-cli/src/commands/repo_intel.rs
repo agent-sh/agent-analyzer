@@ -612,6 +612,14 @@ fn run_init(path: &Path, _max_commits: Option<usize>) -> Result<()> {
         Err(e) => eprintln!("[WARN] Metadata collection failed: {e}"),
     }
 
+    // Phase 3.5: Entry-points (binaries, framework configs, AST mains).
+    // Cached in the artifact so the slop orphan-export detector can
+    // skip files referenced externally without re-walking the filesystem.
+    eprintln!("[INFO] Detecting entry points...");
+    let entry_points = analyzer_collectors::entry_points::detect(path, map.symbols.as_ref());
+    eprintln!("[INFO] Found {} entry points", entry_points.len());
+    map.entry_points = Some(entry_points);
+
     // Phase 4: Doc-code cross-references (requires Phase 2 symbols)
     if let Some(ref symbols) = map.symbols {
         eprintln!("[INFO] Checking doc-code references...");
@@ -688,6 +696,12 @@ fn run_update(path: &Path, map_file: &Path) -> Result<()> {
         Ok(metadata) => map.project = Some(metadata),
         Err(e) => eprintln!("[WARN] Metadata collection failed: {e}"),
     }
+
+    // Refresh entry-points cache (filesystem changes since last init).
+    map.entry_points = Some(analyzer_collectors::entry_points::detect(
+        path,
+        map.symbols.as_ref(),
+    ));
 
     // Refresh doc-code references
     if let Some(ref symbols) = map.symbols {
