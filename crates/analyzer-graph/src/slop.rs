@@ -48,6 +48,19 @@ pub enum SlopAction {
     },
 }
 
+impl SlopAction {
+    /// Target file for this action. Every variant has a path, so
+    /// this is total. Used by the CLI `--files` filter and consumers
+    /// that group / dedupe by target path.
+    pub fn path(&self) -> &str {
+        match self {
+            SlopAction::DeleteFile { path }
+            | SlopAction::DeleteLines { path, .. }
+            | SlopAction::ReplaceLines { path, .. } => path.as_str(),
+        }
+    }
+}
+
 /// Why a fix was emitted. Stable identifiers so downstream tools can
 /// filter or group by category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +88,15 @@ pub enum SlopCategory {
     /// (function, class, assignment, control flow) — a strong signal
     /// the code was commented out rather than explained in prose.
     CommentedOutCode,
+    /// A `#[allow(dead_code)]` / `#[allow(unused)]` attribute on a
+    /// symbol that the import graph proves IS being used. The
+    /// suppression was correct at some point but the symbol became
+    /// reachable again and the annotation was never removed. Keeping
+    /// stale suppressions around blinds the real dead-code lint.
+    /// Rust-only; other languages have different suppression shapes
+    /// (`@ts-ignore`, `# noqa`, `@SuppressWarnings`) that serve
+    /// different purposes.
+    StaleSuppression,
 }
 
 /// Confidence in a fix, on a 0.0-1.0 scale.
@@ -111,6 +133,7 @@ pub fn default_confidence(category: SlopCategory) -> Confidence {
         SlopCategory::DuplicateTooling => 0.85,
         SlopCategory::PassthroughWrapper => 0.85,
         SlopCategory::CommentedOutCode => 0.85,
+        SlopCategory::StaleSuppression => 0.90,
         // Sensitive to import-graph completeness; recommend review
         SlopCategory::OrphanExport => 0.75,
     }
@@ -200,6 +223,7 @@ pub fn slop_fixes(repo_root: &Path, map: &RepoIntelData) -> SlopFixesResult {
     fixes.extend(duplicate_tooling(repo_root));
     fixes.extend(orphan_exports(map));
     fixes.extend(ast_findings(repo_root));
+    fixes.extend(stale_suppressions_rust(repo_root, map));
 
     let fixes = apply_suppressions(repo_root, fixes);
     let by_file = group_by_file(&fixes);
@@ -393,6 +417,7 @@ fn category_kebab(c: SlopCategory) -> &'static str {
         SlopCategory::PassthroughWrapper => "passthrough-wrapper",
         SlopCategory::AlwaysTrueCondition => "always-true-condition",
         SlopCategory::CommentedOutCode => "commented-out-code",
+        SlopCategory::StaleSuppression => "stale-suppression",
     }
 }
 
@@ -3201,6 +3226,369 @@ fn commented_out_code(
     out
 }
 
+// ── Stale suppression annotations (Rust) ─────────────────────────
+//
+// A `#[allow(dead_code)]` / `#[allow(unused)]` attribute on a symbol
+// that the import graph proves IS being used. The suppression was
+// correct at some point but the symbol became reachable again and
+// the annotation was never removed. Keeping stale suppressions
+// around blinds the real dead-code lint.
+//
+// Algorithm:
+//
+// 1. Build a `used_names` set from the map: every entry in every
+//    file's `imports[].names` (exact-match; Rust identifiers are
+//    case-sensitive).
+// 2. For each `.rs` file, run a tree-sitter query for `attribute_item`
+//    nodes. Accept attributes whose top-level identifier is `allow`
+//    (not nested inside e.g. `cfg_attr(...)`) and whose argument list
+//    contains one of: `dead_code`, `unused`, `unused_imports`,
+//    `unused_variables`, `unused_assignments`, `unused_must_use`.
+// 3. For each matched attribute, find the following sibling item
+//    node (fn / struct / enum / mod / const / static / trait / impl)
+//    and its identifier.
+// 4. If the identifier appears in `used_names`, flag the attribute
+//    for deletion (DeleteLines over the attribute's line range).
+//
+// Confidence 0.90: the graph-based evidence is strong but the import
+// graph can be incomplete for non-Rust callers (e.g. an FFI boundary
+// where the name is referenced from C/Python via `pub extern`). The
+// suppression-directive system lets users silence any false positive.
+
+const ALLOW_SUPPRESSION_LINTS: &[&str] = &[
+    "dead_code",
+    "unused",
+    "unused_imports",
+    "unused_variables",
+    "unused_assignments",
+    "unused_must_use",
+];
+
+/// Collected usage information from the symbol graph.
+///
+/// The detector needs both "name is imported somewhere" (fast
+/// membership test) and "which module paths reference this name"
+/// (used to bias toward same-crate matches and away from
+/// cross-module name collisions). Keeping both in one struct so the
+/// build walk happens once.
+struct UsedSymbols {
+    /// Every imported name seen across the map. Rust identifiers are
+    /// case-sensitive so no case-folding.
+    all_names: HashSet<String>,
+    /// Per-name: the set of `imports[].from` module-path strings that
+    /// imported it. Lets the caller check `name "helper" is imported
+    /// from a path that could plausibly resolve to our file` rather
+    /// than blindly trusting a bare-name collision.
+    modules_per_name: HashMap<String, HashSet<String>>,
+}
+
+fn collect_used_symbols(map: &RepoIntelData) -> UsedSymbols {
+    let mut all_names = HashSet::new();
+    let mut modules_per_name: HashMap<String, HashSet<String>> = HashMap::new();
+    if let Some(syms) = map.symbols.as_ref() {
+        for (_path, file_syms) in syms.iter() {
+            for imp in &file_syms.imports {
+                for name in &imp.names {
+                    all_names.insert(name.clone());
+                    modules_per_name
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(imp.from.clone());
+                }
+            }
+        }
+    }
+    UsedSymbols {
+        all_names,
+        modules_per_name,
+    }
+}
+
+/// Return true if any `imports[].from` value looks like it could path
+/// to the given file. A bare `crate::foo::bar` import gets matched
+/// against the file path by taking each path segment and checking
+/// whether the file's relative path contains that segment. It's
+/// permissive by design — a hit is strong evidence, a miss would
+/// wrongly spare a real stale suppression.
+///
+/// For a file `crates/foo/src/helpers.rs` and an import `from =
+/// "crate::helpers"`, the segments [`crate`, `helpers`] both appear
+/// in the path, so we return true.
+///
+/// When no cross-file import data is available for a name (which can
+/// happen for inherent methods or crate-private usage the import
+/// collector didn't capture) we conservatively return true so the
+/// detector falls back to the all-names membership check it had
+/// before.
+fn import_paths_could_resolve_to_file(modules: &HashSet<String>, rel_file: &str) -> bool {
+    if modules.is_empty() {
+        return true;
+    }
+    let file_norm = rel_file.replace('\\', "/");
+    for module in modules {
+        let segments: Vec<&str> = module
+            .split("::")
+            .filter(|s| !s.is_empty() && *s != "crate" && *s != "self" && *s != "super")
+            .collect();
+        if segments.is_empty() {
+            // `crate` or `self` alone — any file in the same crate is
+            // a valid target. Treat as a match.
+            return true;
+        }
+        if segments
+            .iter()
+            .any(|seg| file_norm.contains(&format!("/{seg}")) || file_norm.starts_with(seg))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse an `#[allow(...)]` attribute via AST structure, not text
+/// scanning. Returns the list of lint names only when the attribute's
+/// top-level identifier is literally `allow` (not `cfg_attr`, not
+/// `deny`, not `warn`). This correctly skips cases like
+/// `#[cfg_attr(feature = "x", allow(dead_code))]` where `allow`
+/// appears only as a nested identifier.
+///
+/// Shape in tree-sitter-rust:
+///
+///   (attribute_item
+///     (attribute
+///       (identifier)       ; "allow" at top level
+///       arguments: (token_tree "(" (identifier)+ ")")))
+///
+/// Returns `Vec::new()` for inner attributes (`#![allow(...)]`) —
+/// those are module-scoped; removing them would change the silence
+/// shape file-wide and that's not a safe mechanical edit.
+fn extract_allow_lints(attribute_node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    // Inner attributes (#![...]) carry an `inner` marker child or
+    // start their text with "#!["; either check works.
+    if attribute_node
+        .utf8_text(source)
+        .map(|t| t.starts_with("#!["))
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
+    // Find the child `attribute` node.
+    let mut attr_inner = None;
+    let mut c = attribute_node.walk();
+    for child in attribute_node.named_children(&mut c) {
+        if child.kind() == "attribute" {
+            attr_inner = Some(child);
+            break;
+        }
+    }
+    let Some(attr_inner) = attr_inner else {
+        return Vec::new();
+    };
+    // The attribute's first named child is the top-level identifier
+    // (e.g. `allow`, `cfg_attr`, `derive`). Must be exactly `allow`.
+    let Some(ident) = attr_inner.named_child(0) else {
+        return Vec::new();
+    };
+    if ident.kind() != "identifier" {
+        return Vec::new();
+    }
+    let top_name = ident.utf8_text(source).unwrap_or("");
+    if top_name != "allow" {
+        return Vec::new();
+    }
+    // Collect identifiers from the `token_tree` / `arguments`. The
+    // argument list holds identifier tokens (dead_code, unused, ...),
+    // possibly scoped like `clippy::needless_return`.
+    let mut out: Vec<String> = Vec::new();
+    let mut walker = attr_inner.walk();
+    for child in attr_inner.named_children(&mut walker) {
+        if child.kind() != "token_tree" {
+            continue;
+        }
+        // Walk raw characters of the token-tree text: tree-sitter
+        // tokenises the inside as a flat sequence so simple
+        // comma-split is fine here, but we strip clippy:: scope
+        // prefixes so `clippy::needless_return` becomes `needless_return`.
+        let tt_text = child.utf8_text(source).unwrap_or("");
+        // Remove the outer parentheses.
+        let inner = tt_text
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(tt_text);
+        for raw in inner.split(',') {
+            let name = raw.trim().trim_start_matches("clippy::");
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Find the identifier of the item an attribute is attached to. Rust
+/// tree-sitter puts attribute_item as a sibling before the decorated
+/// item inside the same enclosing scope. We walk forward siblings
+/// skipping whitespace/other attributes/macros until we hit an item
+/// with a named identifier, or run out.
+///
+/// Returning `None` for unrecognized kinds rather than aborting means
+/// stacked attributes work: `#[allow(dead_code)] #[derive(Debug)] struct
+/// Foo` walks attr → attr → struct_item and finds `Foo`.
+fn next_item_identifier<'a>(
+    attr: &tree_sitter::Node<'a>,
+    source: &[u8],
+) -> Option<(String, tree_sitter::Node<'a>)> {
+    const NAMED_ITEM_KINDS: &[&str] = &[
+        "function_item",
+        "function_signature_item",
+        "struct_item",
+        "enum_item",
+        "mod_item",
+        "const_item",
+        "static_item",
+        "trait_item",
+        "type_item",
+        "union_item",
+        "extern_crate_declaration",
+    ];
+    const SKIP_KINDS: &[&str] = &[
+        "attribute_item",
+        "line_comment",
+        "block_comment",
+        "macro_invocation",
+        "inner_doc_comment_marker",
+        "outer_doc_comment_marker",
+    ];
+    let mut cur = attr.next_named_sibling();
+    while let Some(node) = cur {
+        let kind = node.kind();
+        if SKIP_KINDS.contains(&kind) {
+            cur = node.next_named_sibling();
+            continue;
+        }
+        if NAMED_ITEM_KINDS.contains(&kind) {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Ok(name) = name_node.utf8_text(source)
+            {
+                return Some((name.to_string(), node));
+            }
+            return None;
+        }
+        // impl_item / use_declaration / foreign_mod_item / etc. are
+        // legitimately decorated but don't carry a single name field
+        // we can check against the usage graph. Treat as "can't
+        // determine" and move on — underreporting is safer than
+        // false positives on an impl block.
+        return None;
+    }
+    None
+}
+
+fn stale_suppressions_rust(repo_root: &Path, map: &RepoIntelData) -> Vec<SlopFix> {
+    let used = collect_used_symbols(map);
+    if used.all_names.is_empty() {
+        // No symbol graph → we can't tell used from unused; skip
+        // rather than emit false positives.
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+    let query_src = "(attribute_item) @attr";
+    let Ok(query) = tree_sitter::Query::new(&language, query_src) else {
+        return out;
+    };
+    // Parser and query are both reusable across files; only the tree
+    // changes per file. Instantiating them once saves tree-sitter
+    // setup cost on large repos.
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return out;
+    }
+
+    for path in walk_repo_files(repo_root) {
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let rel = relative(&path, repo_root);
+        // Test files routinely carry `#[allow(dead_code)]` on helper
+        // fixtures that aren't "used" in the production graph. Skip
+        // them to avoid noise — same rule the passthrough-wrapper
+        // detector already follows.
+        if is_rust_test_file(&rel) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let Some(tree) = parser.parse(&content, None) else {
+            continue;
+        };
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+        let source = content.as_bytes();
+        while let Some(m) = matches.next() {
+            let Some(cap) = m.captures.first() else {
+                continue;
+            };
+            let attr = cap.node;
+            let lints = extract_allow_lints(&attr, source);
+            if lints.is_empty() {
+                continue;
+            }
+            // Only emit when EVERY lint in the attribute is a stale
+            // suppression candidate. Mixed-lint attributes like
+            // `#[allow(non_snake_case, dead_code)]` get left alone —
+            // deleting the whole line would silently drop the
+            // non-suppression lint (`non_snake_case` here). A future
+            // enhancement could emit a ReplaceLines that keeps the
+            // non-suppression lints, but for now we prefer under-
+            // reporting to a fix that breaks other lints.
+            let all_suppression = lints
+                .iter()
+                .all(|l| ALLOW_SUPPRESSION_LINTS.contains(&l.as_str()));
+            if !all_suppression {
+                continue;
+            }
+            let Some((name, _item_node)) = next_item_identifier(&attr, source) else {
+                continue;
+            };
+            if !used.all_names.contains(&name) {
+                continue;
+            }
+            // Name-collision guard: a `#[allow(dead_code)]` on a
+            // private `helper` in src/a.rs shouldn't be flagged just
+            // because an unrelated file imports a different `helper`
+            // from a different module. Require that at least one of
+            // the `imports[].from` paths for this name could plausibly
+            // resolve to the current file (segment match). When no
+            // import path info is available we fall through
+            // permissively — see `import_paths_could_resolve_to_file`.
+            if let Some(modules) = used.modules_per_name.get(&name)
+                && !import_paths_could_resolve_to_file(modules, &rel)
+            {
+                continue;
+            }
+            let start = (attr.start_position().row as u32) + 1;
+            let end = (attr.end_position().row as u32) + 1;
+            let category = SlopCategory::StaleSuppression;
+            out.push(SlopFix {
+                action: SlopAction::DeleteLines {
+                    path: rel.clone(),
+                    lines: [start, end],
+                },
+                category,
+                reason: format!(
+                    "Rust `#[allow({})]` on `{name}` — symbol is imported elsewhere in the graph so the suppression is stale",
+                    lints.join(", ")
+                ),
+                confidence: default_confidence(category),
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4694,6 +5082,237 @@ pub fn ok() {}
                 .iter()
                 .any(|f| f.category == SlopCategory::CommentedOutCode),
             "leading-star block should flag; got {fixes:?}"
+        );
+    }
+
+    // ── Stale suppression annotations ─────────────────────
+
+    /// Build a map where `file` imports `imported` from `crate::lib`.
+    /// The "lib" segment is chosen so the default src/lib.rs target
+    /// file in the stale-suppression tests matches the import-path
+    /// resolution check (segment match against "lib").
+    fn map_with_import(file: &str, imported: &[&str]) -> RepoIntelData {
+        let mut m = empty_map();
+        let mut syms = std::collections::HashMap::new();
+        syms.insert(
+            file.to_string(),
+            analyzer_core::types::FileSymbols {
+                exports: Vec::new(),
+                imports: vec![analyzer_core::types::ImportEntry {
+                    from: "crate::lib".to_string(),
+                    names: imported.iter().map(|s| s.to_string()).collect(),
+                }],
+                definitions: Vec::new(),
+            },
+        );
+        m.symbols = Some(syms);
+        m
+    }
+
+    #[test]
+    fn detects_stale_allow_dead_code_on_used_function() {
+        let src = "\
+#[allow(dead_code)]
+pub fn helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        // Simulate another file importing `helper`.
+        let map = map_with_import("src/consumer.rs", &["helper"]);
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            result.fixes.iter().any(
+                |f| f.category == SlopCategory::StaleSuppression && f.reason.contains("helper")
+            ),
+            "should flag stale allow(dead_code) on an imported symbol; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn ignores_allow_dead_code_on_genuinely_dead_symbol() {
+        let src = "\
+#[allow(dead_code)]
+pub fn helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        // Another file imports a DIFFERENT name.
+        let map = map_with_import("src/consumer.rs", &["other_name"]);
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should NOT flag allow(dead_code) when symbol truly unused; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn ignores_allow_dead_code_when_symbol_graph_absent() {
+        // Conservative: if map has no symbols section, we can't tell
+        // used from unused, so emit nothing rather than risk false
+        // positives.
+        let src = "\
+#[allow(dead_code)]
+pub fn helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let result = slop_fixes(dir.path(), &empty_map());
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should not flag without symbol graph; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn ignores_non_suppression_allow_attributes() {
+        // `#[allow(non_snake_case)]` is a style lint, not a usage
+        // suppression. Don't touch it even if the symbol is imported.
+        let src = "\
+#[allow(non_snake_case)]
+pub fn Helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let map = map_with_import("src/consumer.rs", &["Helper"]);
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should not flag allow(non_snake_case); got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn skips_stale_suppression_in_test_files() {
+        // `tests/foo.rs` and `src/*test*.rs` routinely have dead_code
+        // helpers. Skip them entirely.
+        let src = "\
+#[allow(dead_code)]
+pub fn helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("tests/fixture.rs", src)]);
+        let map = map_with_import("src/consumer.rs", &["helper"]);
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should skip test files; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn ignores_mixed_lint_allow_with_non_suppression() {
+        // `#[allow(non_snake_case, dead_code)]` on a used symbol
+        // must NOT be flagged — deleting the line would silently
+        // drop the `non_snake_case` lint suppression. Mixed-lint
+        // attributes are left alone until we can rewrite them
+        // surgically.
+        let src = "\
+#[allow(non_snake_case, dead_code)]
+pub fn Helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let map = map_with_import("src/consumer.rs", &["Helper"]);
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should not flag mixed-lint attribute; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_name_collision() {
+        // `helper` in src/module_a.rs has #[allow(dead_code)].
+        // Another file imports `helper` from `crate::module_b`. Name
+        // collision does NOT imply module_a's helper is used.
+        let src_a = "\
+#[allow(dead_code)]
+pub fn helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/module_a.rs", src_a)]);
+        let mut m = empty_map();
+        let mut syms = std::collections::HashMap::new();
+        syms.insert(
+            "src/consumer.rs".to_string(),
+            analyzer_core::types::FileSymbols {
+                exports: Vec::new(),
+                imports: vec![analyzer_core::types::ImportEntry {
+                    // Path clearly targets module_b, NOT module_a.
+                    from: "crate::module_b".to_string(),
+                    names: vec!["helper".to_string()],
+                }],
+                definitions: Vec::new(),
+            },
+        );
+        m.symbols = Some(syms);
+        let result = slop_fixes(dir.path(), &m);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should not flag helper in module_a when import targets module_b; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn ignores_cfg_attr_nested_allow() {
+        // `#[cfg_attr(feature = "x", allow(dead_code))]` mentions
+        // `allow` only nested inside cfg_attr. It is NOT a top-level
+        // `#[allow(...)]` and must not be flagged even when the
+        // decorated symbol is imported.
+        let src = "\
+#[cfg_attr(feature = \"x\", allow(dead_code))]
+pub fn helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let map = map_with_import("src/consumer.rs", &["helper"]);
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should not flag nested allow inside cfg_attr; got {:?}",
+            result.fixes
+        );
+    }
+
+    #[test]
+    fn ignores_inner_allow_attribute() {
+        // `#![allow(dead_code)]` is module-scoped; removing it would
+        // change the silence shape across the whole file. Leave it.
+        let src = "\
+#![allow(dead_code)]
+
+pub fn helper(x: u32) -> u32 { x + 1 }
+";
+        let dir = make_repo(&[("src/lib.rs", src)]);
+        let map = map_with_import("src/consumer.rs", &["helper"]);
+        let result = slop_fixes(dir.path(), &map);
+        assert!(
+            !result
+                .fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::StaleSuppression),
+            "should not flag inner attribute; got {:?}",
+            result.fixes
         );
     }
 }
