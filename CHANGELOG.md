@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-24
+
+### Added
+
+- **`analyzer-embed` crate + binary** (#28) - new workspace member producing the `agent-analyzer-embed` binary. Provides a standalone embedding server so external agents can generate and store vector embeddings via the `set-embeddings` subcommand. The release workflow now builds and uploads `agent-analyzer-embed` alongside `agent-analyzer` for all 5 platforms (10 release assets total).
+- **`set-embeddings` subcommand** (#28) - accepts JSON via stdin to store vector embeddings in the artifact. Complements the existing `set-descriptors` and `set-summary` subcommands.
+- **`query slop-fixes` subcommand** (#28) - scans staged/committed diffs for AI slop patterns that were introduced and then immediately reverted or corrected, ranking files by slop-fix frequency.
+- **`query slop-targets` subcommand** (#28) - identifies files most likely to contain residual AI slop based on authorship signals and pattern density, used by the deslop agent to prioritise its work queue.
+- **Per-language detectors** (#28) - dedicated AST-based detectors for empty error swallowing and tautological assertions across Rust, TypeScript, JavaScript, Python, Go, and Java. Feeds into the slop-targets ranking.
+- **Rust mod-decl resolver** (#28) - resolves `mod foo;` declarations to their canonical file path, eliminating orphan-export false positives for Rust workspaces. Reduced false positives by ~95% on the agnix codebase.
+- **TS/JS import resolver** (#28) - resolves ES module and CommonJS `require`/`import` statements to file paths, including index-file and extension-less resolution, for the same orphan-export fix.
+- **Python import resolver** (#28) - resolves absolute and relative Python imports (`from . import`, `from pkg import mod`) to file paths.
+
 ## [0.5.0] - 2026-04-24
 
 ### Changed (BREAKING)
@@ -105,7 +118,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Query flags: `--min-changes`, `--path-filter`, `--adjust-for-ai`
 - 68 tests at launch
 
-[Unreleased]: https://github.com/agent-sh/agent-analyzer/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/agent-sh/agent-analyzer/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.0...v0.3.1
