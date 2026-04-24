@@ -159,10 +159,17 @@ dependencies = [
  "analyzer-core",
  "anyhow",
  "chrono",
+ "ignore",
  "petgraph",
  "rayon",
  "serde",
  "serde_json",
+ "streaming-iterator",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-typescript",
 ]
 
 [[package]]

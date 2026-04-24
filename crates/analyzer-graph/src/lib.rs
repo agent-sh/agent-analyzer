@@ -18,6 +18,7 @@ pub mod centrality;
 pub mod cochange;
 pub mod louvain;
 pub mod queries;
+pub mod slop;
 
 use analyzer_core::types::RepoIntelData;
 

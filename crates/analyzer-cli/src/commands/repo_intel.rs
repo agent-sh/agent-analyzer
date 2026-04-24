@@ -377,6 +377,18 @@ pub enum QueryAction {
         #[arg(long)]
         map_file: PathBuf,
     },
+    /// Structured slop fix actions for the deslop agent. Each finding
+    /// is self-contained (file + line range + action + reason) so the
+    /// agent applies it without further research. Covers: tracked
+    /// artifacts, stale CI configs, duplicate tooling, orphan exports,
+    /// empty catch blocks, tautological tests.
+    SlopFixes {
+        /// Repository path
+        path: PathBuf,
+        /// Path to repo-intel JSON file (provides import graph + symbols)
+        #[arg(long)]
+        map_file: PathBuf,
+    },
 }
 
 pub fn run(action: RepoIntelAction) -> Result<()> {
@@ -954,6 +966,11 @@ fn run_query(query: QueryAction) -> Result<()> {
                     println!("[]");
                 }
             }
+        }
+        QueryAction::SlopFixes { path, map_file } => {
+            let map = load_map(&map_file)?;
+            let result = analyzer_graph::slop::slop_fixes(&path, &map);
+            println!("{}", output::to_json(&result));
         }
         QueryAction::Summary {
             map_file, depth, ..

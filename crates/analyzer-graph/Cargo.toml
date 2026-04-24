@@ -19,6 +19,13 @@ anyhow.workspace = true
 chrono.workspace = true
 petgraph.workspace = true
 rayon.workspace = true
+ignore.workspace = true
+tree-sitter.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-python.workspace = true
+streaming-iterator = "0.1"
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
