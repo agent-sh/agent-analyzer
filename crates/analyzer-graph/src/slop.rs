@@ -157,9 +157,9 @@ pub fn group_by_file(fixes: &[SlopFix]) -> Vec<FileFixes> {
     let mut by_path: BTreeMap<String, Vec<SlopFix>> = BTreeMap::new();
     for fix in fixes {
         let path = match &fix.action {
-            SlopAction::DeleteFile { path } => path.clone(),
-            SlopAction::DeleteLines { path, .. } => path.clone(),
-            SlopAction::ReplaceLines { path, .. } => path.clone(),
+            SlopAction::DeleteFile { path }
+            | SlopAction::DeleteLines { path, .. }
+            | SlopAction::ReplaceLines { path, .. } => path.clone(),
         };
         by_path.entry(path).or_default().push(fix.clone());
     }
@@ -1642,12 +1642,12 @@ fn classify_always_true(
 
 fn is_same_expression_compare(text: &str, ops: &[&str]) -> bool {
     for op in ops {
-        if let Some(pos) = text.find(op) {
-            let lhs = text[..pos].trim();
-            let rhs = text[pos + op.len()..].trim();
-            // Strip optional outer parentheses
-            let lhs_inner = strip_one_paren_pair(lhs);
-            let rhs_inner = strip_one_paren_pair(rhs);
+        // Use top-level split so parens/brackets don't trip us up on
+        // expressions like `(a() == a())` (not that is_simple_atom
+        // would accept them; still, robust delimiter location first).
+        if let Some((lhs, rhs)) = split_top_level_op(text, op) {
+            let lhs_inner = strip_one_paren_pair(lhs.trim());
+            let rhs_inner = strip_one_paren_pair(rhs.trim());
             if !lhs_inner.is_empty() && lhs_inner == rhs_inner && is_simple_atom(lhs_inner) {
                 return true;
             }
@@ -1660,9 +1660,13 @@ fn strip_one_paren_pair(s: &str) -> &str {
     let trimmed = s.trim();
     if trimmed.starts_with('(') && trimmed.ends_with(')') {
         let inner = &trimmed[1..trimmed.len() - 1];
-        // Only strip if the parens are balanced as a single outer pair.
+        // Only strip when the outer `(` and `)` form a single
+        // balanced pair. Walk the inner text tracking depth: if it
+        // ever drops below 0, the outer `(` was already closed mid
+        // way (e.g. `(a)+(b)` with inner `a)+(b`), so the outer
+        // parens are not a single pair.
         let mut depth = 0i32;
-        for (i, c) in inner.char_indices() {
+        for c in inner.chars() {
             match c {
                 '(' => depth += 1,
                 ')' => {
@@ -1672,11 +1676,6 @@ fn strip_one_paren_pair(s: &str) -> &str {
                     }
                 }
                 _ => {}
-            }
-            if depth == 0 && i + 1 < inner.len() {
-                // Closing paren in middle — original was something like
-                // `(a) + (b)`, not a single outer pair.
-                return trimmed;
             }
         }
         if depth == 0 {
@@ -1714,8 +1713,10 @@ fn is_simple_atom(s: &str) -> bool {
 fn is_contradiction(text: &str) -> bool {
     // `x && !x` — same atom both sides of `&&`, one negated.
     if let Some((lhs, rhs)) = split_top_level_op(text, "&&") {
-        let lhs = lhs.trim();
-        let rhs = rhs.trim();
+        // Strip optional outer parens — `(x == null) && (x != null)`
+        // is semantically identical to the unparenthesized form.
+        let lhs = strip_one_paren_pair(lhs.trim());
+        let rhs = strip_one_paren_pair(rhs.trim());
         if let Some(neg_lhs) = rhs.strip_prefix('!') {
             if lhs == neg_lhs.trim() && is_simple_atom(lhs) {
                 return true;
@@ -1726,16 +1727,19 @@ fn is_contradiction(text: &str) -> bool {
                 return true;
             }
         }
-        // `x == null && x != null`
+        // `x == null && x != null`, `x === null && x !== null`
         if let (Some((l_lhs, l_rhs)), Some((r_lhs, r_rhs))) =
             (split_first_compare(lhs), split_first_compare(rhs))
             && l_lhs.trim() == r_lhs.trim()
             && l_rhs.trim() == r_rhs.trim()
         {
-            // Compare ops are opposite (`==` vs `!=`).
             let l_op = compare_op(lhs).unwrap_or("");
             let r_op = compare_op(rhs).unwrap_or("");
-            if (l_op == "==" && r_op == "!=") || (l_op == "!=" && r_op == "==") {
+            if (l_op == "==" && r_op == "!=")
+                || (l_op == "!=" && r_op == "==")
+                || (l_op == "===" && r_op == "!==")
+                || (l_op == "!==" && r_op == "===")
+            {
                 return true;
             }
         }
