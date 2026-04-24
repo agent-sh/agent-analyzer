@@ -320,6 +320,13 @@ fn orphan_exports(map: &RepoIntelData) -> Vec<SlopFix> {
         }
 
         for export in &file_symbols.exports {
+            // Filter to top-level kinds. Field, EnumVariant, Property
+            // are member symbols — flagging them as "orphan exports"
+            // is wrong (their parent struct/enum/class is the actual
+            // export; the member just goes wherever the parent goes).
+            if !is_top_level_kind(&export.kind) {
+                continue;
+            }
             out.push(SlopFix {
                 action: SlopAction::DeleteLines {
                     path: file_path.clone(),
@@ -327,13 +334,63 @@ fn orphan_exports(map: &RepoIntelData) -> Vec<SlopFix> {
                 },
                 category: SlopCategory::OrphanExport,
                 reason: format!(
-                    "exported symbol `{}` — file has zero importers in the project graph",
-                    export.name
+                    "exported {kind} `{name}` — file has zero importers in the project graph",
+                    kind = symbol_kind_name(&export.kind),
+                    name = export.name
                 ),
             });
         }
     }
     out
+}
+
+fn is_top_level_kind(k: &analyzer_core::types::SymbolKind) -> bool {
+    use analyzer_core::types::SymbolKind::*;
+    matches!(
+        k,
+        Function | Class | Struct | Trait | Interface | Enum | Constant | TypeAlias | Module
+    )
+}
+
+fn symbol_kind_name(k: &analyzer_core::types::SymbolKind) -> &'static str {
+    use analyzer_core::types::SymbolKind::*;
+    match k {
+        Function => "function",
+        Class => "class",
+        Struct => "struct",
+        Trait => "trait",
+        Interface => "interface",
+        Enum => "enum",
+        Constant => "constant",
+        TypeAlias => "type alias",
+        Module => "module",
+        Field => "field",
+        EnumVariant => "variant",
+        Property => "property",
+    }
+}
+
+/// Path-based heuristic for "this file is dedicated to tests / benches"
+/// — those files freely use `let _ = …`, `.ok();`, and `.unwrap()` and
+/// flagging them as slop generates noise without value.
+///
+/// Does NOT catch `#[cfg(test)] mod tests { … }` blocks inside production
+/// `.rs` files; those would need AST-level cfg-attribute walking. The
+/// path-based filter handles the common conventions:
+///   - `tests/*` and `benches/*` directories
+///   - `*_test.rs`, `*_tests.rs`, `tests.rs` filename suffixes
+fn is_rust_test_file(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase().replace('\\', "/");
+    if lower.starts_with("tests/") || lower.contains("/tests/") {
+        return true;
+    }
+    if lower.starts_with("benches/") || lower.contains("/benches/") {
+        return true;
+    }
+    if lower.ends_with("_test.rs") || lower.ends_with("_tests.rs") || lower.ends_with("/tests.rs") {
+        return true;
+    }
+    false
 }
 
 fn looks_like_entry_point(path: &str) -> bool {
@@ -406,7 +463,13 @@ fn ast_findings(repo_root: &Path) -> Vec<SlopFix> {
                 out.extend(tautological_tests_python(&content, &rel));
             }
             "rs" => {
-                out.extend(error_swallowing_rust(&content, &rel));
+                // Tautological assertions still fire in test files (they're
+                // FOUND in test files by definition). Error-discard
+                // patterns (`let _ = …`, `.ok();`) are conventional in
+                // tests so we skip those for test files only.
+                if !is_rust_test_file(&rel) {
+                    out.extend(error_swallowing_rust(&content, &rel));
+                }
                 out.extend(tautological_tests_rust(&content, &rel));
             }
             "go" => {
@@ -1674,6 +1737,140 @@ mod tests {
             "expected assertTrue(true) flag; got {:?}",
             fixes
         );
+    }
+
+    #[test]
+    fn skips_rust_let_underscore_in_test_files() {
+        let dir = make_repo(&[(
+            "tests/integration.rs",
+            "#[test]\nfn t() {\n    let _ = call();\n}\n",
+        )]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes
+                .iter()
+                .any(|f| f.category == SlopCategory::EmptyCatch && f.reason.contains("let _")),
+            "should not flag `let _` in tests/ dir; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn skips_rust_dot_ok_in_underscore_test_file() {
+        let dir = make_repo(&[("src/foo_test.rs", "fn t() {\n    call().ok();\n}\n")]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            !fixes.iter().any(|f| f.reason.contains(".ok();")),
+            "should not flag `.ok();` in *_test.rs; got {:?}",
+            fixes
+        );
+    }
+
+    #[test]
+    fn flags_rust_let_underscore_in_production_file() {
+        let dir = make_repo(&[("src/lib.rs", "fn f() {\n    let _ = call();\n}\n")]);
+        let fixes = ast_findings(dir.path());
+        assert!(
+            fixes.iter().any(|f| f.reason.contains("let _")),
+            "should flag `let _` in production code"
+        );
+    }
+
+    // ── Orphan-export SymbolKind filter ─────────
+
+    #[test]
+    fn orphan_exports_skips_member_kinds() {
+        use analyzer_core::types::*;
+        use std::collections::HashMap;
+
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            "src/foo.rs".into(),
+            FileSymbols {
+                exports: vec![
+                    SymbolEntry {
+                        name: "MyStruct".into(),
+                        kind: SymbolKind::Struct,
+                        line: 1,
+                    },
+                    SymbolEntry {
+                        name: "field_a".into(),
+                        kind: SymbolKind::Field,
+                        line: 3,
+                    },
+                    SymbolEntry {
+                        name: "VariantOne".into(),
+                        kind: SymbolKind::EnumVariant,
+                        line: 7,
+                    },
+                    SymbolEntry {
+                        name: "computed_prop".into(),
+                        kind: SymbolKind::Property,
+                        line: 11,
+                    },
+                ],
+                imports: vec![],
+                definitions: vec![],
+            },
+        );
+
+        let mut map = RepoIntelData {
+            version: "test".into(),
+            generated: chrono::Utc::now(),
+            updated: chrono::Utc::now(),
+            partial: false,
+            git: GitInfo {
+                analyzed_up_to: "HEAD".into(),
+                total_commits_analyzed: 0,
+                first_commit_date: "".into(),
+                last_commit_date: "".into(),
+                scope: None,
+                shallow: false,
+            },
+            contributors: Contributors {
+                humans: HashMap::new(),
+                bots: HashMap::new(),
+            },
+            file_activity: HashMap::new(),
+            coupling: HashMap::new(),
+            conventions: ConventionInfo {
+                prefixes: HashMap::new(),
+                style: "".into(),
+                uses_scopes: false,
+                naming_patterns: None,
+                test_patterns: None,
+            },
+            releases: Releases {
+                tags: vec![],
+                cadence: "".into(),
+            },
+            renames: vec![],
+            deletions: vec![],
+            symbols: Some(symbols),
+            import_graph: Some(HashMap::new()),
+            project: None,
+            doc_refs: None,
+            graph: None,
+            file_descriptors: None,
+            summary: None,
+            embeddings_meta: None,
+        };
+        // Need a non-empty import_graph so the orphan check actually
+        // runs (otherwise the function returns early).
+        map.import_graph
+            .as_mut()
+            .unwrap()
+            .insert("src/other.rs".into(), vec![]);
+
+        let fixes = orphan_exports(&map);
+        // Should ONLY emit the Struct, not the field/variant/property.
+        assert_eq!(
+            fixes.len(),
+            1,
+            "expected 1 fix (Struct only); got {fixes:?}"
+        );
+        assert!(fixes[0].reason.contains("MyStruct"));
+        assert!(fixes[0].reason.contains("struct"));
     }
 
     #[test]
