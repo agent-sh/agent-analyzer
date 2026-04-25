@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-25
+
+### Added
+
+- **`passthrough-wrapper` detector** (#31) - new `SlopCategory::PassthroughWrapper`, confidence 0.85. Detects functions whose entire body is a single call to another function with identical args, across Rust, TypeScript/JavaScript, Python, Go, and Java. AST-based: uses tree-sitter `type_parameters` field for generic detection, `trait` field for Rust trait-impl detection, and a captured-receiver comparison for Go method self-delegation.
+- **`always-true-condition` detector** (#32) - new `SlopCategory::AlwaysTrueCondition`, confidence 0.92. Flags tautological checks (`if x == x`, `if x === x`) and contradictions (`x && !x`, `x == null && x != null`, `x === null && x !== null`) across all 5 languages. Paren-aware via `split_top_level_op`.
+- **`commented-out-code` detector** (#33) - new `SlopCategory::CommentedOutCode`, confidence 0.85. Detects comment blocks whose content re-parses as valid code in the surrounding language. Tree-sitter re-parse with zero-ERROR + substantive-node requirement. Handles leading-star block-comment layout, preserves Python indentation, rejects `///` / `//!` / `/**` / `/*!` doc comments. Per-line marker check skips TODO / FIXME / NOTE / HACK / XXX / WARNING / SAFETY / agentsys-ignore / SPDX-License.
+- **`stale-suppression` detector (Rust only)** (#34) - new `SlopCategory::StaleSuppression`, confidence 0.90. Flags `#[allow(dead_code)]` / `#[allow(unused)]` on symbols the import graph proves are used. `UsedSymbols::modules_per_name` segment-matches against the target file's path to guard against name-collision false positives. Only emits when EVERY lint is a suppression candidate (mixed-lint attributes left alone). Skips inner attributes, nested `cfg_attr(..., allow(...))`, and test files.
+- **External entry-points detection** (#29) - new `repo-intel query entry-points`: Cargo `[[bin]]` / `[[test]]` / `[[bench]]` / `[[example]]`, `main()` functions via AST, `package.json bin` scripts, framework-loaded configs (Next / Vite / Astro / Svelte / Docusaurus / Tailwind / PostCSS / Rollup / Webpack / Babel / Jest / Vitest / Playwright), and Python `__main__.py`. `.cjs` and `.mjs` variants included. Reduced orphan-export false positives from 52 to 0 on agnix.
+- **`agentsys-ignore` suppression directives** (#30) - per-fix suppression via `// agentsys-ignore[: <category>]` and `// agentsys-ignore-all`. Supports `//`, `#`, and `--` markers. 3-line lookback + same-line inline trailing. File-deletion fixes suppressible by a header directive in the first 5 lines.
+- **Confidence scores per `SlopCategory`** (#32) - new `Confidence` type alias (f32). `default_confidence(category)` returns per-category defaults (0.75-0.97). Serde default keeps older JSON artifacts compatible.
+- **`group_by_file` output** (#32) - `SlopFixesResult` now carries a `by_file: Vec<FileFixes>` alongside flat `fixes`. Deterministic alphabetic sort.
+- **Word-boundary cliché matching** (#30) - `tokenize_identifier` uses case transitions and separator boundaries (camelCase / snake_case / kebab-case / PascalCase). O(N) single-pass.
+- **`--files` filter on three queries** (#34) - `slop-fixes`, `entry-points`, and `slop-targets` accept `--files a,b,c` to restrict results. Windows paths normalized. New public `SlopAction::path()` accessor + `slop_targets::retain_targets_touching` helper.
+
+### Changed
+
+- **`SlopAction::path()` signature** (#34) - now returns `&str` (total) instead of `Option<&str>`. Every variant has a path.
+- **`category_kebab` hot path** (#30) - returns `&'static str` from a match arm instead of `serde_json::to_value` per call.
+
+### Fixed
+
+- Addressed 19+ reviewer-flagged items across the 6 slop PRs: single-pass partition loops, parser hoisting, AST field checks replacing string scans, shebang handling for Hash-style comments, paren-aware operator splitting, `strip_one_paren_pair` depth handling, `CommentKind` line/block tracking, nested `cfg_attr` allow guard, name-collision guard on stale-suppression, mixed-lint all-suppression requirement.
+
 ## [0.6.0] - 2026-04-24
 
 ### Added
