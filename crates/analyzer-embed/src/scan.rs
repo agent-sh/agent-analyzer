@@ -270,10 +270,7 @@ fn is_secret_like(path: &Path) -> bool {
     };
     // Dotfile names we care about even if the walker misses them (e.g.
     // on platforms where `.hidden` has different semantics).
-    let dotfile_exact = matches!(
-        name,
-        ".env" | ".npmrc" | ".pypirc" | ".netrc" | ".htpasswd"
-    );
+    let dotfile_exact = matches!(name, ".env" | ".npmrc" | ".pypirc" | ".netrc" | ".htpasswd");
     if dotfile_exact {
         return true;
     }
@@ -292,7 +289,10 @@ fn is_secret_like(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
     if let Some(e) = ext.as_deref()
-        && matches!(e, "pem" | "key" | "crt" | "p12" | "pfx" | "jks" | "keystore")
+        && matches!(
+            e,
+            "pem" | "key" | "crt" | "p12" | "pfx" | "jks" | "keystore"
+        )
     {
         return true;
     }
@@ -530,7 +530,10 @@ mod tests {
             .iter()
             .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert!(rels.iter().any(|p| p == "small.rs"), "small.rs missing: {rels:?}");
+        assert!(
+            rels.iter().any(|p| p == "small.rs"),
+            "small.rs missing: {rels:?}"
+        );
         assert!(
             !rels.iter().any(|p| p == "big.rs"),
             "10 MiB big.rs should have been skipped: {rels:?}"
@@ -557,8 +560,17 @@ mod tests {
                     .replace('\\', "/")
             })
             .collect();
-        assert!(rels.iter().any(|p| p == "src/a.rs"), "src/a.rs missing: {rels:?}");
-        for forbidden in [".env", ".git/config", ".ssh/id_rsa", "keys/server.pem", "keys/server.key"] {
+        assert!(
+            rels.iter().any(|p| p == "src/a.rs"),
+            "src/a.rs missing: {rels:?}"
+        );
+        for forbidden in [
+            ".env",
+            ".git/config",
+            ".ssh/id_rsa",
+            "keys/server.pem",
+            "keys/server.key",
+        ] {
             assert!(
                 !rels.iter().any(|p| p == forbidden),
                 "secret-like path {forbidden} should have been excluded: {rels:?}"

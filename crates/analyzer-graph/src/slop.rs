@@ -2826,10 +2826,7 @@ fn is_secret_like(path: &Path) -> bool {
         Some(n) => n,
         None => return false,
     };
-    if matches!(
-        name,
-        ".env" | ".npmrc" | ".pypirc" | ".netrc" | ".htpasswd"
-    ) {
+    if matches!(name, ".env" | ".npmrc" | ".pypirc" | ".netrc" | ".htpasswd") {
         return true;
     }
     if name.starts_with(".env.") {
@@ -2847,7 +2844,10 @@ fn is_secret_like(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
     if let Some(e) = ext.as_deref()
-        && matches!(e, "pem" | "key" | "crt" | "p12" | "pfx" | "jks" | "keystore")
+        && matches!(
+            e,
+            "pem" | "key" | "crt" | "p12" | "pfx" | "jks" | "keystore"
+        )
     {
         return true;
     }
