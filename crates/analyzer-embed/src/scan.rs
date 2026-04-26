@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use analyzer_core::limits::MAX_WALK_FILE_SIZE;
+use analyzer_core::secrets::is_secret_like;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use ignore::WalkBuilder;
@@ -217,18 +219,12 @@ fn load_existing_hashes(
 }
 
 /// Maximum size of any single file the embed/slop walkers will read.
-/// Generated or vendored source files can easily balloon past typical
-/// source sizes; reading a multi-hundred-MiB file into memory to hash and
-/// chunk it is almost never what we want. 5 MiB comfortably covers the
-/// legitimate long tail.
-pub(crate) const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
-
 fn walk_repo(repo: &Path, max_files: usize) -> Result<Vec<(PathBuf, String)>> {
     let mut out = Vec::new();
     for entry in WalkBuilder::new(repo)
         .standard_filters(true)
         .hidden(true)
-        .max_filesize(Some(MAX_FILE_BYTES))
+        .max_filesize(Some(MAX_WALK_FILE_SIZE))
         .build()
     {
         let entry = match entry {
@@ -256,58 +252,6 @@ fn walk_repo(repo: &Path, max_files: usize) -> Result<Vec<(PathBuf, String)>> {
         }
     }
     Ok(out)
-}
-
-/// Explicit deny-list for known-secret patterns. `.hidden(true)` on the
-/// walker already excludes dot-prefixed files/dirs on Unix (and any path
-/// containing a dot-prefixed component); this is a belt-and-suspenders
-/// check that also catches non-hidden variants like `id_rsa` or `*.pem`
-/// that a user might have committed by accident.
-fn is_secret_like(path: &Path) -> bool {
-    let name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return false,
-    };
-    // Dotfile names we care about even if the walker misses them (e.g.
-    // on platforms where `.hidden` has different semantics).
-    let dotfile_exact = matches!(name, ".env" | ".npmrc" | ".pypirc" | ".netrc" | ".htpasswd");
-    if dotfile_exact {
-        return true;
-    }
-    if name.starts_with(".env.") {
-        return true;
-    }
-    if name.starts_with("id_rsa")
-        || name.starts_with("id_dsa")
-        || name.starts_with("id_ecdsa")
-        || name.starts_with("id_ed25519")
-    {
-        return true;
-    }
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    if let Some(e) = ext.as_deref()
-        && matches!(
-            e,
-            "pem" | "key" | "crt" | "p12" | "pfx" | "jks" | "keystore"
-        )
-    {
-        return true;
-    }
-    // Secret-bearing directories: anywhere in the path.
-    for comp in path.components() {
-        if let Some(c) = comp.as_os_str().to_str()
-            && matches!(
-                c,
-                ".git" | ".ssh" | ".gnupg" | ".aws" | ".gcloud" | ".azure"
-            )
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn is_eligible(path: &Path) -> bool {

@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
+use analyzer_core::limits::{MAX_NAME_LEN, MAX_PATH_LEN};
 use anyhow::{Context, Result, anyhow, bail};
 use half::f16;
 use serde::{Deserialize, Serialize};
@@ -51,11 +52,13 @@ const SIDECAR_VERSION: u32 = 1;
 //   - vector_count: BGE-small at per-function × very large monorepo
 //     stays well under 10M.
 //   - dim: BGE-large is 1024; 4096 covers foreseeable future models.
-//   - name_len: paths/symbol names; 1 KiB is already generous.
+//   - name_len / path_len: see analyzer_core::limits. Paths need a larger
+//     cap than symbol names because deeply nested monorepos routinely
+//     exceed 1 KiB on repo-relative paths; we use 4 KiB (PATH_MAX) for
+//     paths and keep the tighter 1 KiB cap for identifiers.
 const MAX_HEADER_LEN: usize = 1 << 20; // 1 MiB
 const MAX_VECTOR_COUNT: usize = 10_000_000;
 const MAX_DIM: usize = 4096;
-const MAX_NAME_LEN: usize = 1024;
 // Minimum bytes required per vector entry (path_len u32 + kind u8 +
 // start u32 + end u32 + name_len u32 + fp16 values). Even with a zero-length
 // path and zero-length name and dim=0 that's at least 17 bytes; we use 17
@@ -339,13 +342,22 @@ fn read_u32<R: Read>(r: &mut R) -> Result<u32> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// Read a length-prefixed UTF-8 string used for repo-relative paths.
+///
+/// Paths can be longer than symbol identifiers in deeply nested
+/// monorepos, so we apply [`MAX_PATH_LEN`] here rather than the tighter
+/// [`MAX_NAME_LEN`].
 fn read_string<R: Read>(r: &mut R) -> Result<String> {
+    read_bounded_string(r, MAX_PATH_LEN, "path")
+}
+
+fn read_bounded_string<R: Read>(r: &mut R, cap: usize, label: &str) -> Result<String> {
     let len = read_u32(r)? as usize;
-    if len > MAX_NAME_LEN {
+    if len > cap {
         return Err(anyhow!(
-            "sidecar string length {} exceeds {} byte cap; file may be corrupt or malicious",
+            "sidecar {label} length {} exceeds {} byte cap; file may be corrupt or malicious",
             len,
-            MAX_NAME_LEN
+            cap,
         ));
     }
     let mut buf = vec![0u8; len];
@@ -517,6 +529,41 @@ mod tests {
             msg.contains("name_len") && msg.contains("cap"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn oversized_path_len_is_rejected() {
+        // path_len attacker-chosen to MAX_PATH_LEN + 1; we must reject
+        // before attempting to allocate. Pad body past the min-bytes
+        // sanity check so we hit the path_len check and not the earlier
+        // MIN_BYTES_PER_VECTOR floor.
+        let header = br#"{"version":1,"model_id":"m","dim":0,"vector_count":1}"#;
+        let mut buf = craft_header_only(header);
+        buf.extend_from_slice(&((MAX_PATH_LEN + 1) as u32).to_le_bytes()); // path_len
+        buf.extend_from_slice(&[0u8; MIN_BYTES_PER_VECTOR]); // body padding
+        let err = Sidecar::from_bytes(&buf[..]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path") && msg.contains("cap"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn long_path_under_cap_round_trips() {
+        // Realistic deep-monorepo path: 1500 bytes exceeds MAX_NAME_LEN
+        // (1024) but is well under MAX_PATH_LEN (4096). Before the split
+        // these paths would be rejected as "name_len exceeds cap" during
+        // read. Now they should load fine.
+        let long_path: String = "dir/".repeat(360) + "file.ts"; // ~1447 bytes
+        assert!(long_path.len() > MAX_NAME_LEN);
+        assert!(long_path.len() < MAX_PATH_LEN);
+        let mut a = Sidecar::new("m".into(), 4);
+        a.insert(long_path.clone(), vec![sample_vector()]);
+        let mut out = Vec::new();
+        a.write(&mut out).unwrap();
+        let b = Sidecar::from_bytes(&out[..]).unwrap();
+        assert!(b.vectors.contains_key(&long_path));
     }
 
     #[test]

@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use streaming_iterator::StreamingIterator;
 
+use analyzer_core::limits::MAX_WALK_FILE_SIZE;
+use analyzer_core::secrets::is_secret_like;
 use analyzer_core::types::RepoIntelData;
 
 /// Concrete edit a deslop agent should apply.
@@ -2796,10 +2798,10 @@ fn walk_repo_files(root: &Path) -> Vec<PathBuf> {
     for entry in ignore::WalkBuilder::new(root)
         .standard_filters(true)
         .hidden(true)
-        // Skip files that would need more than 5 MiB of RAM to read; the
-        // slop analyzers read the whole file into memory to parse with
-        // tree-sitter, so unbounded sizes are a DoS vector.
-        .max_filesize(Some(5 * 1024 * 1024))
+        // Skip oversized files — slop analyzers read the whole file into
+        // memory to parse with tree-sitter, so unbounded sizes are a DoS
+        // vector. Cap shared with analyzer-embed via analyzer-core::limits.
+        .max_filesize(Some(MAX_WALK_FILE_SIZE))
         .build()
     {
         let entry = match entry {
@@ -2816,52 +2818,6 @@ fn walk_repo_files(root: &Path) -> Vec<PathBuf> {
         out.push(path.to_path_buf());
     }
     out
-}
-
-/// See crates/analyzer-embed/src/scan.rs for the rationale; kept in sync
-/// here because analyzer-graph does its own repo walk and we don't want
-/// to pull analyzer-embed as a dependency for one helper.
-fn is_secret_like(path: &Path) -> bool {
-    let name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return false,
-    };
-    if matches!(name, ".env" | ".npmrc" | ".pypirc" | ".netrc" | ".htpasswd") {
-        return true;
-    }
-    if name.starts_with(".env.") {
-        return true;
-    }
-    if name.starts_with("id_rsa")
-        || name.starts_with("id_dsa")
-        || name.starts_with("id_ecdsa")
-        || name.starts_with("id_ed25519")
-    {
-        return true;
-    }
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    if let Some(e) = ext.as_deref()
-        && matches!(
-            e,
-            "pem" | "key" | "crt" | "p12" | "pfx" | "jks" | "keystore"
-        )
-    {
-        return true;
-    }
-    for comp in path.components() {
-        if let Some(c) = comp.as_os_str().to_str()
-            && matches!(
-                c,
-                ".git" | ".ssh" | ".gnupg" | ".aws" | ".gcloud" | ".azure"
-            )
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn relative(path: &Path, root: &Path) -> String {
