@@ -58,8 +58,7 @@ impl FastEmbedder {
 
         prune_poisoned_cache(&cache_dir, model_code_for(&fastembed_model));
 
-        let mut opts =
-            InitOptions::new(fastembed_model.clone()).with_show_download_progress(true);
+        let mut opts = InitOptions::new(fastembed_model.clone()).with_show_download_progress(true);
         opts = opts.with_cache_dir(cache_dir.clone());
 
         let model = TextEmbedding::try_new(opts).with_context(|| {
