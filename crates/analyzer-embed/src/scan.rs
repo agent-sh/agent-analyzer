@@ -220,7 +220,7 @@ fn walk_repo(repo: &Path, max_files: usize) -> Result<Vec<(PathBuf, String)>> {
     let mut out = Vec::new();
     for entry in WalkBuilder::new(repo)
         .standard_filters(true)
-        .hidden(false)
+        .hidden(true)
         .build()
     {
         let entry = match entry {
@@ -234,6 +234,9 @@ fn walk_repo(repo: &Path, max_files: usize) -> Result<Vec<(PathBuf, String)>> {
         if !is_eligible(&path) {
             continue;
         }
+        if is_secret_like(&path) {
+            continue;
+        }
         let content = match fs::read(&path) {
             Ok(c) => c,
             Err(_) => continue,
@@ -245,6 +248,58 @@ fn walk_repo(repo: &Path, max_files: usize) -> Result<Vec<(PathBuf, String)>> {
         }
     }
     Ok(out)
+}
+
+/// Explicit deny-list for known-secret patterns. `.hidden(true)` on the
+/// walker already excludes dot-prefixed files/dirs on Unix (and any path
+/// containing a dot-prefixed component); this is a belt-and-suspenders
+/// check that also catches non-hidden variants like `id_rsa` or `*.pem`
+/// that a user might have committed by accident.
+fn is_secret_like(path: &Path) -> bool {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    // Dotfile names we care about even if the walker misses them (e.g.
+    // on platforms where `.hidden` has different semantics).
+    let dotfile_exact = matches!(
+        name,
+        ".env" | ".npmrc" | ".pypirc" | ".netrc" | ".htpasswd"
+    );
+    if dotfile_exact {
+        return true;
+    }
+    if name.starts_with(".env.") {
+        return true;
+    }
+    if name.starts_with("id_rsa")
+        || name.starts_with("id_dsa")
+        || name.starts_with("id_ecdsa")
+        || name.starts_with("id_ed25519")
+    {
+        return true;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if let Some(e) = ext.as_deref()
+        && matches!(e, "pem" | "key" | "crt" | "p12" | "pfx" | "jks" | "keystore")
+    {
+        return true;
+    }
+    // Secret-bearing directories: anywhere in the path.
+    for comp in path.components() {
+        if let Some(c) = comp.as_os_str().to_str()
+            && matches!(
+                c,
+                ".git" | ".ssh" | ".gnupg" | ".aws" | ".gcloud" | ".azure"
+            )
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_eligible(path: &Path) -> bool {
@@ -442,6 +497,35 @@ mod tests {
         };
         let doc = run_scan(&mut embedder, &opts).unwrap();
         assert!(doc.files.contains_key("nested/inner/a.rs"));
+    }
+
+    #[test]
+    fn walk_excludes_dotfiles_and_secret_patterns() {
+        let dir = make_repo(&[
+            ("src/a.rs", "fn a() {}\n"),
+            (".env", "SECRET=hunter2\n"),
+            (".git/config", "[core]\n"),
+            (".ssh/id_rsa", "-----BEGIN RSA PRIVATE KEY-----\n"),
+            ("keys/server.pem", "-----BEGIN CERTIFICATE-----\n"),
+            ("keys/server.key", "-----BEGIN PRIVATE KEY-----\n"),
+        ]);
+        let files = walk_repo(dir.path(), 100).unwrap();
+        let rels: Vec<String> = files
+            .iter()
+            .map(|(p, _)| {
+                p.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(rels.iter().any(|p| p == "src/a.rs"), "src/a.rs missing: {rels:?}");
+        for forbidden in [".env", ".git/config", ".ssh/id_rsa", "keys/server.pem", "keys/server.key"] {
+            assert!(
+                !rels.iter().any(|p| p == forbidden),
+                "secret-like path {forbidden} should have been excluded: {rels:?}"
+            );
+        }
     }
 
     #[test]

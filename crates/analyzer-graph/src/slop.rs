@@ -2795,18 +2795,69 @@ fn walk_repo_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for entry in ignore::WalkBuilder::new(root)
         .standard_filters(true)
-        .hidden(false)
+        .hidden(true)
         .build()
     {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
-        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            out.push(entry.path().to_path_buf());
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
         }
+        let path = entry.path();
+        if is_secret_like(path) {
+            continue;
+        }
+        out.push(path.to_path_buf());
     }
     out
+}
+
+/// See crates/analyzer-embed/src/scan.rs for the rationale; kept in sync
+/// here because analyzer-graph does its own repo walk and we don't want
+/// to pull analyzer-embed as a dependency for one helper.
+fn is_secret_like(path: &Path) -> bool {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    if matches!(
+        name,
+        ".env" | ".npmrc" | ".pypirc" | ".netrc" | ".htpasswd"
+    ) {
+        return true;
+    }
+    if name.starts_with(".env.") {
+        return true;
+    }
+    if name.starts_with("id_rsa")
+        || name.starts_with("id_dsa")
+        || name.starts_with("id_ecdsa")
+        || name.starts_with("id_ed25519")
+    {
+        return true;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if let Some(e) = ext.as_deref()
+        && matches!(e, "pem" | "key" | "crt" | "p12" | "pfx" | "jks" | "keystore")
+    {
+        return true;
+    }
+    for comp in path.components() {
+        if let Some(c) = comp.as_os_str().to_str()
+            && matches!(
+                c,
+                ".git" | ".ssh" | ".gnupg" | ".aws" | ".gcloud" | ".azure"
+            )
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn relative(path: &Path, root: &Path) -> String {
