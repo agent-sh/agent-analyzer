@@ -1,0 +1,80 @@
+# cargo-deny configuration for agent-analyzer.
+#
+# Run locally with:
+#   cargo install cargo-deny --locked
+#   cargo deny check
+#
+# CI integration is a follow-up; this file establishes the policy.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ── Advisories ────────────────────────────────────────────────────────
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Any known CVE in the dep tree fails the build.
+yanked = "deny"
+# Unmaintained crates warn but don't fail; they're often unavoidable in
+# transitive deps and we want signal, not noise.
+ignore = []
+
+# ── Licenses ──────────────────────────────────────────────────────────
+[licenses]
+version = 2
+# Permissive licenses we accept.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+]
+confidence-threshold = 0.93
+# Strong-copyleft licenses are not compatible with the MIT license on
+# the workspace; deny them explicitly so a new transitive dep under
+# GPL/AGPL/SSPL fails the build instead of quietly shipping.
+exceptions = []
+
+# Deny these license IDs outright even if somehow detected as compatible.
+[[licenses.clarify]]
+# ring has a bespoke license expression; map it to the common form.
+name = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ── Bans ──────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+# Deny specific crates if they show up - placeholder list; extend when
+# a concrete risk is identified.
+deny = []
+# Skip known-duplicate-version noise from the ecosystem.
+skip = []
+skip-tree = []
+
+# ── Sources ───────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Only allow git deps from the agent-sh org. Add other trusted orgs here
+# explicitly if needed.
+allow-git = []
+
+[sources.allow-org]
+github = ["agent-sh"]

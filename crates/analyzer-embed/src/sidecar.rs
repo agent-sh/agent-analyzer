@@ -34,13 +34,36 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
-use anyhow::{Context, Result, bail};
+use analyzer_core::limits::{MAX_NAME_LEN, MAX_PATH_LEN};
+use anyhow::{Context, Result, anyhow, bail};
 use half::f16;
 use serde::{Deserialize, Serialize};
 
 use crate::chunk::ChunkKind;
 
 const SIDECAR_VERSION: u32 = 1;
+
+// Caps on attacker-controlled length/count fields. A malformed or malicious
+// sidecar could otherwise declare a 4 GiB header or 2^32 vectors and drive
+// the reader into allocating attacker-chosen amounts of memory.
+//
+// Chosen to be comfortably above realistic usage:
+//   - header is small JSON; 1 MiB is ~10x the largest plausible header.
+//   - vector_count: BGE-small at per-function × very large monorepo
+//     stays well under 10M.
+//   - dim: BGE-large is 1024; 4096 covers foreseeable future models.
+//   - name_len / path_len: see analyzer_core::limits. Paths need a larger
+//     cap than symbol names because deeply nested monorepos routinely
+//     exceed 1 KiB on repo-relative paths; we use 4 KiB (PATH_MAX) for
+//     paths and keep the tighter 1 KiB cap for identifiers.
+const MAX_HEADER_LEN: usize = 1 << 20; // 1 MiB
+const MAX_VECTOR_COUNT: usize = 10_000_000;
+const MAX_DIM: usize = 4096;
+// Minimum bytes required per vector entry (path_len u32 + kind u8 +
+// start u32 + end u32 + name_len u32 + fp16 values). Even with a zero-length
+// path and zero-length name and dim=0 that's at least 17 bytes; we use 17
+// as a conservative floor for the implied-size sanity check.
+const MIN_BYTES_PER_VECTOR: usize = 17;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidecarHeader {
@@ -127,8 +150,47 @@ impl Sidecar {
         self.vectors.insert(path, vectors);
     }
 
+    /// Parse a sidecar from a byte slice. Prefer this over [`Sidecar::read`]
+    /// when reading from an on-disk file because it additionally validates
+    /// the declared vector count against the actual file size to bound
+    /// up-front allocations.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::read_inner(bytes, Some(bytes.len()))
+    }
+
+    /// Parse a sidecar from any `Read` source. Applies absolute caps on
+    /// attacker-controlled fields but cannot cross-check against a total
+    /// size - callers with an on-disk file should use [`Sidecar::from_bytes`].
     pub fn read<R: Read>(mut r: R) -> Result<Self> {
+        // Slurp so we can apply the implied-size check consistently. The
+        // caller already had to buffer the header/body to call read_exact
+        // repeatedly, so this doesn't change peak memory by more than a
+        // small constant in the happy path.
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).context("read sidecar")?;
+        Self::read_inner(&buf[..], Some(buf.len()))
+    }
+
+    fn read_inner(bytes: &[u8], total_len: Option<usize>) -> Result<Self> {
+        let mut r = bytes;
+
         let header_len = read_u32(&mut r)? as usize;
+        if header_len > MAX_HEADER_LEN {
+            return Err(anyhow!(
+                "sidecar header_len {} exceeds {} byte cap; file may be corrupt or malicious",
+                header_len,
+                MAX_HEADER_LEN
+            ));
+        }
+        if let Some(total) = total_len
+            && header_len.saturating_add(4) > total
+        {
+            return Err(anyhow!(
+                "sidecar header_len {} exceeds available bytes {}",
+                header_len,
+                total
+            ));
+        }
         let mut header_buf = vec![0u8; header_len];
         r.read_exact(&mut header_buf).context("read header")?;
         let header: SidecarHeader =
@@ -140,6 +202,35 @@ impl Sidecar {
                 SIDECAR_VERSION
             );
         }
+        if header.vector_count > MAX_VECTOR_COUNT {
+            return Err(anyhow!(
+                "sidecar vector_count {} exceeds {} cap; file may be corrupt or malicious",
+                header.vector_count,
+                MAX_VECTOR_COUNT
+            ));
+        }
+        if header.dim > MAX_DIM {
+            return Err(anyhow!(
+                "sidecar dim {} exceeds {} cap; file may be corrupt or malicious",
+                header.dim,
+                MAX_DIM
+            ));
+        }
+        // Cross-check declared count against actual bytes left. Each vector
+        // entry requires at least MIN_BYTES_PER_VECTOR + 2*dim bytes.
+        if let Some(total) = total_len {
+            let per_vec = MIN_BYTES_PER_VECTOR.saturating_add(header.dim.saturating_mul(2));
+            let min_body = header.vector_count.saturating_mul(per_vec);
+            let available = total.saturating_sub(4 + header_len);
+            if min_body > available {
+                return Err(anyhow!(
+                    "sidecar declares {} vectors (min {} bytes) but only {} body bytes remain",
+                    header.vector_count,
+                    min_body,
+                    available
+                ));
+            }
+        }
 
         let mut vectors: HashMap<String, Vec<StoredVector>> = HashMap::new();
         for _ in 0..header.vector_count {
@@ -149,6 +240,13 @@ impl Sidecar {
             let start_line = read_u32(&mut r)?;
             let end_line = read_u32(&mut r)?;
             let name_len = read_u32(&mut r)? as usize;
+            if name_len > MAX_NAME_LEN {
+                return Err(anyhow!(
+                    "sidecar name_len {} exceeds {} byte cap; file may be corrupt or malicious",
+                    name_len,
+                    MAX_NAME_LEN
+                ));
+            }
             let name = if name_len == 0 {
                 None
             } else {
@@ -156,6 +254,7 @@ impl Sidecar {
                 r.read_exact(&mut buf).context("read name")?;
                 Some(String::from_utf8(buf).context("name utf-8")?)
             };
+            // header.dim is bounded by MAX_DIM above, so with_capacity is safe.
             let mut values = Vec::with_capacity(header.dim);
             for _ in 0..header.dim {
                 values.push(f16::from_bits(read_u16(&mut r)?));
@@ -243,8 +342,24 @@ fn read_u32<R: Read>(r: &mut R) -> Result<u32> {
     Ok(u32::from_le_bytes(b))
 }
 
+/// Read a length-prefixed UTF-8 string used for repo-relative paths.
+///
+/// Paths can be longer than symbol identifiers in deeply nested
+/// monorepos, so we apply [`MAX_PATH_LEN`] here rather than the tighter
+/// [`MAX_NAME_LEN`].
 fn read_string<R: Read>(r: &mut R) -> Result<String> {
+    read_bounded_string(r, MAX_PATH_LEN, "path")
+}
+
+fn read_bounded_string<R: Read>(r: &mut R, cap: usize, label: &str) -> Result<String> {
     let len = read_u32(r)? as usize;
+    if len > cap {
+        return Err(anyhow!(
+            "sidecar {label} length {} exceeds {} byte cap; file may be corrupt or malicious",
+            len,
+            cap,
+        ));
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).context("read string bytes")?;
     String::from_utf8(buf).context("string utf-8")
@@ -346,6 +461,122 @@ mod tests {
         let mut buf = Vec::new();
         let err = s.write(&mut buf).unwrap_err();
         assert!(err.to_string().contains("does not match header dim"));
+    }
+
+    /// Build a minimal sidecar byte stream by hand so we can inject
+    /// attacker-controlled length fields without going through Sidecar::write.
+    fn craft_header_only(header_json: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        buf.extend_from_slice(header_json);
+        buf
+    }
+
+    #[test]
+    fn oversized_header_len_is_rejected() {
+        let mut buf = Vec::new();
+        // Declare a 4 GiB - 1 header without supplying the bytes.
+        buf.extend_from_slice(&(u32::MAX).to_le_bytes());
+        let err = Sidecar::from_bytes(&buf[..]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("header_len") && msg.contains("cap"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn oversized_vector_count_is_rejected() {
+        let header = br#"{"version":1,"model_id":"m","dim":4,"vector_count":99999999}"#;
+        let buf = craft_header_only(header);
+        let err = Sidecar::from_bytes(&buf[..]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("vector_count") && msg.contains("cap"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn oversized_dim_is_rejected() {
+        let header = br#"{"version":1,"model_id":"m","dim":999999,"vector_count":0}"#;
+        let buf = craft_header_only(header);
+        let err = Sidecar::from_bytes(&buf[..]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dim") && msg.contains("cap"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn oversized_name_len_is_rejected() {
+        // Construct: header, then one vector entry with attacker name_len.
+        // path_len=1, path='a', kind=0, start=0, end=0, name_len=MAX+1
+        let header = br#"{"version":1,"model_id":"m","dim":0,"vector_count":1}"#;
+        let mut buf = craft_header_only(header);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // path_len
+        buf.push(b'a'); // path
+        buf.push(0); // kind
+        buf.extend_from_slice(&0u32.to_le_bytes()); // start
+        buf.extend_from_slice(&0u32.to_le_bytes()); // end
+        buf.extend_from_slice(&((MAX_NAME_LEN + 1) as u32).to_le_bytes()); // name_len
+        // We don't add MAX_NAME_LEN+1 bytes - validation must reject before
+        // attempting to allocate.
+        let err = Sidecar::from_bytes(&buf[..]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("name_len") && msg.contains("cap"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn oversized_path_len_is_rejected() {
+        // path_len attacker-chosen to MAX_PATH_LEN + 1; we must reject
+        // before attempting to allocate. Pad body past the min-bytes
+        // sanity check so we hit the path_len check and not the earlier
+        // MIN_BYTES_PER_VECTOR floor.
+        let header = br#"{"version":1,"model_id":"m","dim":0,"vector_count":1}"#;
+        let mut buf = craft_header_only(header);
+        buf.extend_from_slice(&((MAX_PATH_LEN + 1) as u32).to_le_bytes()); // path_len
+        buf.extend_from_slice(&[0u8; MIN_BYTES_PER_VECTOR]); // body padding
+        let err = Sidecar::from_bytes(&buf[..]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path") && msg.contains("cap"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn long_path_under_cap_round_trips() {
+        // Realistic deep-monorepo path: 1500 bytes exceeds MAX_NAME_LEN
+        // (1024) but is well under MAX_PATH_LEN (4096). Before the split
+        // these paths would be rejected as "name_len exceeds cap" during
+        // read. Now they should load fine.
+        let long_path: String = "dir/".repeat(360) + "file.ts"; // ~1447 bytes
+        assert!(long_path.len() > MAX_NAME_LEN);
+        assert!(long_path.len() < MAX_PATH_LEN);
+        let mut a = Sidecar::new("m".into(), 4);
+        a.insert(long_path.clone(), vec![sample_vector()]);
+        let mut out = Vec::new();
+        a.write(&mut out).unwrap();
+        let b = Sidecar::from_bytes(&out[..]).unwrap();
+        assert!(b.vectors.contains_key(&long_path));
+    }
+
+    #[test]
+    fn vector_count_mismatched_against_file_size_is_rejected() {
+        // Declares 10M vectors but the body has 0 bytes; must fail fast.
+        let header = br#"{"version":1,"model_id":"m","dim":4,"vector_count":1000000}"#;
+        let buf = craft_header_only(header);
+        let err = Sidecar::from_bytes(&buf[..]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("body bytes remain") || msg.contains("declares"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

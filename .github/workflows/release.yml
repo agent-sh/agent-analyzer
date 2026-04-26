@@ -7,6 +7,10 @@ on:
 
 permissions:
   contents: write
+  # Required for actions/attest-build-provenance to sign attestations
+  # via the workflow's OIDC identity and write them to the release.
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -109,6 +113,29 @@ jobs:
           cd ../../..
           (Get-FileHash agent-analyzer-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower() + "  agent-analyzer-${{ matrix.target }}.zip" | Out-File -Encoding ASCII agent-analyzer-${{ matrix.target }}.zip.sha256
           (Get-FileHash agent-analyzer-embed-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower() + "  agent-analyzer-embed-${{ matrix.target }}.zip" | Out-File -Encoding ASCII agent-analyzer-embed-${{ matrix.target }}.zip.sha256
+
+      # SLSA build-provenance attestations. These are uploaded as separate
+      # .intoto.jsonl files alongside the tarballs so downloaders *can*
+      # verify with cosign / slsa-verifier, but the agent-core downloader
+      # does not yet consume them - this is defense-in-depth at publish
+      # time, client-side verification is a follow-up.
+      - name: Attest release artifacts (Unix)
+        if: runner.os != 'Windows'
+        # Pin to SHA to prevent a malicious tag reassignment from silently
+        # replacing the attestation step. Bump via Dependabot.
+        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
+        with:
+          subject-path: |
+            agent-analyzer-${{ matrix.target }}.tar.gz
+            agent-analyzer-embed-${{ matrix.target }}.tar.gz
+
+      - name: Attest release artifacts (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
+        with:
+          subject-path: |
+            agent-analyzer-${{ matrix.target }}.zip
+            agent-analyzer-embed-${{ matrix.target }}.zip
 
       - name: Upload agent-analyzer artifact
         uses: actions/upload-artifact@v4

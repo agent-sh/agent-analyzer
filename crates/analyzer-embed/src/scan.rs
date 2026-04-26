@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use analyzer_core::limits::MAX_WALK_FILE_SIZE;
+use analyzer_core::secrets::is_secret_like;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use ignore::WalkBuilder;
@@ -202,7 +204,7 @@ fn load_existing_hashes(
         return Ok(HashMap::new());
     }
     let bytes = fs::read(sidecar_path).context("read sidecar")?;
-    let sidecar = Sidecar::read(&bytes[..])?;
+    let sidecar = Sidecar::from_bytes(&bytes[..])?;
     if sidecar.header.model_id != expected_model_id {
         // Model changed — drop everything, force full rebuild.
         return Ok(HashMap::new());
@@ -216,11 +218,13 @@ fn load_existing_hashes(
     Ok(HashMap::new())
 }
 
+/// Maximum size of any single file the embed/slop walkers will read.
 fn walk_repo(repo: &Path, max_files: usize) -> Result<Vec<(PathBuf, String)>> {
     let mut out = Vec::new();
     for entry in WalkBuilder::new(repo)
         .standard_filters(true)
-        .hidden(false)
+        .hidden(true)
+        .max_filesize(Some(MAX_WALK_FILE_SIZE))
         .build()
     {
         let entry = match entry {
@@ -232,6 +236,9 @@ fn walk_repo(repo: &Path, max_files: usize) -> Result<Vec<(PathBuf, String)>> {
         }
         let path = entry.path().to_path_buf();
         if !is_eligible(&path) {
+            continue;
+        }
+        if is_secret_like(&path) {
             continue;
         }
         let content = match fs::read(&path) {
@@ -442,6 +449,77 @@ mod tests {
         };
         let doc = run_scan(&mut embedder, &opts).unwrap();
         assert!(doc.files.contains_key("nested/inner/a.rs"));
+    }
+
+    #[test]
+    fn walk_skips_files_larger_than_cap() {
+        let dir = TempDir::new().unwrap();
+        // Small eligible file - must be kept.
+        {
+            let p = dir.path().join("small.rs");
+            let mut f = File::create(&p).unwrap();
+            f.write_all(b"fn a() {}\n").unwrap();
+        }
+        // 10 MiB file with an eligible extension - must be skipped.
+        {
+            let p = dir.path().join("big.rs");
+            let mut f = File::create(&p).unwrap();
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..10 {
+                f.write_all(&chunk).unwrap();
+            }
+        }
+        let files = walk_repo(dir.path(), 100).unwrap();
+        let rels: Vec<String> = files
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            rels.iter().any(|p| p == "small.rs"),
+            "small.rs missing: {rels:?}"
+        );
+        assert!(
+            !rels.iter().any(|p| p == "big.rs"),
+            "10 MiB big.rs should have been skipped: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn walk_excludes_dotfiles_and_secret_patterns() {
+        let dir = make_repo(&[
+            ("src/a.rs", "fn a() {}\n"),
+            (".env", "SECRET=hunter2\n"),
+            (".git/config", "[core]\n"),
+            (".ssh/id_rsa", "-----BEGIN RSA PRIVATE KEY-----\n"),
+            ("keys/server.pem", "-----BEGIN CERTIFICATE-----\n"),
+            ("keys/server.key", "-----BEGIN PRIVATE KEY-----\n"),
+        ]);
+        let files = walk_repo(dir.path(), 100).unwrap();
+        let rels: Vec<String> = files
+            .iter()
+            .map(|(p, _)| {
+                p.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(
+            rels.iter().any(|p| p == "src/a.rs"),
+            "src/a.rs missing: {rels:?}"
+        );
+        for forbidden in [
+            ".env",
+            ".git/config",
+            ".ssh/id_rsa",
+            "keys/server.pem",
+            "keys/server.key",
+        ] {
+            assert!(
+                !rels.iter().any(|p| p == forbidden),
+                "secret-like path {forbidden} should have been excluded: {rels:?}"
+            );
+        }
     }
 
     #[test]

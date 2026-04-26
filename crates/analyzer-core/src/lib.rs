@@ -4,6 +4,8 @@ pub mod bot_detect;
 pub mod bug_fix_detect;
 pub mod generated_detect;
 pub mod git;
+pub mod limits;
 pub mod output;
+pub mod secrets;
 pub mod types;
 pub mod walk;

@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use streaming_iterator::StreamingIterator;
 
+use analyzer_core::limits::MAX_WALK_FILE_SIZE;
+use analyzer_core::secrets::is_secret_like;
 use analyzer_core::types::RepoIntelData;
 
 /// Concrete edit a deslop agent should apply.
@@ -2795,16 +2797,27 @@ fn walk_repo_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for entry in ignore::WalkBuilder::new(root)
         .standard_filters(true)
+        // Keep hidden files in — `tracked_artifacts` needs to see `.DS_Store`,
+        // `.swp`, etc. Secret-like paths are filtered below by `is_secret_like`.
         .hidden(false)
+        // Skip oversized files — slop analyzers read the whole file into
+        // memory to parse with tree-sitter, so unbounded sizes are a DoS
+        // vector. Cap shared with analyzer-embed via analyzer-core::limits.
+        .max_filesize(Some(MAX_WALK_FILE_SIZE))
         .build()
     {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
-        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            out.push(entry.path().to_path_buf());
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
         }
+        let path = entry.path();
+        if is_secret_like(path) {
+            continue;
+        }
+        out.push(path.to_path_buf());
     }
     out
 }
