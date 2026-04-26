@@ -5,6 +5,12 @@ on:
   push:
     branches: [main]
 
+# Minimal permissions — cargo-deny only needs to read the repo.
+# Matches the pattern used by ci.yml and release.yml. Hardening per
+# CodeQL + cursor review on #38.
+permissions:
+  contents: read
+
 jobs:
   cargo-deny:
     name: cargo-deny check
