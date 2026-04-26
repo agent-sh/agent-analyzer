@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-26
+
+### Fixed
+- **analyzer-embed: stable cache dir + heal poisoned fastembed caches** (#36). Previously fastembed defaulted to `./.fastembed_cache` relative to CWD - every user repo downloaded 66 MB on first use, polluted the working tree, and a killed download left the cache poisoned so subsequent runs hung silently. Now resolves cache via `FASTEMBED_CACHE_DIR` env -> `~/.agent-sh/cache/fastembed` -> fastembed default, validates/prunes poisoned caches on init, and surfaces download failures with context.
+- **analyzer-embed: slop walker keeps hidden files visible** (post-merge fix). The security pass set `.hidden(true)` on both embed and slop walkers, but slop's `tracked_artifacts` scanner needs to see `.DS_Store`, `.swp`, etc. Embed walker still filters; slop walker restored to `.hidden(false)` with `is_secret_like` filtering secrets explicitly.
+
+### Security
+- **analyzer-embed: sidecar parser caps untrusted allocations** (#37). A hostile `.embeddings.bin` with crafted u32 lengths could drive `vec![0u8; N]` up to 4 GiB, triggering OOM (-> `panic = abort`). Now caps: header_len (1 MiB), vector_count (10M), dim (4096), name_len (1 KiB), path_len (4 KiB).
+- **analyzer-embed + analyzer-graph: skip hidden + secret-like files during walks** (#37). Walkers now honor `.hidden(true)` on the embed path + `is_secret_like` deny-list (`.env`, `.git/`, `.ssh/`, `*.pem`, `id_rsa*`, `.aws/`, etc.) so embedding indexes and slop reports don't leak credentials.
+- **analyzer-embed + analyzer-graph: cap individual file size at 5 MiB** (#37). Prevents OOM on oversized source files.
+- **Release artifacts now publish SLSA build-provenance attestations via actions/attest-build-provenance** (#37). Client-side verification (cosign / slsa-verifier) is a follow-up in agent-core's binary downloader.
+- **Add deny.toml** (#37) for cargo-deny advisories/licenses/bans/sources checks.
+
+### Changed
+- **model_code_for delegates to TextEmbedding::get_model_info** (#36 review). The previous hand-rolled match on `fastembed::EmbeddingModel` (marked `#[non_exhaustive]`) needed a catch-all; now errors surface through upstream.
+- **Shared limits and secret-deny-list moved to analyzer-core::{limits, secrets}** (#37 review). Eliminates the duplicated `is_secret_like` and `MAX_WALK_FILE_SIZE` between analyzer-embed and analyzer-graph.
+
 ## [0.7.0] - 2026-04-25
 
 ### Added
@@ -142,7 +159,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Query flags: `--min-changes`, `--path-filter`, `--adjust-for-ai`
 - 68 tests at launch
 
-[Unreleased]: https://github.com/agent-sh/agent-analyzer/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/agent-sh/agent-analyzer/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/agent-sh/agent-analyzer/compare/v0.3.2...v0.4.0
