@@ -216,11 +216,19 @@ fn load_existing_hashes(
     Ok(HashMap::new())
 }
 
+/// Maximum size of any single file the embed/slop walkers will read.
+/// Generated or vendored source files can easily balloon past typical
+/// source sizes; reading a multi-hundred-MiB file into memory to hash and
+/// chunk it is almost never what we want. 5 MiB comfortably covers the
+/// legitimate long tail.
+pub(crate) const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
 fn walk_repo(repo: &Path, max_files: usize) -> Result<Vec<(PathBuf, String)>> {
     let mut out = Vec::new();
     for entry in WalkBuilder::new(repo)
         .standard_filters(true)
         .hidden(true)
+        .max_filesize(Some(MAX_FILE_BYTES))
         .build()
     {
         let entry = match entry {
@@ -497,6 +505,36 @@ mod tests {
         };
         let doc = run_scan(&mut embedder, &opts).unwrap();
         assert!(doc.files.contains_key("nested/inner/a.rs"));
+    }
+
+    #[test]
+    fn walk_skips_files_larger_than_cap() {
+        let dir = TempDir::new().unwrap();
+        // Small eligible file - must be kept.
+        {
+            let p = dir.path().join("small.rs");
+            let mut f = File::create(&p).unwrap();
+            f.write_all(b"fn a() {}\n").unwrap();
+        }
+        // 10 MiB file with an eligible extension - must be skipped.
+        {
+            let p = dir.path().join("big.rs");
+            let mut f = File::create(&p).unwrap();
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..10 {
+                f.write_all(&chunk).unwrap();
+            }
+        }
+        let files = walk_repo(dir.path(), 100).unwrap();
+        let rels: Vec<String> = files
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(rels.iter().any(|p| p == "small.rs"), "small.rs missing: {rels:?}");
+        assert!(
+            !rels.iter().any(|p| p == "big.rs"),
+            "10 MiB big.rs should have been skipped: {rels:?}"
+        );
     }
 
     #[test]

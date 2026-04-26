@@ -2796,6 +2796,10 @@ fn walk_repo_files(root: &Path) -> Vec<PathBuf> {
     for entry in ignore::WalkBuilder::new(root)
         .standard_filters(true)
         .hidden(true)
+        // Skip files that would need more than 5 MiB of RAM to read; the
+        // slop analyzers read the whole file into memory to parse with
+        // tree-sitter, so unbounded sizes are a DoS vector.
+        .max_filesize(Some(5 * 1024 * 1024))
         .build()
     {
         let entry = match entry {
