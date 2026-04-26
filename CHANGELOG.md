@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-04-26
+
+### Added
+- **cargo-deny CI job** (#38). New `.github/workflows/deny.yml` runs `cargo deny check --all-features` on every PR and push to main. Catches advisories, license violations, duplicate semver majors, and untrusted sources. Minimal `contents: read` permissions.
+
 ## [0.8.0] - 2026-04-26
 
 ### Fixed
