@@ -46,7 +46,6 @@ impl FastEmbedder {
     /// downloads the model files; subsequent constructions read from the
     /// fastembed cache.
     pub fn new(variant: ModelVariant) -> Result<Self> {
-        let fastembed_model = map_variant(variant);
         let cache_dir = resolve_cache_dir();
 
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
@@ -56,9 +55,9 @@ impl FastEmbedder {
             );
         }
 
-        prune_poisoned_cache(&cache_dir, model_code_for(&fastembed_model));
+        prune_poisoned_cache(&cache_dir, &model_code_for(map_variant(variant))?);
 
-        let mut opts = InitOptions::new(fastembed_model.clone()).with_show_download_progress(true);
+        let mut opts = InitOptions::new(map_variant(variant)).with_show_download_progress(true);
         opts = opts.with_cache_dir(cache_dir.clone());
 
         let model = TextEmbedding::try_new(opts).with_context(|| {
@@ -98,17 +97,22 @@ fn map_variant(v: ModelVariant) -> EmbeddingModel {
     }
 }
 
-/// HuggingFace model code for a fastembed model. This is the string
-/// fastembed uses to form the on-disk cache dir: `models--<org>--<name>`
-/// where `/` in the code becomes `--`. Hardcoding the two variants we
-/// support avoids a runtime lookup and keeps the cache layout logic
-/// independent of fastembed's private model registry.
-fn model_code_for(model: &EmbeddingModel) -> &'static str {
-    match model {
-        EmbeddingModel::BGESmallENV15Q => "Qdrant/bge-small-en-v1.5-onnx-Q",
-        EmbeddingModel::EmbeddingGemma300M => "onnx-community/embeddinggemma-300m-ONNX",
-        _ => "",
-    }
+/// HuggingFace model code for a fastembed model. Fastembed uses this to
+/// form the on-disk cache dir: `models--<org>--<name>` where `/` in the
+/// code becomes `--`.
+///
+/// We delegate to `TextEmbedding::get_model_info`, which is the stable
+/// accessor into fastembed's own model registry. This matters because
+/// `EmbeddingModel` is `#[non_exhaustive]` upstream: a hardcoded `match`
+/// with a catch-all `_ => ""` branch would silently break cache-layout
+/// logic (e.g., `prune_poisoned_cache`) if fastembed added a variant we
+/// later started using - the catch-all would return the empty string and
+/// the poisoned-cache detector would no-op. Using the upstream lookup
+/// forwards the error instead so breakage is loud.
+fn model_code_for(model: EmbeddingModel) -> Result<String> {
+    TextEmbedding::get_model_info(&model)
+        .map(|info| info.model_code.clone())
+        .with_context(|| format!("fastembed has no ModelInfo for {model:?}"))
 }
 
 /// Resolve the cache directory per the precedence documented on
@@ -221,6 +225,17 @@ mod tests {
             map_variant(ModelVariant::Big),
             EmbeddingModel::EmbeddingGemma300M
         ));
+    }
+
+    #[test]
+    fn model_code_for_supported_variants_succeeds() {
+        // Both variants we care about must resolve through fastembed's
+        // ModelInfo registry. If fastembed ever drops one of these the
+        // test fires before users hit a runtime error.
+        let small = model_code_for(map_variant(ModelVariant::Small)).unwrap();
+        assert_eq!(small, "Qdrant/bge-small-en-v1.5-onnx-Q");
+        let big = model_code_for(map_variant(ModelVariant::Big)).unwrap();
+        assert_eq!(big, "onnx-community/embeddinggemma-300m-ONNX");
     }
 
     #[test]
