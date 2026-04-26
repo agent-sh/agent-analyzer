@@ -1,0 +1,20 @@
+name: cargo-deny
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  cargo-deny:
+    name: cargo-deny check
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # EmbarkStudios/cargo-deny-action@v2.0.17
+      - uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb
+        with:
+          log-level: warn
+          command: check
+          arguments: --all-features
