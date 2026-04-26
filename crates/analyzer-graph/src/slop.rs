@@ -2797,7 +2797,9 @@ fn walk_repo_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for entry in ignore::WalkBuilder::new(root)
         .standard_filters(true)
-        .hidden(true)
+        // Keep hidden files in — `tracked_artifacts` needs to see `.DS_Store`,
+        // `.swp`, etc. Secret-like paths are filtered below by `is_secret_like`.
+        .hidden(false)
         // Skip oversized files — slop analyzers read the whole file into
         // memory to parse with tree-sitter, so unbounded sizes are a DoS
         // vector. Cap shared with analyzer-embed via analyzer-core::limits.
