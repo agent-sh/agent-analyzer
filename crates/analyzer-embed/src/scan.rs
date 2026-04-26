@@ -202,7 +202,7 @@ fn load_existing_hashes(
         return Ok(HashMap::new());
     }
     let bytes = fs::read(sidecar_path).context("read sidecar")?;
-    let sidecar = Sidecar::read(&bytes[..])?;
+    let sidecar = Sidecar::from_bytes(&bytes[..])?;
     if sidecar.header.model_id != expected_model_id {
         // Model changed — drop everything, force full rebuild.
         return Ok(HashMap::new());
