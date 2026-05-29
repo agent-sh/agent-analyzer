@@ -26,10 +26,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # ort_asset / ort_sha pin the matching Microsoft ONNX Runtime 1.24.2
+        # release (the ABI ort-sys 2.0.0-rc.12 targets). The embed binary is
+        # built with `ort-load-dynamic`, so libonnxruntime is bundled beside it
+        # in the embed tarball and loaded at runtime. musl is intentionally
+        # unbundled: a glibc ORT cannot dlopen under musl, and MS ships no musl
+        # build - the embed binary fails fast there with install guidance.
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: agent-analyzer
+            ort_asset: onnxruntime-linux-x64-1.24.2.tgz
+            ort_sha: 43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: agent-analyzer
@@ -37,12 +45,18 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: agent-analyzer
             cross: true
+            ort_asset: onnxruntime-linux-aarch64-1.24.2.tgz
+            ort_sha: 6715b3d19965a2a6981e78ed4ba24f17a8c30d2d26420dbed10aac7ceca0085e
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: agent-analyzer
+            ort_asset: onnxruntime-osx-arm64-1.24.2.tgz
+            ort_sha: 0af4fa503e8ea285245b47ee42d0a7461b8156a81270857da0c1d4ecf858abde
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: agent-analyzer.exe
+            ort_asset: onnxruntime-win-x64-1.24.2.zip
+            ort_sha: 8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0
 
     steps:
       - uses: actions/checkout@v4
@@ -92,13 +106,62 @@ jobs:
             echo "name=agent-analyzer-embed" >> "$GITHUB_OUTPUT"
           fi
 
+      # Bundle ONNX Runtime beside the embed binary so the binary's runtime
+      # loader (resolve_and_preflight_ort) finds it as the "next to the
+      # executable" candidate - no system install, no network, no hang.
+      # sha256-pinned; the bundled-name strip (libonnxruntime.so.X -> .so /
+      # .dylib) matches ort_dylib_name() in model.rs. Skipped for targets with
+      # no ort_asset (musl), which fail fast at runtime with guidance.
+      - name: Bundle ONNX Runtime beside embed binary (Unix)
+        if: runner.os != 'Windows' && matrix.ort_asset != ''
+        run: |
+          set -euo pipefail
+          dest="target/${{ matrix.target }}/release"
+          url="https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/${{ matrix.ort_asset }}"
+          curl -fsSL -o ort.tgz "$url"
+          echo "${{ matrix.ort_sha }}  ort.tgz" | sha256sum -c -
+          mkdir -p ort-extract
+          tar xzf ort.tgz -C ort-extract
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            src=$(find ort-extract -name 'libonnxruntime.*.dylib' | head -1)
+            cp "$src" "$dest/libonnxruntime.dylib"
+            ls -la "$dest/libonnxruntime.dylib"
+          else
+            src=$(find ort-extract -name 'libonnxruntime.so.*' | head -1)
+            cp "$src" "$dest/libonnxruntime.so"
+            ls -la "$dest/libonnxruntime.so"
+          fi
+
+      - name: Bundle ONNX Runtime beside embed binary (Windows)
+        if: runner.os == 'Windows' && matrix.ort_asset != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = "target/${{ matrix.target }}/release"
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/${{ matrix.ort_asset }}"
+          Invoke-WebRequest -Uri $url -OutFile ort.zip
+          $got = (Get-FileHash ort.zip -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne "${{ matrix.ort_sha }}") {
+            throw "ORT sha256 mismatch: got $got expected ${{ matrix.ort_sha }}"
+          }
+          Expand-Archive -Path ort.zip -DestinationPath ort-extract -Force
+          $src = Get-ChildItem -Path ort-extract -Recurse -Filter onnxruntime.dll | Select-Object -First 1
+          Copy-Item $src.FullName (Join-Path $dest "onnxruntime.dll")
+          Get-ChildItem (Join-Path $dest "onnxruntime.dll")
+
       - name: Create archives (Unix)
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
           cd target/${{ matrix.target }}/release
           tar czvf ../../../agent-analyzer-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
-          tar czvf ../../../agent-analyzer-embed-${{ matrix.target }}.tar.gz ${{ steps.embed_artifact.outputs.name }}
+          # Bundle the ONNX Runtime dylib into the embed tarball when present
+          # (every target except musl). The JS resolver extracts the whole
+          # archive next to the binary, so the lib lands as a sibling.
+          embed_files="${{ steps.embed_artifact.outputs.name }}"
+          if [ -f libonnxruntime.so ]; then embed_files="$embed_files libonnxruntime.so"; fi
+          if [ -f libonnxruntime.dylib ]; then embed_files="$embed_files libonnxruntime.dylib"; fi
+          tar czvf ../../../agent-analyzer-embed-${{ matrix.target }}.tar.gz $embed_files
           cd ../../..
           shasum -a 256 agent-analyzer-${{ matrix.target }}.tar.gz > agent-analyzer-${{ matrix.target }}.tar.gz.sha256
           shasum -a 256 agent-analyzer-embed-${{ matrix.target }}.tar.gz > agent-analyzer-embed-${{ matrix.target }}.tar.gz.sha256
@@ -109,7 +172,10 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath ../../../agent-analyzer-${{ matrix.target }}.zip
-          Compress-Archive -Path ${{ steps.embed_artifact.outputs.name }} -DestinationPath ../../../agent-analyzer-embed-${{ matrix.target }}.zip
+          # Bundle onnxruntime.dll into the embed zip when present.
+          $embedPaths = @("${{ steps.embed_artifact.outputs.name }}")
+          if (Test-Path "onnxruntime.dll") { $embedPaths += "onnxruntime.dll" }
+          Compress-Archive -Path $embedPaths -DestinationPath ../../../agent-analyzer-embed-${{ matrix.target }}.zip
           cd ../../..
           (Get-FileHash agent-analyzer-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower() + "  agent-analyzer-${{ matrix.target }}.zip" | Out-File -Encoding ASCII agent-analyzer-${{ matrix.target }}.zip.sha256
           (Get-FileHash agent-analyzer-embed-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower() + "  agent-analyzer-embed-${{ matrix.target }}.zip" | Out-File -Encoding ASCII agent-analyzer-embed-${{ matrix.target }}.zip.sha256
