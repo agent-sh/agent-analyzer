@@ -188,13 +188,35 @@ fn ort_dylib_name() -> &'static str {
 ///      by dlopen-ing the bare library name.
 ///
 /// Returns a clear, actionable error if nothing loads - never a silent hang.
+///
+/// Runs at most once per process. `FastEmbedder::new` may be called more than
+/// once (multiple variants) and potentially from multiple threads; the actual
+/// resolve - which calls `std::env::set_var`, a data race if run concurrently -
+/// is guarded by a `OnceLock` so it executes exactly once and the result is
+/// cached.
 fn resolve_and_preflight_ort() -> Result<()> {
+    static ORT_INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ORT_INIT
+        .get_or_init(|| resolve_and_preflight_ort_inner().map_err(|e| format!("{e:#}")))
+        .clone()
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+fn resolve_and_preflight_ort_inner() -> Result<()> {
     // Candidate paths in precedence order. `None` => bare name (system search).
     let mut candidates: Vec<Option<PathBuf>> = Vec::new();
 
     if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
         if !p.is_empty() {
-            candidates.push(Some(PathBuf::from(p)));
+            // `ort` accepts ORT_DYLIB_PATH as either the dylib file or a
+            // directory containing it. dlopen needs the file, so normalize a
+            // directory to <dir>/<libname> before probing.
+            let pb = PathBuf::from(&p);
+            candidates.push(Some(if pb.is_dir() {
+                pb.join(ort_dylib_name())
+            } else {
+                pb
+            }));
         }
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -222,11 +244,13 @@ fn resolve_and_preflight_ort() -> Result<()> {
                 // Only export an explicit path for real files; for the system
                 // search case leave ORT_DYLIB_PATH unset so `ort` does its own
                 // default resolution (matching what just succeeded here).
-                if let Some(p) = cand {
-                    // SAFETY: single-threaded init path (called at the top of
-                    // FastEmbedder::new before any embedding threads spawn).
+                if cand.is_some() {
+                    // SAFETY: serialized by the OnceLock in the public wrapper -
+                    // this inner fn runs exactly once per process, before any
+                    // embedding threads spawn, so the set_var has no concurrent
+                    // reader/writer.
                     unsafe {
-                        std::env::set_var("ORT_DYLIB_PATH", p);
+                        std::env::set_var("ORT_DYLIB_PATH", &load_target);
                     }
                 }
                 return Ok(());
@@ -380,6 +404,29 @@ mod tests {
         let tmp = tempdir().unwrap();
         let missing = tmp.path().join(ort_dylib_name());
         assert!(try_dlopen(&missing).is_err());
+    }
+
+    #[test]
+    fn try_dlopen_rejects_a_directory() {
+        // `ort` accepts ORT_DYLIB_PATH as a directory, but dlopen needs the
+        // file. The resolver normalizes dir -> dir/<libname> before probing;
+        // this locks in that dlopen-ing a directory itself fails (so the
+        // normalization is load-bearing, not cosmetic).
+        let tmp = tempdir().unwrap();
+        assert!(
+            try_dlopen(tmp.path()).is_err(),
+            "dlopen of a directory must fail"
+        );
+    }
+
+    #[test]
+    fn preflight_runs_once_and_caches() {
+        // The OnceLock wrapper must return a stable result across calls (no
+        // re-resolve, no repeated set_var). We can't assert success without a
+        // real ORT on the host, but we can assert idempotence: two calls agree.
+        let first = resolve_and_preflight_ort().is_ok();
+        let second = resolve_and_preflight_ort().is_ok();
+        assert_eq!(first, second, "preflight result must be stable/cached");
     }
 
     #[test]
