@@ -122,6 +122,7 @@ dependencies = [
  "fastembed",
  "half",
  "ignore",
+ "libloading",
  "rayon",
  "serde",
  "serde_json",

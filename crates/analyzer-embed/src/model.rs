@@ -46,6 +46,14 @@ impl FastEmbedder {
     /// downloads the model files; subsequent constructions read from the
     /// fastembed cache.
     pub fn new(variant: ModelVariant) -> Result<Self> {
+        // Make ONNX Runtime loadable BEFORE fastembed touches `ort`. With the
+        // `ort-load-dynamic` feature, a missing/unloadable libonnxruntime sends
+        // fastembed's lazy init into a futex deadlock with no output (observed
+        // on machines without a system ORT). Resolve a dylib, export
+        // ORT_DYLIB_PATH for `ort` to consume, and fail fast with guidance if
+        // none loads.
+        resolve_and_preflight_ort()?;
+
         let cache_dir = resolve_cache_dir();
 
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
@@ -154,6 +162,132 @@ fn home_dir() -> Option<PathBuf> {
     None
 }
 
+/// Platform-specific ONNX Runtime shared-library file name.
+fn ort_dylib_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    }
+}
+
+/// Ensure ONNX Runtime is loadable before fastembed initializes `ort`.
+///
+/// `ort-load-dynamic` defers ORT loading until first use and, on failure to
+/// find the dylib, fastembed's init wedges in a futex with no diagnostic. We
+/// pre-empt that: pick a dylib, verify it actually `dlopen`s, and publish it
+/// via `ORT_DYLIB_PATH` (which `ort` honors). Resolution order:
+///
+///   1. `ORT_DYLIB_PATH` if already set (respect the operator's choice; still
+///      preflighted so a bad path is reported, not hung on).
+///   2. `libonnxruntime.{so,dylib,dll}` next to the running executable - the
+///      release tarball bundles it beside `agent-analyzer-embed`.
+///   3. System default: let the loader search (LD_LIBRARY_PATH, standard dirs)
+///      by dlopen-ing the bare library name.
+///
+/// Returns a clear, actionable error if nothing loads - never a silent hang.
+///
+/// Runs at most once per process. `FastEmbedder::new` may be called more than
+/// once (multiple variants) and potentially from multiple threads; the actual
+/// resolve - which calls `std::env::set_var`, a data race if run concurrently -
+/// is guarded by a `OnceLock` so it executes exactly once and the result is
+/// cached.
+fn resolve_and_preflight_ort() -> Result<()> {
+    static ORT_INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ORT_INIT
+        .get_or_init(|| resolve_and_preflight_ort_inner().map_err(|e| format!("{e:#}")))
+        .clone()
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+fn resolve_and_preflight_ort_inner() -> Result<()> {
+    // Candidate paths in precedence order. `None` => bare name (system search).
+    let mut candidates: Vec<Option<PathBuf>> = Vec::new();
+
+    if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
+        if !p.is_empty() {
+            // `ort` accepts ORT_DYLIB_PATH as either the dylib file or a
+            // directory containing it. dlopen needs the file, so normalize a
+            // directory to <dir>/<libname> before probing.
+            let pb = PathBuf::from(&p);
+            candidates.push(Some(if pb.is_dir() {
+                pb.join(ort_dylib_name())
+            } else {
+                pb
+            }));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(Some(dir.join(ort_dylib_name())));
+        }
+    }
+    candidates.push(None); // system default search
+
+    let mut tried: Vec<String> = Vec::new();
+    for cand in &candidates {
+        let load_target: PathBuf = match cand {
+            Some(p) => {
+                if !p.exists() {
+                    tried.push(format!("{} (not found)", p.display()));
+                    continue;
+                }
+                p.clone()
+            }
+            None => PathBuf::from(ort_dylib_name()),
+        };
+
+        match try_dlopen(&load_target) {
+            Ok(()) => {
+                // Only export an explicit path for real files; for the system
+                // search case leave ORT_DYLIB_PATH unset so `ort` does its own
+                // default resolution (matching what just succeeded here).
+                if cand.is_some() {
+                    // SAFETY: serialized by the OnceLock in the public wrapper -
+                    // this inner fn runs exactly once per process, before any
+                    // embedding threads spawn, so the set_var has no concurrent
+                    // reader/writer.
+                    unsafe {
+                        std::env::set_var("ORT_DYLIB_PATH", &load_target);
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                tried.push(format!("{}: {e}", load_target.display()));
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "could not load ONNX Runtime ({lib}). The embedder needs ONNX Runtime \
+         at runtime. Fixes:\n  \
+         - reinstall the embed binary so the bundled library is restored \
+         (it ships in the agent-analyzer-embed release tarball), or\n  \
+         - install ONNX Runtime and set ORT_DYLIB_PATH to its \
+         {lib}.\nTried:\n  {tried}",
+        lib = ort_dylib_name(),
+        tried = tried.join("\n  ")
+    );
+}
+
+/// Attempt to `dlopen` a shared library and immediately release it.
+///
+/// Returns `Ok(())` if the library loads. Loading ORT runs its initializers;
+/// this is the same load `ort` performs internally - we only do it first to
+/// surface failures as a clean error rather than a downstream deadlock. The
+/// handle is dropped right away; `ort` loads its own copy via `ORT_DYLIB_PATH`.
+fn try_dlopen(lib: &Path) -> Result<(), String> {
+    // SAFETY: dlopen of a shared library by path. Standard dynamic-loading;
+    // any unsafe initializer the library runs is the same one `ort` would run.
+    match unsafe { libloading::Library::new(lib) } {
+        Ok(_handle) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Best-effort detection of a half-built model cache. Fastembed creates
 /// `models--<org>--<name>/refs/main` early in the download; if the
 /// process is killed before it finalizes, `snapshots/` stays empty and
@@ -236,6 +370,63 @@ mod tests {
         assert_eq!(small, "Qdrant/bge-small-en-v1.5-onnx-Q");
         let big = model_code_for(map_variant(ModelVariant::Big)).unwrap();
         assert_eq!(big, "onnx-community/embeddinggemma-300m-ONNX");
+    }
+
+    #[test]
+    fn ort_dylib_name_matches_platform() {
+        let name = ort_dylib_name();
+        if cfg!(target_os = "windows") {
+            assert_eq!(name, "onnxruntime.dll");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(name, "libonnxruntime.dylib");
+        } else {
+            assert_eq!(name, "libonnxruntime.so");
+        }
+    }
+
+    #[test]
+    fn try_dlopen_rejects_a_non_library_file() {
+        // The preflight's load primitive must report failure (so the resolver
+        // can move to the next candidate / bail with guidance) rather than
+        // succeed or hang on a file that is not a real shared object. Host-
+        // independent: a text file never dlopens anywhere.
+        let tmp = tempdir().unwrap();
+        let bogus = tmp.path().join(ort_dylib_name());
+        std::fs::write(&bogus, b"not a real shared object").unwrap();
+
+        let err = try_dlopen(&bogus).expect_err("a text file must not dlopen");
+        assert!(!err.is_empty(), "dlopen failure should carry a message");
+    }
+
+    #[test]
+    fn try_dlopen_reports_missing_file() {
+        // A path that does not exist must error, not panic.
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join(ort_dylib_name());
+        assert!(try_dlopen(&missing).is_err());
+    }
+
+    #[test]
+    fn try_dlopen_rejects_a_directory() {
+        // `ort` accepts ORT_DYLIB_PATH as a directory, but dlopen needs the
+        // file. The resolver normalizes dir -> dir/<libname> before probing;
+        // this locks in that dlopen-ing a directory itself fails (so the
+        // normalization is load-bearing, not cosmetic).
+        let tmp = tempdir().unwrap();
+        assert!(
+            try_dlopen(tmp.path()).is_err(),
+            "dlopen of a directory must fail"
+        );
+    }
+
+    #[test]
+    fn preflight_runs_once_and_caches() {
+        // The OnceLock wrapper must return a stable result across calls (no
+        // re-resolve, no repeated set_var). We can't assert success without a
+        // real ORT on the host, but we can assert idempotence: two calls agree.
+        let first = resolve_and_preflight_ort().is_ok();
+        let second = resolve_and_preflight_ort().is_ok();
+        assert_eq!(first, second, "preflight result must be stable/cached");
     }
 
     #[test]

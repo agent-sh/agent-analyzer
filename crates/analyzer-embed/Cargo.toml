@@ -40,16 +40,23 @@ tree-sitter-java.workspace = true
 sha2 = "0.10"
 half = "2"
 streaming-iterator = "0.1"
+# Pre-flight dlopen of ONNX Runtime so a missing/unloadable libonnxruntime
+# fails fast with install guidance instead of deadlocking inside fastembed's
+# lazy `ort` init (see resolve_and_preflight_ort in model.rs). Same crate ort
+# itself loads the dylib with, so no new transitive cost.
+libloading = "0.9"
 # Use `ort-load-dynamic` instead of the default `ort-download-binaries`
 # so the build does not depend on pyke's CDN at compile time. The
 # CDN goes down occasionally (sustained 504s during this PR's CI),
 # which would otherwise fail every PR build until pyke recovers.
 #
-# Runtime trade-off: the embed binary expects ONNX Runtime to be
-# loadable at runtime via `ORT_DYLIB_PATH` or a system-default
-# location. The JS wrapper (`lib/embed/binary.js` in the repo-intel
-# plugin) downloads the lib alongside the binary on first use; users
-# running the binary directly need ONNX Runtime installed manually.
+# Runtime trade-off: the embed binary needs ONNX Runtime loadable at
+# runtime. Resolution order (resolve_and_preflight_ort in model.rs):
+#   1. ORT_DYLIB_PATH if set
+#   2. libonnxruntime.{so,dylib,dll} next to the embed binary
+#      (the release tarball bundles it; the JS resolver extracts both)
+#   3. system default (LD_LIBRARY_PATH / standard dirs)
+# A missing lib is reported with install guidance, never a silent hang.
 fastembed = { version = "5", default-features = false, features = [
     "ort-load-dynamic",
     "hf-hub-native-tls",
