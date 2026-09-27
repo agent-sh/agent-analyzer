@@ -6,9 +6,8 @@
 
 ## Project Instruction Files
 
-- `CLAUDE.md` is the project memory entrypoint for Claude Code.
-- `AGENTS.md` is a byte-for-byte copy of `CLAUDE.md` for tools that read `AGENTS.md` (Codex CLI, OpenCode, Cursor, Cline, Copilot).
-- Keep them identical.
+`AGENTS.md` is the repository instruction source. Keep directory-specific guidance
+in the corresponding nested `AGENTS.md`.
 
 ## Critical Rules
 
@@ -268,3 +267,12 @@ Consumers:
 - AI detection: `agent-knowledge/ai-commit-detection-forensics.md`
 - Git analysis research: `agent-knowledge/git-history-analysis-developer-tools.md`
 - https://agentskills.io
+
+## Validation scope
+
+Choose checks that cover the changed behavior. For CPU-only tooling, documentation
+and configuration changes, run the relevant CPU tests, static checks and configuration
+validation. Do not require a blanket GPU gate for those changes. Require GPU
+qualification when GPU, runtime or model behavior, or related claims, change.
+Preserve applicable native, model and hardware qualification gates. CPU checks do
+not qualify GPU behavior.
