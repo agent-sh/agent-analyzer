@@ -3299,7 +3299,7 @@ fn collect_used_symbols(map: &RepoIntelData) -> UsedSymbols {
     let mut all_names = HashSet::new();
     let mut modules_per_name: HashMap<String, HashSet<String>> = HashMap::new();
     if let Some(syms) = map.symbols.as_ref() {
-        for (_path, file_syms) in syms.iter() {
+        for file_syms in syms.values() {
             for imp in &file_syms.imports {
                 for name in &imp.names {
                     all_names.insert(name.clone());
