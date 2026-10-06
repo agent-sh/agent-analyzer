@@ -263,16 +263,7 @@ Consumers:
 ## References
 
 - Part of the [agent-sh](https://github.com/agent-sh) ecosystem
-- Spec: `agent-analyzer/SPEC.md`
-- AI detection: `agent-knowledge/ai-commit-detection-forensics.md`
-- Git analysis research: `agent-knowledge/git-history-analysis-developer-tools.md`
+- Spec: `SPEC.md`
+- AI detection: [ai-commit-detection-forensics](https://github.com/agent-sh/agent-knowledge/blob/main/ai-commit-detection-forensics.md)
+- Git analysis research: [git-history-analysis-developer-tools](https://github.com/agent-sh/agent-knowledge/blob/main/git-history-analysis-developer-tools.md)
 - https://agentskills.io
-
-## Validation scope
-
-Choose checks that cover the changed behavior. For CPU-only tooling, documentation
-and configuration changes, run the relevant CPU tests, static checks and configuration
-validation. Do not require a blanket GPU gate for those changes. Require GPU
-qualification when GPU, runtime or model behavior, or related claims, change.
-Preserve applicable native, model and hardware qualification gates. CPU checks do
-not qualify GPU behavior.
