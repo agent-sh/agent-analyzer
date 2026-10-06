@@ -264,6 +264,6 @@ Consumers:
 
 - Part of the [agent-sh](https://github.com/agent-sh) ecosystem
 - Spec: `agent-analyzer/SPEC.md`
-- AI detection: `agent-knowledge/ai-commit-detection-forensics.md`
-- Git analysis research: `agent-knowledge/git-history-analysis-developer-tools.md`
+- AI detection: [ai-commit-detection-forensics](https://github.com/agent-sh/agent-knowledge/blob/main/ai-commit-detection-forensics.md)
+- Git analysis research: [git-history-analysis-developer-tools](https://github.com/agent-sh/agent-knowledge/blob/main/git-history-analysis-developer-tools.md)
 - https://agentskills.io
