@@ -38,7 +38,7 @@ cargo install --path crates/analyzer-cli
 
 ### Via agent-sh plugins
 
-If you use the [repo-intel](https://github.com/agent-sh/repo-intel) plugin, the binary is downloaded automatically on first use. No manual install needed.
+If you use the [deslop](https://github.com/agent-sh/deslop) plugin, the binary is downloaded automatically on first use. No manual install needed.
 
 ## Quick start
 
@@ -54,8 +54,8 @@ Output (JSON to stdout):
 
 ```json
 [
-  { "path": "src/engine.rs", "changes": 142, "authors": 5, "lastChanged": "2026-03-10" },
-  { "path": "src/api/handler.rs", "changes": 98, "authors": 3, "lastChanged": "2026-03-14" }
+  { "path": "src/engine.rs", "changes": 142, "recentChanges": 31, "score": 1.43, "authors": ["alice", "bob"], "bugFixes": 12 },
+  { "path": "src/api/handler.rs", "changes": 98, "recentChanges": 20, "score": 1.39, "authors": ["carol"], "bugFixes": 7 }
 ]
 ```
 
@@ -67,7 +67,7 @@ Progress and errors go to stderr, so piping and redirection work as expected.
 
 **Incremental by default**: After the initial scan, `update` only processes commits after `analyzedUpTo`. If a force-push is detected (the recorded SHA is no longer in history), it falls back to a full rebuild automatically.
 
-**Offline-only**: The binary never makes network or LLM calls. Per-file descriptors and the 3-depth narrative summary that `find` and `summary` consume are written in by external orchestrators via `set-descriptors` / `set-summary` (the [repo-intel](https://github.com/agent-sh/repo-intel) JS plugin spawns Haiku Task subagents and pipes their JSON output through these subcommands).
+**Offline-only**: The binary never makes network or LLM calls. Per-file descriptors and the 3-depth narrative summary that `find` and `summary` consume are written in by external orchestrators via `set-descriptors` / `set-summary`. Embeddings come from the separate `agent-analyzer-embed` binary and are stored with `set-embeddings`.
 
 **Bot-aware, not AI-attribution**: A `bot_detect` module isolates automation accounts (`dependabot`, `renovate`, `github-actions`) from human contributors. AI authorship attribution was removed in v0.5.0 because it conflated bots with model-assisted authoring and produced misleading ratios.
 
@@ -88,6 +88,8 @@ Progress and errors go to stderr, so piping and redirection work as expected.
 - **Concept search** - `find <concept>` ranks files by deterministic signals (basename/path/symbol/import/doc-header) plus optional LLM-generated descriptor matching for semantic recall
 - **Repo summary** - cached 3-depth narrative description (sentence / paragraph / page), populated by external orchestrator
 - **Entry-point listing** - every place execution can start: binaries (`Cargo.toml [[bin]]`, `package.json bin`, `pyproject scripts`), AST `main` functions, npm `scripts`, with Cargo workspace awareness
+- **Slop detection** - `slop-fixes` returns self-contained fix actions (tracked artifacts, stale CI configs, duplicate tooling, orphan exports, empty catch blocks, tautological tests, passthrough wrappers, commented-out code) and `slop-targets` ranks files for the [deslop](https://github.com/agent-sh/deslop) agent's deeper scans
+- **Local embeddings** - the separate `agent-analyzer-embed` binary embeds files or functions with fastembed (`--variant small` = BGE-small, `big` = EmbeddingGemma-300M) and re-embeds only changed files on `update`
 
 ## Usage
 
@@ -109,7 +111,7 @@ agent-analyzer repo-intel update /path/to/repo --map-file repo-intel.json > repo
 agent-analyzer repo-intel status /path/to/repo --map-file repo-intel.json
 ```
 
-Returns `current`, `stale`, or `rebuild_needed`.
+Returns `valid`, `stale`, or `invalid` (force-push detected).
 
 ### Queries
 
@@ -156,11 +158,16 @@ echo '{"depth1": "...", "depth3": "...", "depth10": "...", "inputHash": "sha256:
   | agent-analyzer repo-intel set-summary --map-file repo-intel.json --input -
 ```
 
-The [repo-intel](https://github.com/agent-sh/repo-intel) JS plugin's `/repo-intel enrich` action does this automatically by spawning Haiku Task subagents and parsing their JSON output.
+Embeddings go through the same path. `agent-analyzer-embed` writes a JSON document to stdout, and `set-embeddings` stores the vectors in a `<map-file-stem>.embeddings.bin` sidecar:
+
+```bash
+agent-analyzer-embed scan . --variant small \
+  | agent-analyzer repo-intel set-embeddings --map-file repo-intel.json --input -
+```
 
 ## Architecture
 
-Rust workspace with 7 crates:
+Rust workspace with 8 crates:
 
 ```
 analyzer-core             shared types, git2 wrapper, bot/bug-fix/generated detection,
@@ -170,7 +177,8 @@ analyzer-core             shared types, git2 wrapper, bot/bug-fix/generated dete
     +-- analyzer-repo-map     AST-based symbol mapping + concept-to-file search (Phase 2 + Phase 6)
     +-- analyzer-collectors   project data gathering + entry-point detection (Phase 3)
     +-- analyzer-sync-check   doc-code sync analysis (Phase 4)
-    +-- analyzer-graph        co-change communities + betweenness centrality (Phase 5)
+    +-- analyzer-graph        co-change communities + betweenness centrality (Phase 5), slop detection
+    +-- analyzer-embed        local embeddings, `agent-analyzer-embed` binary
     |
 analyzer-cli              unified binary, clap dispatch
 ```
@@ -207,7 +215,7 @@ The `generated_detect` module flags `*.pb.go`, `*.d.ts`, `*/generated/*`, `*/cod
 ## Development
 
 ```bash
-cargo test                            # 146 tests across all crates
+cargo test                            # 416 tests across all crates
 cargo clippy -- -D warnings           # lint
 cargo fmt --check                     # format check
 cargo build --release                 # optimized binary (LTO + stripped)
@@ -215,16 +223,15 @@ cargo build --release                 # optimized binary (LTO + stripped)
 
 ## Integration
 
-This binary is consumed by JS plugins in the agent-sh ecosystem via a binary resolver in [agent-core](https://github.com/agent-sh/agent-core):
+This binary is consumed by JS plugins in the agent-sh ecosystem via the binary resolver in [agentsys](https://github.com/agent-sh/agentsys) (`lib/binary/`):
 
 - JS calls `binary.ensureBinary()` which auto-downloads from GitHub releases
 - Binary location: `~/.agent-sh/bin/agent-analyzer[.exe]`
 - No manual install - lazy download on first use
 
 Consumers:
-- [repo-intel](https://github.com/agent-sh/repo-intel) plugin (unified static analysis wrapper - git history, AST symbols, project metadata, doc-code sync)
-- `agent-core/lib/collectors/` (uses `collect` CLI for project metadata)
-- [sync-docs](https://github.com/agent-sh/sync-docs) plugin (uses `sync-check` CLI for doc-code cross-references)
+- [deslop](https://github.com/agent-sh/deslop) plugin (runs `repo-intel init`/`update` and the `slop-fixes` / `slop-targets` queries through its vendored copy of the resolver)
+- agentsys `lib/repo-intel/` (repo-intel artifact install, update and queries)
 
 ## Contributing
 
